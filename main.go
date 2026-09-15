@@ -116,24 +116,33 @@ func run() error {
 	// 3) 业务服务
 	svc := service.New(d, reg, cfg.Service)
 
-	// 4) 账本（配额 + 折扣倍率 + 用量）
+	// 4) 账本（配额 + 账号倍率 + 用量）
 	//
-	// Vault 路径为空则纯内存，重启即丢——生产环境务必配置落盘路径。
-	accounts, err := account.New(account.Options{Path: cfg.AccountsPath})
-	if err != nil {
-		return fmt.Errorf("初始化账本失败: %w", err)
-	}
-	defer func() { _ = accounts.Close() }()
+	// 免校验模式（VL_EASE=true）下**整个账户体系都不建立**：不读也不写账本文件、
+	// 不创建管理员。这才是"所有有关账户的内容关闭"应有的样子——
+	// 留一个空账本在那里，早晚会有人以为它在生效。
+	var accounts *account.Store
+	if cfg.IsEase() {
+		logger.Warn("免校验模式已开启（VL_EASE=true）：不校验 API Key、不计量配额、" +
+			"无管理接口；请勿将本服务直接暴露到公网")
+	} else {
+		var err error
+		accounts, err = account.New(account.Options{Path: cfg.AccountsPath})
+		if err != nil {
+			return fmt.Errorf("初始化账本失败: %w", err)
+		}
+		defer func() { _ = accounts.Close() }()
 
-	// 冷启动：账本里没有管理员时自动创建一个。
-	// 否则第一次部署会陷入"没有管理员 → 无法创建账号 → 永远没有管理员"。
-	adminKey, err := ensureAdmin(accounts, logger, cfg.AdminKey)
-	if err != nil {
-		return err
-	}
-	if adminKey != "" {
-		logger.Warn("已创建初始管理员账号，请立即保存这个 Key（只显示这一次）",
-			"admin_key", adminKey)
+		// 冷启动：账本里没有管理员时自动创建一个。
+		// 否则第一次部署会陷入"没有管理员 → 无法创建账号 → 永远没有管理员"。
+		adminKey, err := ensureAdmin(accounts, logger, cfg.AdminKey)
+		if err != nil {
+			return err
+		}
+		if adminKey != "" {
+			logger.Warn("已创建初始管理员账号，请立即保存这个 Key（只显示这一次）",
+				"admin_key", adminKey)
+		}
 	}
 
 	// 5) 并发闸门：默认每 Key 1 个请求、全局 10 个解析任务
@@ -250,17 +259,27 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 			authed = append(authed, string(e.Name()))
 		}
 	}
+	mode := "账户模式"
+	if cfg.IsEase() {
+		mode = "免校验模式"
+	}
 	logger.Info("vidlink 启动",
 		"version", buildVersion,
 		"addr", cfg.Addr,
+		"mode", mode,
 		"platforms", fmt.Sprint(platforms),
 		"cookie_configured", fmt.Sprint(authed),
-		"admin_key_configured", cfg.AdminKey != "",
 		"cache_ttl", cfg.Service.CacheTTL.String(),
 		"proxy_endpoint", cfg.ProxySrv.Enabled,
 	)
-	if cfg.AccountsPath == "" {
+	switch {
+	case cfg.IsEase():
+		// 免校验模式下账户参数一律无意义，说了只会误导
+	case cfg.AccountsPath == "":
 		logger.Warn("未配置 VIDLINK_ACCOUNTS_PATH：账本只在内存里，重启后账号与配额全部丢失")
+	default:
+		logger.Info("账户模式已启用", "accounts_path", cfg.AccountsPath,
+			"admin_key_configured", cfg.AdminKey != "")
 	}
 }
 

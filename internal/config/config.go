@@ -20,6 +20,18 @@ import (
 type Config struct {
 	Addr string
 
+	// Ease 是"免校验模式"：由 VL_EASE=true 打开。
+	//
+	// 打开后**账户体系整体关闭**：不建账本、不需要 API Key、不计量配额、
+	// 没有管理接口，只保留公开端点与四个解析端点。
+	//
+	// 用途是本地/内网把服务当纯解析工具用（比如自己写脚本、塞进别的程序），
+	// 不必为了取一条直链先去建账号、发 Key、算配额。
+	//
+	// 安全性由部署方式来保证：这个模式没有任何身份校验，
+	// **绝不能直接暴露到公网**（见 README 的警告）。
+	Ease bool
+
 	// AdminKey 是**首次启动时**用来创建初始管理员的 Key。
 	//
 	// 为空则自动生成一个随机 Key 并在日志里打印一次（只打印一次）。
@@ -97,6 +109,7 @@ type ProxyOptions struct {
 func Load() (*Config, error) {
 	c := &Config{
 		Addr:               env("VIDLINK_ADDR", ":8080"),
+		Ease:               envBool("VL_EASE", false),
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
@@ -153,6 +166,12 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
+// IsEase 报告是否处于免校验模式。
+//
+// 做成方法而不是到处读 c.Ease：这个开关决定"账户体系是否存在"，
+// 调用点应当一眼看出自己在问什么。
+func (c *Config) IsEase() bool { return c != nil && c.Ease }
+
 func (c *Config) validate() error {
 	if c.Addr == "" {
 		return fmt.Errorf("config: VIDLINK_ADDR 不能为空")
@@ -183,6 +202,12 @@ func (c *Config) validate() error {
 	if c.BatchMax < c.BatchMin {
 		return fmt.Errorf("config: VIDLINK_BATCH_MAX(%d) 不能小于 VIDLINK_BATCH_MIN(%d)",
 			c.BatchMax, c.BatchMin)
+	}
+	// 免校验模式就是"不要任何请求级拦截"，按 IP 的限流也一并关掉——
+	// 否则会出现"不需要 Key，但打快一点就被 429"这种半吊子状态，
+	// 而那个 429 与身份、配额都无关，用户根本无从理解。
+	if c.Ease {
+		c.RateLimitRPM = 0
 	}
 	if c.Net.Burst < 1 {
 		c.Net.Burst = 4

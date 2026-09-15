@@ -99,6 +99,10 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	if d.Gate == nil {
 		d.Gate = gate.New(gate.DefaultOptions())
 	}
+	if cfg.IsEase() && d.Accounts != nil {
+		// 免校验模式下账户体系不存在；传进来也用不到，直接忽略以免误用。
+		d.Accounts = nil
+	}
 	// 媒体代理需要流式传输大文件，不能用带总超时的 client。
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -122,12 +126,24 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		svc:        svc,
 		http:       &http.Client{Transport: tr},
 		log:        log,
-		limiter:    newIPLimiter(cfg.RateLimitRPM),
+		limiter:    newIPLimiter(effectiveRPM(cfg)),
 		accounts:   d.Accounts,
 		gate:       d.Gate,
 		quotaTable: d.QuotaTable,
 		startedAt:  time.Now(),
 	}, nil
+}
+
+// effectiveRPM 返回实际生效的每 IP 限流值。
+//
+// 免校验模式一律为 0（不限流）：那是"不要任何请求级拦截"的一部分。
+// 配置层已经置 0，这里再判一次是为了兜住"直接构造 Config 的调用方"
+// （测试、内嵌使用），让模式语义不依赖于谁怎么填这个字段。
+func effectiveRPM(cfg *config.Config) int {
+	if cfg.IsEase() {
+		return 0
+	}
+	return cfg.RateLimitRPM
 }
 
 // routeSpec 声明一条对外路由。
@@ -155,9 +171,6 @@ func (s *Server) routes() []routeSpec {
 		{method: http.MethodGet, path: "/healthz", public: true, handler: s.handleHealthz},
 		{method: http.MethodGet, path: "/readyz", public: true, handler: s.handleReadyz},
 
-		// ---- 免费但需要身份：用量查询要知道"你是谁" ----
-		{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage},
-
 		// ---- 配额端点：四个 ----
 		{method: http.MethodGet, path: "/v1/info", handler: s.handleInfo,
 			endpoint: quota.EndpointInfo},
@@ -169,8 +182,16 @@ func (s *Server) routes() []routeSpec {
 			endpoint: quota.EndpointBatchLinks},
 	}
 
-	// ---- 管理面：需要管理员账号 ----
-	specs = append(specs, s.adminRoutes()...)
+	// 免校验模式：账户体系整体不存在，所以用量查询与管理面**不注册**。
+	// 不注册（而不是注册后返回 403/空数据）意味着它们确实返回 404，
+	// 外界探测不到"这里本该有个管理接口"。
+	if !s.cfg.IsEase() {
+		// ---- 免配额但需要身份：用量查询要知道"你是谁" ----
+		specs = append(specs,
+			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage})
+		// ---- 管理面：需要管理员账号 ----
+		specs = append(specs, s.adminRoutes()...)
+	}
 
 	if s.cfg.ProxySrv.Enabled {
 		specs = append(specs,
@@ -184,7 +205,10 @@ func (s *Server) routes() []routeSpec {
 //
 // 中间件顺序是**契约的一部分**，从外到内：
 //
-//	Logging → RequestID → Recovery → CORS → RateLimit → APIKey → mux
+//	Logging → RequestID → Recovery → CORS → RateLimit → Account → mux
+//
+// 免校验模式（VL_EASE=true）下 RateLimit 已按配置关闭（RPM=0），
+// Account 整层不挂载，于是最终链路是 Logging → RequestID → Recovery → CORS → mux。
 //
 // 三条不能动的约束：
 //
@@ -207,7 +231,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.fallback(specs))
 
 	var h http.Handler = mux
-	h = s.withAccount(h, specs)
+	// 免校验模式：不挂账户中间件——没有 Key 校验、没有按 Key 闸门、没有配额预授权。
+	if !s.cfg.IsEase() {
+		h = s.withAccount(h, specs)
+	}
 	h = s.withRateLimit(h)
 	h = s.withCORS(h)
 	h = s.withRecovery(h)
@@ -223,9 +250,14 @@ func (s *Server) Handler() http.Handler {
 // 又想要正确的 405，两者不可兼得，于是自己判。
 func (s *Server) fallback(specs []routeSpec) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 根路径给一个纯文本导航页（人用浏览器打开时不至于看到一个 JSON 错误）
+		// 根路径：免校验模式给图形化解析页；账户模式给纯文本导航页
+		// （账户模式的页面需要凭据，做成网页就得先解决"Key 从哪来"，不适合直接摊开）。
 		if r.URL.Path == "/" {
 			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				if s.cfg.IsEase() {
+					s.handleUI(w, r)
+					return
+				}
 				s.handleIndex(w, r)
 				return
 			}
@@ -538,9 +570,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":      "ok",
 		"version":     Version,
 		"api_version": apiVersion,
+		"mode":        s.modeName(),
 		"uptime_sec":  int(time.Since(s.startedAt).Seconds()),
 		"requests":    s.reqCount.Load(),
 		"errors":      s.errCount.Load(),
+		"proxy":       s.cfg.ProxySrv.Enabled,
 		"cache":       s.svc.CacheStats(),
 	})
 }
@@ -551,18 +585,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // batchRequest 是批量解析的请求体。
 
-// handleIndex 返回一个极简说明页，避免根路径 404。
-// handleIndex 返回根路径的纯文本导航页。
+// handleIndex 返回根路径的纯文本导航页（账户模式）。
+//
+// 免校验模式下根路径走 handleUI，返回内嵌的图形化解析页。
 //
 // 只有 "/" 会走到这里——其他未匹配路径由 fallback 处理成 404/405。
 // 这里给文本而不是 JSON，是因为用浏览器点开会更顺眼；
 // 而真正的接口消费者不会来访问根路径。
+//
+// 免校验模式下列的是另一份清单：没有 Key、没有账号、没有配额，
+// 于是 /v1/usage 与 /v1/admin/* 根本不出现。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, `vidlink %s — 多平台视频解析 API（计量单位：%s）
 
-计量端点（消耗配额）
+	if s.cfg.IsEase() {
+		fmt.Fprintf(w, `vidlink %s — 多平台视频解析 API（免校验模式）
+
+解析端点（无需 API Key，不计量配额）
+  GET  /v1/info?url=             元信息 + 档位列表，无直链
+  GET  /v1/links?url=&quality=   仅直链
+  GET  /v1/detail?url=           元信息 + 全部档位直链
+  POST /v1/batch/links           批量直链，%d~%d 条，不支持抖音
+
+其他端点
+  GET  /v1/platforms             平台清单
+  GET  /v1/version  /v1/health   版本与状态
+  GET  /healthz  /readyz         存活 / 就绪探针
+
+免校验模式已开启（VL_EASE=true）：没有 API Key、没有账号、没有配额，
+/v1/usage 与 /v1/admin/* 不存在。切勿把本服务直接暴露到公网。
+接口文档：docs/API.md
+`, Version, s.cfg.BatchMin, s.cfg.BatchMax)
+	} else {
+		fmt.Fprintf(w, `vidlink %s — 多平台视频解析 API（计量单位：%s）
+
+计量端点（消耗配额，需 API Key）
   GET  /v1/info?url=             0.5（抖音 0.75）    元信息 + 档位列表，无直链
   GET  /v1/links?url=&quality=   1.0（抖音 1.1）     仅直链
   GET  /v1/detail?url=           1.2（抖音 1.5）     元信息 + 全部档位直链
@@ -578,6 +636,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 接口文档：docs/API.md     机器可读规格：docs/openapi.yaml
 配额倍率说明：docs/配额倍率表.md
 `, Version, unitName, s.cfg.BatchMin, s.cfg.BatchMax)
+	}
 	if s.cfg.ProxySrv.Enabled {
 		fmt.Fprint(w, "\nGET /v1/proxy?url=<媒体地址>   （流式代理，支持 Range）\n")
 	}

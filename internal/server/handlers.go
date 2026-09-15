@@ -168,21 +168,27 @@ func (s *Server) writeQuotaError(w http.ResponseWriter, err error) {
 	}
 }
 
-// charge 在解析成功后结算，并把费用与配额回写在响应头里。
+// consumeQuota 在解析成功后结算，并把消耗与剩余回写在响应头里。
 //
 // **只有成功才扣减配额**：上游超时、内容不存在、限流一律不扣。
 // 上游抖动不是客户的问题，计入用量会直接变成投诉。
 //
 // 结算本身失败**不能**把已经成功的响应改成 500——结果客户已经拿到了。
 // 记 error 日志让运维介入，比让客户白等一次更合理。
+//
+// 免校验模式下直接返回：不扣配额，也不回写 X-Quota-* 头。
+// 头里写 0 会让人以为"还有配额这回事，只是这次没用掉"，干脆不写。
 func (s *Server) consumeQuota(w http.ResponseWriter, r *http.Request, v *core.Video, ep quota.Endpoint, items int) {
+	if s.cfg.IsEase() {
+		return
+	}
 	acct, ok := accountFrom(r.Context())
 	if !ok {
 		return
 	}
 	units, err := s.quotaTable.Consume(ep, v.Platform, items, acct.Multiplier)
 	if err != nil {
-		s.log.Error("配额计量失败：无法计算价格", "request_id", requestID(r.Context()),
+		s.log.Error("配额计量失败：无法计算系数乘积", "request_id", requestID(r.Context()),
 			"endpoint", string(ep), "platform", string(v.Platform), "err", err)
 		return
 	}
@@ -329,10 +335,16 @@ type batchLinksResponse struct {
 // 抖音在**解析前**就被挡掉：先用注册表路由出平台（纯本地判断，无上游调用），
 // 不支持批量的直接生成错误，不浪费上游配额，也不浪费 IP 维度的风控额度。
 func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
-	acct, ok := accountFrom(r.Context())
-	if !ok {
-		writeError(w, core.E(core.KindInternal, "", "quota", "缺少账号上下文", nil))
-		return
+	// 免校验模式没有账号上下文，也就没有倍率与结算；其余流程完全一致。
+	ease := s.cfg.IsEase()
+	var acct account.Account
+	if !ease {
+		a, ok := accountFrom(r.Context())
+		if !ok {
+			writeError(w, core.E(core.KindInternal, "", "quota", "缺少账号上下文", nil))
+			return
+		}
+		acct = a
 	}
 
 	var req batchLinksRequest
@@ -367,8 +379,8 @@ func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
 
 	resp := batchLinksResponse{Total: len(urls), Results: make([]batchItem, len(urls))}
 
-	// 每条各自抢一个全局槽位（在 resolveBatchItem 里），
-	// 但整个请求只占**一个** Key 槽位——这正是"批量"的语义。
+	// 每条各自抢一个全局槽位，但整个请求只占**一个** Key 槽位——
+	// 这正是"批量"的语义（免校验模式下没有 Key 槽位这一层）。
 	conc := s.cfg.Service.BatchConcurrency
 	if conc > len(urls) {
 		conc = len(urls)
@@ -398,6 +410,11 @@ func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
 			resp.Failed++
 			continue
 		}
+		if ease {
+			// 不计量，但仍要区分"成功/失败"，否则总数对不上
+			resp.Success++
+			continue
+		}
 		units, err := s.quotaTable.Consume(quota.EndpointBatchLinks, it.platform, 1, acct.Multiplier)
 		if err != nil {
 			// 平台不支持批量（抖音）：把这条转成明确错误，且不消耗配额
@@ -412,7 +429,7 @@ func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Cost = total
 
-	if total > 0 {
+	if !ease && total > 0 {
 		if rc, err := s.accounts.Consume(acct.Key, total); err == nil {
 			setQuotaHeaders(w, rc.Units, rc.Quota)
 		} else {
@@ -517,7 +534,11 @@ func (s *Server) allRates() map[string]any {
 }
 
 // handlePlatforms 返回平台清单与各端点系数。不消耗配额。
+//
+// 免校验模式下**不给 rates/unit**：那时不存在配额这回事，
+// 继续返回一份"每次调用扣多少"的表只会让人以为还有计量。
 func (s *Server) handlePlatforms(w http.ResponseWriter, r *http.Request) {
+	ease := s.cfg.IsEase()
 	pf := s.svc.Platforms()
 	out := make([]map[string]any, 0, len(pf))
 	for _, p := range pf {
@@ -527,18 +548,35 @@ func (s *Server) handlePlatforms(w http.ResponseWriter, r *http.Request) {
 			"hosts":        p.Hosts,
 			"supports_id":  p.ByID,
 			"has_cookie":   p.HasAuth,
-			"rates":        s.quotaTable.Coefficients(plat),
 			"batch":        quota.BatchUnsupportedReason(plat) == "",
 			"batch_reason": quota.BatchUnsupportedReason(plat),
 		}
+		if !ease {
+			m["rates"] = s.quotaTable.Coefficients(plat)
+		}
 		out = append(out, m)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"platforms": out,
-		"unit":      unitName,
+		"mode":      s.modeName(),
 		"limits": map[string]any{
 			"batch_min": s.cfg.BatchMin,
 			"batch_max": s.cfg.BatchMax,
 		},
-	})
+	}
+	if !ease {
+		body["unit"] = unitName
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// modeName 返回当前运行模式，给 /v1/health、/v1/platforms 与导航页共用。
+//
+// 让"是否在免校验模式"成为一个可观测的事实：客户端可以据此决定要不要带 Key，
+// 运维也能一眼看出这台机器有没有身份校验。
+func (s *Server) modeName() string {
+	if s.cfg.IsEase() {
+		return "ease"
+	}
+	return "account"
 }

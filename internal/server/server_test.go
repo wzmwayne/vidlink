@@ -888,3 +888,274 @@ func TestVersionEndpoint(t *testing.T) {
 		t.Errorf("api_version = %v, want %v", m["api_version"], apiVersion)
 	}
 }
+
+// --- 免校验模式（VL_EASE=true）---
+
+// newEaseEnv 构造一个免校验模式的服务端：没有账本、没有账号、没有闸门键。
+func newEaseEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extractor) *testEnv {
+	t.Helper()
+	cfg := &config.Config{
+		Ease:              true,
+		RateLimitRPM:      1, // 故意给一个"会限流"的值，验证模式本身把它按住了
+		CORSOrigins:       []string{"*"},
+		Service:           service.DefaultOptions(),
+		Net:               config.NetOptions{Timeout: 5 * time.Second},
+		BatchMin:          5,
+		BatchMax:          20,
+		PerKeyConcurrency: 1,
+		GlobalConcurrency: 10,
+		QueueMax:          30,
+		QueueWaitTimeout:  2 * time.Second,
+	}
+	if mutate != nil {
+		mutate(cfg)
+	}
+	client, err := netx.New(netx.Options{Timeout: cfg.Net.Timeout})
+	if err != nil {
+		t.Fatalf("构造 HTTP 客户端失败: %v", err)
+	}
+	d := &deps.Deps{Client: client, Cookies: deps.NewCookies(),
+		Params: deps.DefaultParams(), Now: time.Now}
+	svc := service.New(d, extract.NewRegistryWith(exts...), cfg.Service)
+
+	// 关键：账户依赖刻意传 nil——免校验模式不得依赖任何账本。
+	srv, err := New(cfg, Deps{
+		Service: svc, Accounts: nil,
+		Gate:       gate.New(gate.Options{PerKey: 1, Global: 10, MaxQueue: 30, WaitTimeout: 2 * time.Second}),
+		QuotaTable: quota.DefaultTable(),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("构造 server 失败: %v", err)
+	}
+	return &testEnv{srv: srv}
+}
+
+// TestEaseModeNeedsNoKey：不带任何凭据也能解析，且不回写配额头。
+func TestEaseModeNeedsNoKey(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("免校验模式应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "" {
+		t.Errorf("免校验模式不应回写 X-Quota-Consumed，得到 %q", got)
+	}
+	if got := w.Header().Get("X-Quota-Remaining"); got != "" {
+		t.Errorf("免校验模式不应回写 X-Quota-Remaining，得到 %q", got)
+	}
+	// 响应体是正常的 links 结构
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["url"] == "" || body["url"] == nil {
+		t.Errorf("应返回直链，得到 %v", body)
+	}
+}
+
+// TestEaseModeHidesAccountEndpoints：账户相关端点全部 404（不是 403）。
+func TestEaseModeHidesAccountEndpoints(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	for _, path := range []string{
+		"/v1/usage",
+		"/v1/admin/accounts",
+		"/v1/admin/accounts/vl_x",
+		"/v1/admin/stats",
+		"/v1/admin/quota",
+	} {
+		w := do(h, http.MethodGet, path, nil)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s 应 404（该端点不存在），得到 %d（%s）", path, w.Code, w.Body.String())
+		}
+	}
+	// 管理面写接口同样不存在
+	if w := doJSON(h, http.MethodPost, "/v1/admin/accounts", `{"name":"x"}`, nil); w.Code != http.StatusNotFound {
+		t.Errorf("POST /v1/admin/accounts 应 404，得到 %d", w.Code)
+	}
+}
+
+// TestEaseModeReportsModeWithoutRates：/v1/health 与 /v1/platforms 明确报告模式。
+func TestEaseModeReportsModeWithoutRates(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	var health map[string]any
+	w := do(h, http.MethodGet, "/v1/health", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["mode"] != "ease" {
+		t.Errorf("/v1/health mode = %v，想要 ease", health["mode"])
+	}
+
+	var pf map[string]any
+	w = do(h, http.MethodGet, "/v1/platforms", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &pf); err != nil {
+		t.Fatal(err)
+	}
+	if pf["mode"] != "ease" {
+		t.Errorf("/v1/platforms mode = %v，想要 ease", pf["mode"])
+	}
+	if _, has := pf["unit"]; has {
+		t.Error("免校验模式不应返回 unit（不存在配额这回事）")
+	}
+	first := pf["platforms"].([]any)[0].(map[string]any)
+	if _, has := first["rates"]; has {
+		t.Error("免校验模式不应返回 rates（不存在计量）")
+	}
+}
+
+// TestEaseModeDoesNotSerializeRequests：没有按 Key 闸门，第二个并发解析不被拒。
+func TestEaseModeDoesNotSerializeRequests(t *testing.T) {
+	block := make(chan struct{})
+	env := newEaseEnv(t, nil, blockingExtractor{name: core.PlatformBilibili, release: block})
+	h := env.handler()
+
+	first := make(chan int, 1)
+	go func() {
+		first <- do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil).Code
+	}()
+	time.Sleep(80 * time.Millisecond) // 让第一个请求占住解析槽位
+
+	second := make(chan int, 1)
+	go func() {
+		second <- do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/2", nil).Code
+	}()
+
+	// 第二个请求必须也在"进行中"，而不是已经被 429 拒掉
+	select {
+	case code := <-second:
+		t.Fatalf("免校验模式不应拒绝并发请求，却立刻返回了 %d", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(block)
+	if code := <-first; code != http.StatusOK {
+		t.Errorf("第一个请求应 200，得到 %d", code)
+	}
+	if code := <-second; code != http.StatusOK {
+		t.Errorf("第二个请求应 200，得到 %d", code)
+	}
+}
+
+// TestEaseModeIgnoresRateLimit：按 IP 限流在免校验模式下被按住（哪怕配置给了值）。
+func TestEaseModeIgnoresRateLimit(t *testing.T) {
+	env := newEaseEnv(t, func(c *config.Config) { c.RateLimitRPM = 1 }, defaultStub())
+	h := env.handler()
+	for i := 0; i < 8; i++ {
+		w := do(h, http.MethodGet, "/v1/platforms", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("第 %d 次请求应 200（不应限流），得到 %d", i+1, w.Code)
+		}
+	}
+}
+
+// TestEaseModeBatchLinksWithoutKey：批量在免校验模式可用，cost 恒为 0。
+func TestEaseModeBatchLinksWithoutKey(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	w := doJSON(env.handler(), http.MethodPost, "/v1/batch/links", batchBody(5), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("免校验模式批量应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["success"] != float64(5) {
+		t.Errorf("success = %v，想要 5", resp["success"])
+	}
+	if resp["cost"] != float64(0) {
+		t.Errorf("免校验模式 cost 应为 0，得到 %v", resp["cost"])
+	}
+}
+
+// TestEaseModeRootServesUI：免校验模式下根路径必须是那个图形化页面。
+func TestEaseModeRootServesUI(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("根路径应 200，得到 %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q，想要 text/html", ct)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("缺少 nosniff，得到 %q", got)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`id="url"`,        // 链接输入
+		`id="quality"`,    // 清晰度
+		`id="platform"`,   // 平台下拉
+		`id="batch"`,      // 批量输入
+		`data-act="info"`, // 三个解析动作
+		`data-act="links"`,
+		`data-act="detail"`,
+		`data-act="batch"`,
+		`/v1/health`, // 它会去调这些接口
+		`/v1/platforms`,
+		`/v1/batch/links`,
+		`X-Quota`, // 页面显式说明本模式不计量
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("页面缺少 %q", want)
+		}
+	}
+	// 页面必须自包含：不能有外链脚本/样式/字体，否则离线与内网环境会残缺
+	for _, forbidden := range []string{"<script src", "<link ", "cdn.", "googleapis", "unpkg"} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Errorf("页面引用了外部资源: %q", forbidden)
+		}
+	}
+	if len(body) > 80*1024 {
+		t.Errorf("页面过大（%d 字节），内嵌资源应保持精简", len(body))
+	}
+}
+
+// TestEaseModeRootUIIsHeadSafe：HEAD 只回头不回体。
+func TestEaseModeRootUIIsHeadSafe(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodHead, "/", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD / 应 200，得到 %d", w.Code)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("HEAD 不应有响应体，得到 %d 字节", w.Body.Len())
+	}
+}
+
+// TestAccountModeRootStaysText：账户模式下根路径仍是纯文本导航页，且需要 Key。
+//
+// 两件事一起锁：
+//   - 不给网页（账户模式常部署在公网，界面要凭据才有意义，
+//     而"Key 从哪来"没有干净的答案）；
+//   - 不带 Key 访问它同样 403 —— 根路径不在公开端点清单里，
+//     这条与"除公开端点外都要鉴权"保持一致。
+func TestAccountModeRootStaysText(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	if w := do(h, http.MethodGet, "/", nil); w.Code != http.StatusForbidden {
+		t.Errorf("账户模式不带 Key 访问 / 应 403，得到 %d", w.Code)
+	}
+
+	w := do(h, http.MethodGet, "/", userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("带 Key 访问 / 应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("账户模式根路径 Content-Type = %q，想要 text/plain", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "/v1/admin/") {
+		t.Error("账户模式的导航页应提到管理端点")
+	}
+	if strings.Contains(body, "<html") {
+		t.Error("账户模式的根路径不应返回网页")
+	}
+}

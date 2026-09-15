@@ -14,6 +14,14 @@ info:
     浏览器直接 `<video src>` 可能 403：请带上 `Links.headers`，或启用 `/v1/proxy`（默认关闭）。
 
     鉴权三选一：`X-API-Key` 头 / `Authorization: Bearer` / `?key=`。失败一律 403 且不区分原因。
+
+    ## 免校验模式（VL_EASE=true）
+
+    启动时设置 `VL_EASE=true` 会关闭**整个账户体系**：不需要任何凭据、不计量配额、
+    不回写 `X-Quota-*`、关闭按 IP 限流；`/v1/usage` 与 `/v1/admin/*` 不被注册（404）；
+    `/v1/platforms` 不再返回 `rates`/`unit`；批量响应的 `cost` 恒为 0。
+    四个解析端点与公开端点完全可用。`/v1/health`、`/v1/platforms` 会返回
+    `"mode": "ease"`。该模式没有任何身份校验，**不得暴露到公网**。
     并发三层：按 IP 限流（429）、按 Key 并发 1（仅计量端点；429，不排队）、
     全局解析槽位 10 + 队列 30（503）。
 
@@ -481,6 +489,7 @@ components:
       type: object
       properties:
         status: { type: string, example: ok }
+        mode: { type: string, enum: [account, ease], description: 运行模式 }
         version: { type: string }
         api_version: { type: string }
         uptime_sec: { type: integer }
@@ -506,7 +515,8 @@ components:
                 description: 各端点系数；不支持批量时 batch_links 是带 reason 的对象
               batch: { type: boolean }
               batch_reason: { type: string }
-        unit: { type: string, example: 配额 }
+        mode: { type: string, enum: [account, ease] }
+        unit: { type: string, example: 配额, description: 免校验模式下不返回 }
         limits:
           type: object
           properties:

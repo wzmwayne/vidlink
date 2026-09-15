@@ -71,6 +71,53 @@ curl -X POST http://127.0.0.1:8080/v1/batch/links \
 curl -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/usage
 ```
 
+## 免校验模式（VL_EASE=true）
+
+想把它当**纯解析工具**用——不建账号、不发 Key、不算配额——加一个环境变量：
+
+```bash
+VL_EASE=true ./vidlink
+
+# 不用任何凭据，直接解析
+curl 'http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7'
+```
+
+**浏览器打开 `http://127.0.0.1:8080/` 就是一个图形化解析页**：填链接点按钮即可，
+结果按"直链 / 请求头 / 视频轨 / 音频轨 / 字幕 / 图集 / 原始 JSON"分区渲染，
+带复制直链、复制 curl / ffmpeg 命令、批量解析（5~20 条）、平台能力表。
+
+页面由服务端内嵌在二进制里（`internal/server/ui.html`，约 25 KB）：
+
+- **零外部资源**——没有 CDN、字体、图标库，内网/离线打开也完整可用；
+- 只用原生 `fetch` 调本服务的公开接口，**与 curl 能做的事完全一致**，页面不引入任何隐藏能力；
+- 接口返回的标题/作者等文本一律用 `textContent` 写入，不构成 XSS 注入点。
+
+打开后**账户体系整体关闭**，不是"跳过校验"而是"不存在"：
+
+| 能力 | 账户模式（默认） | `VL_EASE=true` |
+|---|---|---|
+| API Key 校验 | 有（403） | **无**（不需要任何凭据） |
+| 账号账本 | 读写 `data/accounts.jsonl` | **完全不建立**（不读也不写文件） |
+| 初始管理员 | 自动创建并打印 Key | **不创建** |
+| 配额计量与 `X-Quota-*` | 有 | **无**（不回写这两个头） |
+| 按 Key 串行闸门 | 1 个并发解析 | 不适用（没有 Key） |
+| 按 IP 限流 | `VIDLINK_RATE_LIMIT_RPM` | **关闭**（连同它一起关） |
+| `/v1/usage`、`/v1/admin/*` | 存在 | **404**（根本不注册） |
+| `/v1/info`、`/v1/links`、`/v1/detail`、`/v1/batch/links` | 需 Key | **完全可用** |
+| `/v1/platforms`、`/v1/version`、`/v1/health`、探针 | 公开 | 公开（不再返回 `rates`/`unit`） |
+| 全局解析槽位（10 + 队列 30） | 有 | **保留**（这是资源保护，不是校验） |
+
+两点刻意的设计：
+
+- **保留全局解析槽位与按主机令牌桶。** 它们保护的是上游平台和这台机器的内存
+  （1 GB 树莓派上跑 100 路并发解析会直接 OOM），与身份校验无关；
+  想要更放开就调 `VIDLINK_GLOBAL_CONCURRENCY`。
+- **`/v1/usage` 与 `/v1/admin/*` 返回 404 而不是 403。** 它们不被注册，
+  外界探测不到"这里本该有个管理接口"。
+
+> ⚠️ **这个模式没有任何身份校验，绝不能暴露到公网。**
+> 只用于本机、内网、或你完全控制的调用方。启动日志里会有一条 WARN 提醒。
+
 ## API
 
 完整规格见 **[docs/API.md](docs/API.md)**（人读）与 **[docs/openapi.yaml](docs/openapi.yaml)**（机器读）。
@@ -82,13 +129,13 @@ curl -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/usage
 | GET | `/v1/platforms` | 公开 | — | 平台清单与各端点系数 |
 | GET | `/healthz` | 公开 | — | **存活**探针（进程活着即 200） |
 | GET | `/readyz` | 公开 | — | **就绪**探针（无可用平台时 503） |
-| GET | `/v1/usage` | Key | — | 自己的配额、用量、倍率 |
+| GET | `/v1/usage` | Key | — | 自己的配额、用量、倍率（免校验模式下不存在） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 | 元信息 + 档位列表，**无直链** |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 | **只有直链** |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
 | POST | `/v1/batch/links` | Key | 0.75/条 | 批量直链，5~20 条，**无抖音** |
 | GET | `/v1/proxy?url=` | Key | — | 流式媒体代理（默认关闭，需白名单） |
-| GET/POST | `/v1/admin/accounts` | 管理员 | — | 账号列表 / 创建账号 |
+| GET/POST | `/v1/admin/accounts` | 管理员 | — | 账号列表 / 创建账号（免校验模式下不存在） |
 | GET/PATCH/DELETE | `/v1/admin/accounts/{key}` | 管理员 | — | 查 / 改 / 删账号 |
 | GET | `/v1/admin/stats` | 管理员 | — | 运行统计 |
 | GET | `/v1/admin/quota` | 管理员 | — | 配额系数全貌（只读） |
@@ -202,6 +249,7 @@ curl -X PATCH ... -d '{"disabled":false}' ...
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `VL_EASE` | `false` | **免校验模式**：账户/配额/鉴权整体关闭，只留解析（见上一节） |
 | `VIDLINK_ADDR` | `:8080` | 监听地址 |
 | `VIDLINK_ADMIN_KEY` | 空 | 首次启动时用它创建初始管理员；空则随机生成并打印一次 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
@@ -289,6 +337,7 @@ vidlink/
 │   ├── account/                     账号账本：配额 / 倍率 / 用量 + JSONL 落盘
 │   ├── gate/                        两道并发闸门（按 Key + 全局）
 │   └── server/                      HTTP 路由 / 中间件 / 管理面 / 流式代理
+│       └── ui.html                  免校验模式的图形化解析页（内嵌进二进制）
 ├── tools/douyin-mint/               （仅本地，未随仓库发布）抖音访客身份铸造
 └── docs/
     ├── API.md                       接口文档（人读）
@@ -377,6 +426,8 @@ export VIDLINK_COOKIE_DOUYIN='UIFID_TEMP=...; ttwid=...'
 - 不绕过付费/会员/版权限制。遇到地区限制等错误应**原样透传**给调用方。
 - 对"试看片段"要如实标注，不要把试看当完整版返回。
 - 请遵守各平台的服务条款与所在地法律法规，控制请求频率。
+- **`VL_EASE=true` 会关闭全部身份校验**，只适合本机或可信内网；
+  把它暴露到公网等于提供一个任何人都能用的解析接口，风险自负。
 
 ## 未随仓库发布的内容
 

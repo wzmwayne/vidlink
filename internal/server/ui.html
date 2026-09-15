@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>vidlink · 视频解析</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --panel2: #23262e; --line: #31353f;
+    --fg: #e6e8ec; --dim: #9aa1ad; --accent: #4c9aff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  .tag {
+    font: 12px/1 var(--mono); padding: 3px 7px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .tag.ease { color: var(--warn); border-color: #4a3a12; background: #2a2411; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; margin-bottom: 14px;
+  }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--dim); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .6px; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 0 0 4px; }
+  input, textarea, select, button {
+    font: 13px/1.5 var(--mono); color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; width: 100%;
+  }
+  input:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 60px; }
+  button { cursor: pointer; width: auto; transition: .12s; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: progress; }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; font-weight: 600; }
+  button.primary:hover { background: #2563eb; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > .col { flex: 1 1 200px; min-width: 150px; }
+  .row > .col.narrow { flex: 0 1 130px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .hidden { display: none !important; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td.mono, .mono { font-family: var(--mono); }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .url {
+    font-family: var(--mono); font-size: 12px; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px;
+    word-break: break-all; max-height: 120px; overflow: auto;
+  }
+  .status { font-size: 12px; font-family: var(--mono); color: var(--dim); }
+  .status .code-2 { color: var(--ok); }
+  .status .code-4, .status .code-5 { color: var(--err); }
+  .err { border-color: #5a1e1e; background: #241417; }
+  .err h2 { color: var(--err); }
+  .warnbox { border-color: #4a3a12; background: #241f11; color: #e3c46a; font-size: 12px; }
+  .cover { max-width: 168px; border-radius: 8px; border: 1px solid var(--line); }
+  .thumb { max-width: 88px; border-radius: 6px; border: 1px solid var(--line); }
+  .flex { display: flex; gap: 14px; flex-wrap: wrap; }
+  .flex > .grow { flex: 1 1 320px; min-width: 260px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  pre {
+    background: #0f1115; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; overflow: auto; max-height: 420px;
+    font: 12px/1.5 var(--mono); margin: 8px 0 0;
+  }
+  .pill { font: 11px/1 var(--mono); padding: 2px 6px; border-radius: 999px;
+          border: 1px solid var(--line); color: var(--dim); }
+  .pill.ok { color: var(--ok); border-color: #1d3d24; }
+  .pill.bad { color: var(--err); border-color: #4a1f1f; }
+  footer { color: var(--dim); font-size: 12px; text-align: center; padding: 8px 0 28px; }
+  footer code { font-family: var(--mono); }
+  @media (max-width: 560px) { .kv { grid-template-columns: 84px 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>vidlink</h1>
+  <span class="tag ease" id="modeTag">…</span>
+  <span class="tag" id="verTag">…</span>
+  <span class="tag" id="platTag">…</span>
+  <span class="status" id="hdr" style="margin-left:auto"></span>
+</header>
+
+<main>
+  <div class="warnbox" style="border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:14px">
+    免校验模式：本页直接调用解析接口，<b>不需要 API Key</b>，也<b>不计量配额</b>
+    （响应里没有 <code>X-Quota-Consumed</code> / <code>X-Quota-Remaining</code>）。
+    请勿把本服务暴露到公网。
+  </div>
+
+  <!-- 单个解析 -->
+  <section>
+    <h2>解析一条</h2>
+    <div class="row">
+      <div class="col" style="flex:3 1 380px">
+        <label for="url">分享链接或整段分享文案</label>
+        <input id="url" placeholder="https://v.douyin.com/xxxx/  或  https://www.bilibili.com/video/BV..." autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label for="quality">清晰度</label>
+        <input id="quality" list="qlist" placeholder="自动" autocomplete="off">
+        <datalist id="qlist">
+          <option value="1080"></option><option value="720"></option>
+          <option value="480"></option><option value="360"></option>
+        </datalist>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="col narrow">
+        <label for="platform">平台（可选）</label>
+        <select id="platform"><option value="">自动识别</option></select>
+      </div>
+      <div class="col">
+        <label for="vid">内容 ID（与平台搭配，可替代链接）</label>
+        <input id="vid" placeholder="BV1xx411c7mD / 7658147082263416115" autocomplete="off">
+      </div>
+    </div>
+    <div class="btns">
+      <button class="primary" data-act="links">取直链</button>
+      <button data-act="info">只看元信息</button>
+      <button data-act="detail">全部详情</button>
+      <button data-act="clear" style="margin-left:auto">清空结果</button>
+    </div>
+    <div class="hint">直链带防盗链要求，下载/播放时要带上结果里的 <code>headers</code>。</div>
+  </section>
+
+  <!-- 批量 -->
+  <section>
+    <h2>批量取直链（5 ~ 20 条，抖音不支持）</h2>
+    <textarea id="batch" placeholder="每行一条链接，例如：&#10;https://www.bilibili.com/video/BV1xx411c7mD&#10;https://v.kuaishou.com/xxxx/"></textarea>
+    <div class="btns">
+      <button data-act="batch">批量解析</button>
+      <button data-act="batchfill">填入当前链接</button>
+      <span class="status" id="batchCount" style="align-self:center"></span>
+    </div>
+  </section>
+
+  <!-- 结果 -->
+  <section id="result" class="hidden">
+    <h2>结果</h2>
+    <div class="status" id="status"></div>
+    <div id="view"></div>
+    <details>
+      <summary>原始 JSON 响应</summary>
+      <pre id="raw"></pre>
+    </details>
+  </section>
+
+  <section id="platsec">
+    <h2>平台与能力</h2>
+    <div id="plats"></div>
+  </section>
+
+  <footer>
+    接口文档 <code>docs/API.md</code> · 服务端 <code>vidlink</code> ·
+    本页由服务端内嵌，无任何外部资源
+  </footer>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (s) => document.querySelector(s);
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null && text !== "") n.textContent = String(text);
+    return n;
+  };
+  let proxyEnabled = false;
+
+  // ---------- 基础设施 ----------
+
+  async function api(path, opts) {
+    const t0 = performance.now();
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) { body = { raw: text }; }
+    return { status: res.status, ms: Math.round(performance.now() - t0), body, headers: res.headers };
+  }
+
+  function setStatus(res, extra) {
+    const s = $("#status");
+    s.textContent = "";
+    const cls = "code-" + String(res.status)[0];
+    s.appendChild(el("span", cls, "HTTP " + res.status));
+    s.appendChild(document.createTextNode("  " + res.ms + " ms"));
+    if (extra) s.appendChild(document.createTextNode("  " + extra));
+  }
+
+  function fail(res) {
+    const box = $("#result");
+    box.classList.remove("hidden");
+    box.classList.remove("err");
+    box.classList.add("err");
+    setStatus(res);
+    const v = $("#view");
+    v.textContent = "";
+    const e = (res.body && res.body.error) || {};
+    const box2 = el("div");
+    box2.appendChild(el("div", "mono", "kind: " + (e.kind || "unknown")));
+    box2.appendChild(el("div", null, e.message || "（没有错误信息）"));
+    if (e.request_id) box2.appendChild(el("div", "mono", "request_id: " + e.request_id));
+    v.appendChild(box2);
+    $("#raw").textContent = JSON.stringify(res.body, null, 2);
+  }
+
+  function ok(res) {
+    const box = $("#result");
+    box.classList.remove("hidden", "err");
+    setStatus(res);
+    $("#raw").textContent = JSON.stringify(res.body, null, 2);
+    return $("#view");
+  }
+
+  async function copy(text, btn) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      const ta = document.createElement("textarea");   // 非安全上下文（局域网 http）没有 clipboard API
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch (e) { alert("复制失败，请手动选中"); }
+      ta.remove();
+    }
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = "已复制";
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    }
+  }
+
+  function copyBtn(text, label) {
+    const b = el("button", null, label || "复制");
+    b.addEventListener("click", () => copy(text, b));
+    return b;
+  }
+
+  function openBtn(url, label) {
+    const b = el("button", null, label || "打开");
+    b.addEventListener("click", () => window.open(url, "_blank", "noopener"));
+    return b;
+  }
+
+  function prettyNum(n) {
+    if (!n) return "";
+    if (n >= 1e8) return (n / 1e8).toFixed(1).replace(/\.0$/, "") + " 亿";
+    if (n >= 1e4) return (n / 1e4).toFixed(1).replace(/\.0$/, "") + " 万";
+    return String(n);
+  }
+
+  function prettySize(n) {
+    if (!n) return "";
+    const u = ["B", "KB", "MB", "GB"]; let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v < 10 && i > 0 ? 1 : 0) + u[i];
+  }
+
+  function prettyDur(s) {
+    if (!s) return "";
+    s = Math.round(s);
+    const m = Math.floor(s / 60), r = s % 60;
+    return m + ":" + String(r).padStart(2, "0");
+  }
+
+  // ---------- 渲染 ----------
+
+  function renderAuthorInfo(v, d) {
+    const wrap = el("div", "flex");
+    if (d.cover) {
+      const img = el("img", "cover"); img.src = d.cover; img.alt = "封面";
+      img.referrerPolicy = "no-referrer"; img.loading = "lazy";
+      img.addEventListener("error", () => img.remove());
+      wrap.appendChild(img);
+    }
+    const g = el("div", "grow");
+    const dl = el("dl", "kv");
+    const add = (k, val) => {
+      if (val === undefined || val === null || val === "") return;
+      dl.appendChild(el("dt", null, k));
+      dl.appendChild(el("dd", null, val));
+    };
+    add("平台", d.platform); add("ID", d.id); add("标题", d.title);
+    add("作者", d.author && d.author.name);
+    if (d.stats) {
+      const s = d.stats, bits = [];
+      if (s.view) bits.push("播放 " + prettyNum(s.view));
+      if (s.like) bits.push("点赞 " + prettyNum(s.like));
+      if (s.danmaku) bits.push("弹幕 " + prettyNum(s.danmaku));
+      if (s.duration) bits.push("时长 " + prettyDur(s.duration));
+      add("统计", bits.join(" · "));
+    }
+    if (d.warning) add("提示", d.warning);
+    if (d.cached) add("缓存", "命中");
+    g.appendChild(dl);
+    if (d.source_url) {
+      const row = el("div", "btns");
+      row.appendChild(openBtn(d.source_url, "打开原页面"));
+      g.appendChild(row);
+    }
+    wrap.appendChild(g);
+    return wrap;
+  }
+
+  function streamTable(list, opts) {
+    const t = el("table");
+    const tr = el("tr");
+    ["档位", "分辨率", "编码", "码率", "大小", "操作"].forEach((h) => tr.appendChild(el("th", null, h)));
+    t.appendChild(tr);
+    list.forEach((s) => {
+      const r = el("tr");
+      r.appendChild(el("td", null, s.quality || s.quality_id || ""));
+      r.appendChild(el("td", "mono", (s.width && s.height) ? s.width + "×" + s.height : ""));
+      r.appendChild(el("td", "mono", s.codec || ""));
+      r.appendChild(el("td", "mono", s.bandwidth ? Math.round(s.bandwidth / 1000) + " kbps" : ""));
+      r.appendChild(el("td", "mono", prettySize(s.size)));
+      const td = el("td");
+      const box = el("div", "btns");
+      box.appendChild(copyBtn(s.url, "复制地址"));
+      box.appendChild(openBtn(s.url, "打开"));
+      if (opts && opts.proxy) {
+        const p = "/v1/proxy?url=" + encodeURIComponent(s.url);
+        box.appendChild(openBtn(p, "代理播放"));
+      }
+      td.appendChild(box);
+      r.appendChild(td);
+      t.appendChild(r);
+    });
+    return t;
+  }
+
+  function renderLinks(d) {
+    const box = el("div");
+    const urlBox = el("div", "url", d.url);
+    box.appendChild(urlBox);
+    const btns = el("div", "btns");
+    btns.appendChild(copyBtn(d.url, "复制直链"));
+    btns.appendChild(openBtn(d.url, "浏览器打开"));
+    if (proxyEnabled) btns.appendChild(openBtn("/v1/proxy?url=" + encodeURIComponent(d.url), "代理播放"));
+    box.appendChild(btns);
+
+    if (d.needs_mux) {
+      const w = el("div", "warnbox", "该平台为 DASH 分离流：还需要下载 audio_url 并用 ffmpeg 混流（-c copy）。");
+      w.style.border = "1px solid var(--line)"; w.style.borderRadius = "8px";
+      w.style.padding = "8px"; w.style.marginTop = "10px";
+      box.appendChild(w);
+    }
+    if (d.audio_url) {
+      box.appendChild(el("h2", null, "音频轨"));
+      box.appendChild(el("div", "url", d.audio_url));
+      const b2 = el("div", "btns");
+      b2.appendChild(copyBtn(d.audio_url, "复制音频地址"));
+      b2.appendChild(openBtn(d.audio_url, "打开"));
+      box.appendChild(b2);
+    }
+    if (d.backup_urls && d.backup_urls.length) {
+      const det = el("details");
+      det.appendChild(el("summary", null, "备用直链（" + d.backup_urls.length + " 条，CDN 容灾）"));
+      d.backup_urls.forEach((u) => det.appendChild(el("div", "url", u)));
+      box.appendChild(det);
+    }
+    if (d.headers && Object.keys(d.headers).length) {
+      box.appendChild(el("h2", null, "必须携带的请求头"));
+      const t = el("table");
+      Object.keys(d.headers).forEach((k) => {
+        const r = el("tr");
+        r.appendChild(el("td", null, k));
+        r.appendChild(el("td", "mono", d.headers[k]));
+        t.appendChild(r);
+      });
+      box.appendChild(t);
+      const b3 = el("div", "btns");
+      b3.appendChild(copyBtn(Object.keys(d.headers).map((k) => k + ": " + d.headers[k]).join("\n"), "复制全部请求头"));
+      b3.appendChild(copyBtn("curl -H '" + Object.keys(d.headers).map((k) => k + ": " + d.headers[k]).join("' -H '") + "' -o out.mp4 '" + d.url + "'", "复制 curl 命令"));
+      box.appendChild(b3);
+      const cmd = el("pre", null, "ffmpeg -headers '" + Object.keys(d.headers).map((k) => k + ": " + d.headers[k]).join("\r\n") + "' -i \"" + d.url + "\"" +
+        (d.audio_url ? " -headers '" + Object.keys(d.headers).map((k) => k + ": " + d.headers[k]).join("\r\n") + "' -i \"" + d.audio_url + "\" -c copy out.mp4" : " -c copy out.mp4"));
+      const det2 = el("details");
+      det2.appendChild(el("summary", null, "ffmpeg 命令"));
+      det2.appendChild(cmd);
+      box.appendChild(det2);
+    }
+    return box;
+  }
+
+  function renderInfo(d, full) {
+    const box = el("div");
+    box.appendChild(renderAuthorInfo(null, d));
+    if (d.qualities && d.qualities.length) {
+      box.appendChild(el("h2", null, "可用档位"));
+      const t = el("table");
+      const tr = el("tr");
+      ["高度", "标签", "原始档位码", "编码"].forEach((h) => tr.appendChild(el("th", null, h)));
+      t.appendChild(tr);
+      d.qualities.forEach((q) => {
+        const r = el("tr");
+        r.appendChild(el("td", "mono", q.height));
+        r.appendChild(el("td", null, q.label));
+        r.appendChild(el("td", "mono", q.quality_id));
+        r.appendChild(el("td", "mono", (q.codecs || []).join(", ")));
+        t.appendChild(r);
+      });
+      box.appendChild(t);
+      const best = d.qualities.reduce((a, b) => (b.height > a.height ? b : a), d.qualities[0]);
+      const b = el("button", null, "把清晰度设为最高档（" + best.height + "）");
+      b.addEventListener("click", () => {
+        $("#quality").value = String(best.height);
+        $("#quality").focus();
+      });
+      const bar = el("div", "btns");
+      bar.appendChild(b);
+      box.appendChild(bar);
+    }
+    if (d.images && d.images.length) {
+      box.appendChild(el("h2", null, "图集（" + d.images.length + " 张）"));
+      const g = el("div", "flex");
+      d.images.forEach((im) => {
+        const cell = el("div");
+        const img = el("img", "thumb"); img.src = im.url; img.loading = "lazy";
+        img.referrerPolicy = "no-referrer";
+        img.addEventListener("error", () => img.remove());
+        cell.appendChild(img);
+        const wrap = el("div", "btns");
+        wrap.appendChild(copyBtn(im.url, "复制"));
+        if (im.live_photo_url) wrap.appendChild(copyBtn(im.live_photo_url, "实况"));
+        cell.appendChild(wrap);
+        g.appendChild(cell);
+      });
+      box.appendChild(g);
+    }
+    if (full) {
+      if (d.videos && d.videos.length) {
+        box.appendChild(el("h2", null, "视频轨"));
+        box.appendChild(streamTable(d.videos, { proxy: proxyEnabled }));
+      }
+      if (d.audios && d.audios.length) {
+        box.appendChild(el("h2", null, "音频轨"));
+        box.appendChild(streamTable(d.audios, { proxy: false }));
+      }
+      if (d.subtitles && d.subtitles.length) {
+        box.appendChild(el("h2", null, "字幕"));
+        const t = el("table");
+        d.subtitles.forEach((s) => {
+          const r = el("tr");
+          r.appendChild(el("td", null, s.name || s.lang));
+          r.appendChild(el("td", "mono", s.format || ""));
+          const td = el("td"); td.appendChild(openBtn(s.url, "打开")); r.appendChild(td);
+          t.appendChild(r);
+        });
+        box.appendChild(t);
+      }
+      if (d.music) {
+        box.appendChild(el("h2", null, "背景音乐"));
+        box.appendChild(el("div", "url", d.music.url));
+      }
+    }
+    return box;
+  }
+
+  function renderBatch(d) {
+    const box = el("div");
+    const sum = el("div", "btns");
+    sum.appendChild(el("span", "pill ok", "成功 " + d.success));
+    sum.appendChild(el("span", "pill bad", "失败 " + d.failed));
+    sum.appendChild(el("span", "pill", "共 " + d.total));
+    box.appendChild(sum);
+    const t = el("table");
+    const tr = el("tr");
+    ["输入", "状态", "结果"].forEach((h) => tr.appendChild(el("th", null, h)));
+    t.appendChild(tr);
+    (d.results || []).forEach((it) => {
+      const r = el("tr");
+      r.appendChild(el("td", "mono", it.input));
+      const st = el("td");
+      st.appendChild(it.links ? el("span", "pill ok", "成功") : el("span", "pill bad", (it.error && it.error.kind) || "失败"));
+      r.appendChild(st);
+      const td = el("td");
+      if (it.links) {
+        td.appendChild(el("div", "url", it.links.url));
+        const b = el("div", "btns");
+        b.appendChild(copyBtn(it.links.url, "复制"));
+        if (proxyEnabled) b.appendChild(openBtn("/v1/proxy?url=" + encodeURIComponent(it.links.url), "代理播放"));
+        td.appendChild(b);
+      } else if (it.error) {
+        td.appendChild(el("div", null, it.error.message));
+      }
+      r.appendChild(td);
+      t.appendChild(r);
+    });
+    box.appendChild(t);
+    return box;
+  }
+
+  // ---------- 动作 ----------
+
+  function target() {
+    const url = $("#url").value.trim();
+    const platform = $("#platform").value;
+    const id = $("#vid").value.trim();
+    if (!url && !(platform && id)) return { err: "请填链接，或同时填平台与内容 ID" };
+    if (!url && !id) return { err: "填了平台就必须再填内容 ID" };
+    if (url) return { q: "url=" + encodeURIComponent(url) };
+    return { q: "platform=" + encodeURIComponent(platform) + "&id=" + encodeURIComponent(id) };
+  }
+
+  async function run(act) {
+    const t = target();
+    if (t.err) { alert(t.err); return; }
+    const q = $("#quality").value.trim();
+    let path = "/v1/" + act + "?" + t.q;
+    if (q && (act === "links")) path += "&quality=" + encodeURIComponent(q);
+    if (act === "info" && q) path += "&quality=" + encodeURIComponent(q);
+    await go(path, act);
+  }
+
+  async function runBatch() {
+    const lines = $("#batch").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (lines.length < 5 || lines.length > 20) {
+      alert("批量需要 5 ~ 20 条，当前 " + lines.length + " 条。少于 5 条请用上面的「取直链」。");
+      return;
+    }
+    await go("/v1/batch/links", "batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ urls: lines, quality: $("#quality").value.trim() }),
+    });
+  }
+
+  async function go(path, act, opts) {
+    const btns = document.querySelectorAll("button[data-act]");
+    btns.forEach((b) => b.disabled = true);
+    try {
+      const res = await api(path, opts);
+      if (res.status !== 200) { fail(res); return; }
+      const v = ok(res);
+      v.textContent = "";
+      if (act === "links") v.appendChild(renderLinks(res.body));
+      else if (act === "detail") {
+        if (res.body.needs_mux && !res.body.audio_url) {
+          const w = el("div", "warnbox", "DASH 分离流：视频与音频分开，需自行混流。");
+          w.style.cssText = "border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:10px";
+          v.appendChild(w);
+        }
+        v.appendChild(renderInfo(res.body, true));
+      } else if (act === "info") v.appendChild(renderInfo(res.body, false));
+      else if (act === "batch") v.appendChild(renderBatch(res.body));
+    } catch (e) {
+      $("#result").classList.remove("hidden");
+      $("#view").textContent = "请求失败：" + e;
+      $("#status").textContent = "";
+    } finally {
+      btns.forEach((b) => b.disabled = false);
+    }
+  }
+
+  // ---------- 初始化 ----------
+
+  async function boot() {
+    try {
+      const h = await api("/v1/health");
+      if (h.body && h.body.mode) {
+        $("#modeTag").textContent = h.body.mode === "ease" ? "免校验模式" : "账户模式";
+      }
+      if (h.body && h.body.version) $("#verTag").textContent = "v" + h.body.version;
+      // 媒体代理是否开启由健康检查直接告知，避免额外发一次注定 404 的探测请求
+      proxyEnabled = !!(h.body && h.body.proxy);
+      $("#hdr").textContent = proxyEnabled ? "媒体代理：开启" : "媒体代理：关闭";
+    } catch (_) { /* 页面能用就行，失败不阻塞 */ }
+
+    try {
+      const p = await api("/v1/platforms");
+      const list = (p.body && p.body.platforms) || [];
+      const sel = $("#platform");
+      list.forEach((x) => {
+        const o = el("option", null, x.name + (x.batch ? "" : "（不支持批量）"));
+        o.value = x.name;
+        sel.appendChild(o);
+      });
+      $("#platTag").textContent = list.length + " 个平台";
+      const box = $("#plats");
+      const t = el("table");
+      const tr = el("tr");
+      ["平台", "域名", "按 ID 解析", "批量", "说明"].forEach((h) => tr.appendChild(el("th", null, h)));
+      t.appendChild(tr);
+      list.forEach((x) => {
+        const r = el("tr");
+        r.appendChild(el("td", null, x.name));
+        r.appendChild(el("td", "mono", (x.hosts || []).join(", ")));
+        r.appendChild(el("td", null, x.supports_id ? "支持" : "—"));
+        r.appendChild(el("td", null, x.batch ? "支持" : "不支持"));
+        r.appendChild(el("td", null, x.batch ? "" : (x.batch_reason || "")));
+        t.appendChild(r);
+      });
+      box.appendChild(t);
+    } catch (_) { /* 同上 */ }
+  }
+
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === "clear") {
+      $("#result").classList.add("hidden");
+      $("#view").textContent = ""; $("#raw").textContent = ""; $("#status").textContent = "";
+      return;
+    }
+    if (act === "batch") { runBatch(); return; }
+    if (act === "batchfill") {
+      const u = $("#url").value.trim();
+      if (u) $("#batch").value = ($("#batch").value.trim() ? $("#batch").value.trim() + "\n" : "") + u;
+      return;
+    }
+    run(act);
+  });
+
+  $("#batch").addEventListener("input", () => {
+    const n = $("#batch").value.split("\n").map((s) => s.trim()).filter(Boolean).length;
+    const s = $("#batchCount");
+    s.textContent = n ? n + " 条" + (n < 5 ? "（至少 5 条）" : n > 20 ? "（最多 20 条）" : "") : "";
+    s.style.color = (n && (n < 5 || n > 20)) ? "var(--err)" : "var(--dim)";
+  });
+
+  $("#url").addEventListener("keydown", (e) => { if (e.key === "Enter") run("links"); });
+  boot();
+})();
+</script>
+</body>
+</html>
