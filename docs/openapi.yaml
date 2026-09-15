@@ -394,7 +394,10 @@ components:
       name: url
       in: query
       required: false
-      description: 分享链接或整段分享文案（自动提取链接）。与 platform + id 二选一。
+      description: |
+        分享链接或整段分享文案（自动从文本里提取链接）。
+        **可以不带 `http://`**（如 `www.bilibili.com/video/BV1xx`，会自动补成 https）。
+        与 platform + id 二选一。
       schema: { type: string }
     Platform:
       name: platform

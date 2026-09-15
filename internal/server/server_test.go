@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -1165,5 +1166,46 @@ func TestAccountModeRootStaysText(t *testing.T) {
 	}
 	if strings.Contains(body, "<html") {
 		t.Error("账户模式的根路径不应返回网页")
+	}
+}
+
+// TestSchemeLessURLIsAccepted：用户只贴域名+路径（没有 http://）也要能解析。
+//
+// 从分享面板、聊天窗口、浏览器地址栏复制出来的链接经常没有 scheme。
+// 这类输入以前会被当成"平台内 ID"，路由失败后回一句"不支持的链接"，
+// 用户看到的现象就是"识别不了"。
+func TestSchemeLessURLIsAccepted(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	for _, in := range []string{
+		"stub.test/v/1",
+		"www.stub.test/v/1",
+		"https://stub.test/v/1",
+		"看看这个stub.test/v/1",
+	} {
+		w := do(h, http.MethodGet, "/v1/links?url="+url.QueryEscape(in), userHdr(env.userKey))
+		if w.Code != http.StatusOK {
+			t.Errorf("%q 应 200，得到 %d（%s）", in, w.Code, w.Body.String())
+		}
+	}
+	// 裸 ID 不能被误判成域名：它应走"识别不出链接"的分支，
+	// 并提示改用 platform + id（那条路是通的，见下一个断言）。
+	w := do(h, http.MethodGet, "/v1/links?url=BV1294y1Y7tU", userHdr(env.userKey))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("裸 ID 经 url= 应 400，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	kind, msg, _ := errBody(t, w)
+	if kind != "bad_input" {
+		t.Errorf("kind = %q，想要 bad_input", kind)
+	}
+	if !strings.Contains(msg, "平台") {
+		t.Errorf("错误信息应提示改用 platform + id，得到 %q", msg)
+	}
+
+	// 按 ID 解析的正路
+	if w := do(h, http.MethodGet,
+		"/v1/links?platform=bilibili&id=BV1294y1Y7tU", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Errorf("platform + id 应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
 }

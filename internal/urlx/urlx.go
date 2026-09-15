@@ -12,10 +12,29 @@ package urlx
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 
 	"vidlink/internal/core"
 )
+
+// bareDomainRe 匹配"缺 scheme 的链接"：域名 + 可选端口 + 可选路径/查询/片段。
+//
+// 刻意要求顶级域是**纯字母且至少两位**：
+//
+//	bilibili.com/video/BV1xx   ✅ 顶级域 com
+//	7.87                       ❌ 顶级域 "87" 是数字
+//	v1.0                       ❌ 同上
+//
+// 这条规则同时挡掉了分享文案里的版本号、小数、编号，
+// 它们是"把整段文本当裸 ID"这条老路径上真实出现过的输入。
+var bareDomainRe = regexp.MustCompile(
+	`(?i)^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d{1,5})?(?:[/?#]\S*)?$`)
+
+// bareURLInText 在整段文本里找第一个"缺 scheme 的链接"。
+// 用于文案与链接粘连、且原文里没有 http 字样的情形。
+var bareURLInText = regexp.MustCompile(
+	`(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d{1,5})?/[^\s，。！？；：、（）【】《》""'']*`)
 
 // Extract 从任意文本中提取第一个 http(s) 链接。
 //
@@ -27,28 +46,59 @@ func Extract(text string) (string, bool) {
 	}
 
 	// 优先按空白切分后再判断：能避免把后随的中文标点吞进 URL。
+	// 这里同时接受"缺 scheme"的写法（www.bilibili.com/video/...），
+	// 因为从分享面板/聊天窗口复制出来的链接经常没有 http://。
 	for _, field := range strings.Fields(s) {
-		if u := trimURL(field); isHTTP(u) {
+		if u, ok := normalize(trimURL(field)); ok {
 			return u, true
 		}
 	}
 
 	// 没有空白分隔时（整段就是一条 URL，或文案与 URL 粘连），
 	// 退化为扫描 "http" 起始位置。
-	idx := strings.Index(s, "http")
-	if idx < 0 {
+	if idx := strings.Index(s, "http"); idx >= 0 {
+		tail := s[idx:]
+		// 在 URL 中截断常见的中文/全角标点与空白
+		if end := strings.IndexAny(tail, " \t\r\n\u3000，。！？；：、（）【】《》“”‘’"); end >= 0 {
+			tail = tail[:end]
+		}
+		if u, ok := normalize(trimURL(tail)); ok {
+			return u, true
+		}
 		return "", false
 	}
-	tail := s[idx:]
-	// 在 URL 中截断常见的中文/全角标点与空白
-	if end := strings.IndexAny(tail, " \t\r\n\u3000，。！？；：、（）【】《》“”‘’"); end >= 0 {
-		tail = tail[:end]
+
+	// 最后再试一次：文案里可能只有一条缺 scheme 的链接，且与中文粘连。
+	if m := bareURLInText.FindString(s); m != "" {
+		if u, ok := normalize(trimURL(m)); ok {
+			return u, true
+		}
 	}
-	tail = trimURL(tail)
-	if !isHTTP(tail) {
+	return "", false
+}
+
+// normalize 把输入归一化成可解析的链接。
+//
+// 缺 scheme 时补 https://：现在几乎所有平台都强制 https，
+// 而 http:// 的写法会被部分平台跳转（多一次往返）。
+// 已经是 http(s) 的输入原样返回——不能动用户给的东西。
+func normalize(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return "", false
 	}
-	return tail, true
+	if isHTTP(s) {
+		return s, true
+	}
+	// 只补 scheme，不改其它字符；补完仍要能通过 url.Parse 才算数
+	if strings.Contains(s, "://") || !bareDomainRe.MatchString(s) {
+		return "", false
+	}
+	withScheme := "https://" + s
+	if !isHTTP(withScheme) {
+		return "", false
+	}
+	return withScheme, true
 }
 
 // trimURL 去掉 URL 两侧常见的包裹字符与尾随标点。
