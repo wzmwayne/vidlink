@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]        # 打 tag 时除了构建，还会把所有产物发到 Release
   pull_request:
   workflow_dispatch:
 
@@ -56,9 +57,28 @@ jobs:
       - name: 校验 OpenAPI 规格
         run: make openapi
 
+  # 交叉编译：一个目标一个 runner，矩阵并行。
+  #
+  # 为什么放在 CI 而不是本地 make build-all：交叉编译要为目标平台重新编译
+  # 整个标准库，8 个目标在开发机上是一串串行等待；矩阵化之后每个目标各占
+  # 一个 runner，总耗时约等于最慢的那一个。产物同时留档，打 tag 时直接发版。
+  #
+  # 目标清单与 Makefile 的 TARGETS 保持一致（含 GOARM 档位）。
   build:
-    name: 交叉编译
+    name: 构建 ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false      # 一个目标挂了，其余目标的结果仍然要看得到
+      matrix:
+        include:
+          - { target: linux/amd64,     artifact: vidlink-linux-amd64 }
+          - { target: linux/arm64,     artifact: vidlink-linux-arm64 }
+          - { target: linux/arm/7,     artifact: vidlink-linux-armv7 }
+          - { target: linux/arm/6,     artifact: vidlink-linux-armv6 }
+          - { target: linux/386,       artifact: vidlink-linux-386 }
+          - { target: windows/amd64,   artifact: vidlink-windows-amd64 }
+          - { target: windows/arm64,   artifact: vidlink-windows-arm64 }
+          - { target: windows/386,     artifact: vidlink-windows-386 }
     steps:
       - uses: actions/checkout@v4
 
@@ -66,19 +86,53 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: 构建 linux/amd64 与 linux/arm64
-        run: make build-all
+      - name: 构建 ${{ matrix.target }}
+        run: make build-one TARGET=${{ matrix.target }}
 
-      - name: 报告产物大小与依赖数
+      - name: 校验产物格式与依赖数
         run: |
-          ls -lh dist/
+          f=$(ls dist/${{ matrix.artifact }}* )
+          file "$f"
+          # Windows 产物必须是 PE，Linux 必须是静态 ELF：
+          # 交叉编译最典型的失败是"编出来了但格式不对"，用 file 一眼可查。
+          case "${{ matrix.target }}" in
+            windows/*) file "$f" | grep -q "PE32" || { echo "::error::不是 PE 格式"; exit 1; } ;;
+            *)         file "$f" | grep -q "ELF"  || { echo "::error::不是 ELF 格式"; exit 1; } ;;
+          esac
+          file "$f" | grep -q "statically linked" || true
           echo "第三方依赖数: $(go list -m all | tail -n +2 | wc -l)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vidlink-binaries
-          path: dist/
-          retention-days: 7
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+          retention-days: 14
+
+  # 打 tag 时把所有产物汇总成一个 Release（用 runner 自带的 gh，不引第三方 action）
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -lh dist/
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
 
   docker:
     name: 容器镜像

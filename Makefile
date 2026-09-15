@@ -9,6 +9,30 @@ GOOS    ?= $(shell go env GOOS)
 GOARCH  ?= $(shell go env GOARCH)
 LDFLAGS := -s -w -X main.buildVersion=$(VERSION)
 
+# 交叉编译目标清单，格式：GOOS/GOARCH[/GOARM]
+#
+# 只列真正会被用到的组合：Linux（arm32 / arm64 / x86_32 / amd64）与
+# Windows（x86_32 / amd64 / arm64）。BSD、Solaris、AIX、mips、riscv64
+# 这些"能编但没人拿来跑这个服务"的目标不列——每多一个目标就多一份
+# 需要在 CI 里长期维护的构建时间。
+#
+# arm32 分两档，因为树莓派横跨两代指令集：
+#   armv7 (GOARM=7)  Pi 2/3/4/5、Zero 2 W、绝大多数 ARM 路由/NAS
+#   armv6 (GOARM=6)  Pi 1、Zero（第一代）、更老的 ARMv6 设备
+#
+# 关于 Windows 7：Go 1.21 起官方已放弃 Windows 7/8（要求 Windows 10+），
+# 而本项目又依赖 Go 1.22 的 ServeMux 路由语法，没法退回去迁就。
+# 因此 windows/* 这三个产物实际可用范围是 Windows 10/11。
+TARGETS := \
+	linux/amd64 \
+	linux/arm64 \
+	linux/arm/7 \
+	linux/arm/6 \
+	linux/386 \
+	windows/amd64 \
+	windows/arm64 \
+	windows/386
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -25,14 +49,34 @@ build-arm64: ## 构建树莓派用的 linux/arm64 二进制
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 	  go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY)-linux-arm64 .
 
+# outname 把 GOOS/GOARCH[/GOARM] 映射成产物文件名：
+#   linux/arm/7     -> vidlink-linux-armv7
+#   windows/amd64   -> vidlink-windows-amd64.exe
+# Windows 的后缀交给 Go 自己加（GOOS=windows 时它一定会加），
+# 我们只在打印时按 .exe 展示，避免出现 amd64.exe.exe 这种事。
+outname = $(BINARY)-$(subst /,-,$(subst arm/7,armv7,$(subst arm/6,armv6,$(TARGET))))
+
+.PHONY: build-one
+build-one: ## 构建单个目标：make build-one TARGET=linux/arm64
+	@test -n "$(TARGET)" || { echo "用法: make build-one TARGET=linux/arm64"; exit 1; }
+	@mkdir -p dist
+	@set -- $(subst /, ,$(TARGET)); \
+	  os=$$1; arch=$$2; arm=$$3; \
+	  echo "-> $(TARGET)"; \
+	  GOARM=$$arm CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
+	    go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(outname) . && \
+	  ls -lh dist/$(outname) | awk '{print "   " $$9 "  " $$5}'
+
 .PHONY: build-all
-build-all: ## 构建三个常用目标平台
-	@for t in linux/amd64 linux/arm64 darwin/arm64; do \
-	  os=$${t%%/*}; arch=$${t##*/}; \
-	  echo "-> $$os/$$arch"; \
-	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
-	    go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-$$os-$$arch . || exit 1; \
-	done
+build-all: ## 交叉编译全部目标到 dist/（一个失败就整体失败）
+	@mkdir -p dist
+	@fail=""; \
+	for t in $(TARGETS); do \
+	  $(MAKE) --no-print-directory build-one TARGET=$$t || fail="$$fail $$t"; \
+	done; \
+	echo; echo "产物清单:"; ls -1sh dist/ | tail -n +2; \
+	if [ -n "$$fail" ]; then echo; echo "以下目标构建失败:$$fail"; exit 1; fi; \
+	echo; echo "全部 $$(echo $(TARGETS) | wc -w) 个目标构建成功";
 
 .PHONY: run
 run: ## 本地启动（默认 :8080）

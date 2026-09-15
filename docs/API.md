@@ -250,14 +250,14 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 ### 3.1 `GET /v1/version` · 公开
 
 ```json
-{"version": "1.4.0", "api_version": "v1", "platform": "linux/arm64"}
+{"version": "v0.87", "api_version": "v1", "platform": "linux/arm64"}
 ```
 
 ### 3.2 `GET /v1/health` · 公开
 
 ```json
 {
-  "status": "ok", "version": "1.4.0", "api_version": "v1",
+  "status": "ok", "version": "v0.87", "api_version": "v1",
   "uptime_sec": 3821, "requests": 10422, "errors": 37,
   "cache": {"entries": 128, "hits": 9014, "misses": 1408, "coalesced": 52, "loads": 1408}
 }

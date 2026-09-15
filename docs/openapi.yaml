@@ -2,7 +2,7 @@ openapi: 3.0.3
 
 info:
   title: vidlink API
-  version: "1.4.0"
+  version: "0.87.0"
   description: |
     多平台视频解析 API：输入分享链接或平台内容 ID，返回平台已发布的直链。
     支持抖音、哔哩哔哩、快手、小红书。人读版本见 API.md，系数见 配额倍率表.md。
