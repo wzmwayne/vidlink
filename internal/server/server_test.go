@@ -1101,6 +1101,12 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`/v1/platforms`,
 		`/v1/batch/links`,
 		`X-Quota`, // 页面显式说明本模式不计量
+		// 浏览器内混流：流式下载（OPFS）→ 片段级重排 → 保存到本地
+		`id="muxStart"`,
+		`id="muxVideo"`,
+		`id="muxSave"`,
+		`navigator.storage.getDirectory`,
+		`canPlayType`, // 无 H.264 解码器的浏览器要给出解释，而不是静默失败
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("页面缺少 %q", want)
@@ -1112,7 +1118,9 @@ func TestEaseModeRootServesUI(t *testing.T) {
 			t.Errorf("页面引用了外部资源: %q", forbidden)
 		}
 	}
-	if len(body) > 80*1024 {
+	// 上限设为 120KB：混流器（自己实现的 fMP4 重排）占了大头，
+	// 但它换掉的是"外链 mp4box.js / 25MB ffmpeg.wasm"这条路。
+	if len(body) > 120*1024 {
 		t.Errorf("页面过大（%d 字节），内嵌资源应保持精简", len(body))
 	}
 }

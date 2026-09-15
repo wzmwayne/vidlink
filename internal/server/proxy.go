@@ -141,7 +141,10 @@ func (s *Server) proxyHostAllowed(host string) bool {
 func defaultReferer(host string) string {
 	switch {
 	case urlx.HostHasSuffix(host, "bilibili.com"), urlx.HostHasSuffix(host, "bilivideo.com"),
-		urlx.HostHasSuffix(host, "hdslb.com"), urlx.HostHasSuffix(host, "akamaized.net"):
+		urlx.HostHasSuffix(host, "hdslb.com"), urlx.HostHasSuffix(host, "akamaized.net"),
+		// B 站的 P2P CDN：实测 *.edge.mountaintoys.cn 同时要求 Referer 与 UA，
+		// 缺任一个都返回 403（浏览器无法自行携带 Referer，只能靠代理补）。
+		urlx.HostHasSuffix(host, "mountaintoys.cn"), urlx.HostHasSuffix(host, "p2pcdn.com"):
 		return "https://www.bilibili.com/"
 	case urlx.HostHasSuffix(host, "douyin.com"), urlx.HostHasSuffix(host, "douyinvod.com"),
 		urlx.HostHasSuffix(host, "zjcdn.com"), urlx.HostHasSuffix(host, "ixigua.com"):

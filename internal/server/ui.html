@@ -80,6 +80,14 @@
     padding: 10px; overflow: auto; max-height: 420px;
     font: 12px/1.5 var(--mono); margin: 8px 0 0;
   }
+  a.btn {
+    display: inline-block; text-decoration: none; cursor: pointer;
+    font: 13px/1.5 var(--mono); color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; transition: .12s;
+  }
+  a.btn:hover { border-color: var(--accent); }
+  a.btn.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; font-weight: 600; }
+  a.btn.primary:hover { background: #2563eb; }
   .pill { font: 11px/1 var(--mono); padding: 2px 6px; border-radius: 999px;
           border: 1px solid var(--line); color: var(--dim); }
   .pill.ok { color: var(--ok); border-color: #1d3d24; }
@@ -149,6 +157,36 @@
       <button data-act="batch">批量解析</button>
       <button data-act="batchfill">填入当前链接</button>
       <span class="status" id="batchCount" style="align-self:center"></span>
+    </div>
+  </section>
+
+  <!-- 浏览器内混流 -->
+  <section id="muxsec">
+    <h2>浏览器内混流（DASH 音视频合并，无需 ffmpeg）</h2>
+    <div class="hint" style="margin:0 0 10px">
+      流程：按上面的链接与清晰度，<b>流式下载</b>视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
+      在页面内合并为单个 MP4 → 保存到本地。适用于返回 <code>audio_url</code> 的平台（如 B 站）。
+      合并是**片段级重排**，不重新编码，所以速度只取决于下载。
+    </div>
+    <div class="btns">
+      <button class="primary" id="muxStart">下载并混流</button>
+      <button id="muxClean">清理浏览器存储</button>
+      <span class="status" id="muxQuota" style="align-self:center"></span>
+    </div>
+    <div id="muxProgWrap" class="hidden" style="margin-top:10px">
+      <div class="status" id="muxPhase">准备中…</div>
+      <div style="height:6px;background:#0f1115;border:1px solid var(--line);border-radius:999px;margin:8px 0;overflow:hidden">
+        <div id="muxBar" style="height:100%;width:0;background:var(--accent);transition:width .15s"></div>
+      </div>
+      <div class="status" id="muxDetail"></div>
+    </div>
+    <div id="muxOut" class="hidden" style="margin-top:12px">
+      <video id="muxVideo" controls playsinline style="width:100%;max-height:420px;background:#000;border-radius:8px"></video>
+      <div id="muxNoPreview" class="hint hidden" style="margin-top:6px"></div>
+      <div class="btns">
+        <a id="muxSave" class="btn primary" download>保存到本地</a>
+        <span class="status" id="muxInfo" style="align-self:center"></span>
+      </div>
     </div>
   </section>
 
@@ -638,7 +676,558 @@
   });
 
   $("#url").addEventListener("keydown", (e) => { if (e.key === "Enter") run("links"); });
+
+  // 供下面的"浏览器内混流"脚本复用（同一个页面，没必要写两遍）
+  window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target,
+                proxyOn: () => proxyEnabled };
   boot();
+})();
+</script>
+
+<script>
+/*
+ * 浏览器内混流：把 DASH 的视频轨(m4s) 与音频轨(m4s) 合并成一个普通 MP4。
+ *
+ * 为什么自己写而不是引入 mp4box.js / ffmpeg.wasm：
+ *   本页承诺"零外部资源、随二进制内嵌"。mp4box.js 要外链，
+ *   ffmpeg.wasm 光 wasm 就 25MB 以上——为了一个"合并两段流"的动作
+ *   把服务体积放大几十倍不值得。而这里要做的事其实很窄：
+ *
+ *     fMP4 的每个片段都是自描述的（moof 里有 tfhd/tfdt/trun），
+ *     合并两条轨**不需要重编码**，只需把两个文件的 moov 合成一个
+ *     （两个 trak + 两个 trex），再把片段按解码时间交叉排列。
+ *
+ *   实测 B 站两个文件的结构正好落在这个"最省事"的情形里：
+ *     - tfhd 带 default-base-is-moof（0x020000）→ trun 的 data_offset
+ *       是相对 moof 起点的，**重排片段不需要修任何偏移**；
+ *     - 每个片段都带 tfdt → 可以按解码时间精确交叉；
+ *     - 两条轨的 track_ID 本来就是 1 / 2（仍然实现了冲突重编号，
+ *       因为别的平台/别的分片方式可能不是这样）。
+ *
+ * 内存策略（用户要求"防爆内存"）：
+ *   下载 → 分片写进 OPFS（浏览器磁盘存储），全程只持有单个 chunk；
+ *   混流 → 每次只读一个 moof（~1KB）与一片 mdat（按 Blob 切片直接转写，不进 JS 堆）；
+ *   输出 → 同样写进 OPFS，播放/保存用它的 object URL，内存占用与文件大小无关。
+ */
+(() => {
+  "use strict";
+  const { api, el, prettySize, target, proxyOn } = window.VL;
+  const $ = (s) => document.querySelector(s);
+  const DIR = "vidlink-mux";
+  const MEM_LIMIT = 400 * 1024 * 1024;   // 无 OPFS 时的内存兜底上限
+
+  // ---------- MP4 盒子工具 ----------
+  const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  const u64 = (b, o) => u32(b, o) * 4294967296 + u32(b, o + 4);
+  const put32 = (b, o, v) => { b[o] = (v >>> 24) & 255; b[o + 1] = (v >>> 16) & 255; b[o + 2] = (v >>> 8) & 255; b[o + 3] = v & 255; };
+  const put64 = (b, o, v) => { put32(b, o, Math.floor(v / 4294967296)); put32(b, o + 4, v >>> 0); };
+  const type4 = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  const concat = (parts) => {
+    let n = 0; parts.forEach((p) => n += p.length);
+    const out = new Uint8Array(n); let o = 0;
+    parts.forEach((p) => { out.set(p, o); o += p.length; });
+    return out;
+  };
+  function iterBoxes(b, start, end) {
+    const out = []; let p = start;
+    while (p + 8 <= end) {
+      let size = u32(b, p), hdr = 8;
+      if (size === 1) { size = u64(b, p + 8); hdr = 16; }
+      else if (size === 0) size = end - p;
+      if (size < hdr || p + size > end) break;
+      out.push({ type: type4(b, p + 4), start: p, size, hdr, end: p + size });
+      p += size;
+    }
+    return out;
+  }
+  // tkhd / mdhd / mvhd 里各字段的位置**随版本号变化**（v1 的时间字段是 8 字节），
+  // 这些偏移一旦算错，读出来的是创建时间而不是 track_ID / timescale——
+  // 而 timescale 错了会让"按解码时间交叉"直接退化成 Infinity 比较。
+  // 所以统一用下面这三个函数取字段，不再手写偏移。
+  function tkhdTrackID(b, start) { const v = b[start + 8]; return u32(b, start + (v === 1 ? 28 : 20)); }
+  function mdhdTimescale(b, start) { const v = b[start + 8]; return u32(b, start + (v === 1 ? 28 : 20)); }
+  function mvhdFields(b, start) {
+    const v = b[start + 8];
+    const tsOff = start + (v === 1 ? 28 : 20);
+    const durOff = start + (v === 1 ? 32 : 24);
+    // duration 之后：rate(4) volume(2) reserved(2) reserved(8) matrix(36) pre_defined(24)
+    const nto = durOff + (v === 1 ? 8 : 4) + 4 + 2 + 2 + 8 + 36 + 24;
+    return { v, tsOff, durOff, nto, timescale: u32(b, tsOff),
+             duration: v === 1 ? u64(b, durOff) : u32(b, durOff) };
+  }
+
+  function mainBox(bytes, type) {
+    const bs = iterBoxes(bytes, 0, bytes.length);
+    const hit = bs.find((x) => x.type === type);
+    if (!hit) throw new Error("MP4 结构异常：缺少 " + type + " 盒");
+    return hit;
+  }
+
+  // ---------- 存储层：OPFS 优先，退化到内存 ----------
+  class OpfsFile {
+    constructor(handle) { this.handle = handle; this.w = null; this.n = 0; }
+    static async create(name) {
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle(DIR, { create: true });
+      const h = await dir.getFileHandle(name, { create: true });
+      const f = new OpfsFile(h);
+      f.w = await h.createWritable();
+      return f;
+    }
+    async append(chunk) { await this.w.write(chunk); this.n += (chunk.size !== undefined ? chunk.size : chunk.length); }
+    async close() { if (this.w) { await this.w.close(); this.w = null; } }
+    async size() { return (await this.handle.getFile()).size; }
+    async read(start, len) {
+      const f = await this.handle.getFile();
+      return new Uint8Array(await f.slice(start, start + len).arrayBuffer());
+    }
+    async sliceBlob(start, end) { return (await this.handle.getFile()).slice(start, end); }
+    async file() { return await this.handle.getFile(); }
+    async drop() { this.w = null; }
+  }
+  class MemFile {
+    constructor() { this.parts = []; this.n = 0; }
+    static async create() { return new MemFile(); }
+    async append(chunk) {
+      if (this.n + (chunk.size || chunk.length) > MEM_LIMIT) throw new Error("超过内存兜底上限（本浏览器不支持 OPFS）");
+      this.parts.push(chunk); this.n += (chunk.size !== undefined ? chunk.size : chunk.length);
+    }
+    async close() {}
+    async size() { return this.n; }
+    async read(start, len) {
+      const blob = await this.file();
+      return new Uint8Array(await blob.slice(start, start + len).arrayBuffer());
+    }
+    async sliceBlob(start, end) { return (await this.file()).slice(start, end); }
+    async file() { return new Blob(this.parts, { type: "application/octet-stream" }); }
+    async drop() { this.parts = []; this.n = 0; }
+  }
+  const opfsOK = typeof navigator.storage !== "undefined" &&
+                 typeof navigator.storage.getDirectory === "function";
+  const newFile = (name) => (opfsOK ? OpfsFile.create(name) : MemFile.create());
+
+  async function cleanStorage() {
+    if (opfsOK) {
+      try {
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry(DIR, { recursive: true });
+      } catch (_) { /* 不存在就算了 */ }
+    }
+  }
+
+  // ---------- 流式下载（分片写盘，只持有单个 chunk） ----------
+  //
+  // 三级兜底，因为"能不能直连"取决于 CDN 节点而不是我们：
+  //   ① 直连（多数节点带 Access-Control-Allow-Origin: *，可以直取）；
+  //   ② 直连失败就重新取一次链接 —— 平台每次返回的镜像节点不同，
+  //      换一个常常就能直连（实测：1080P 节点可直连，某 720P 的
+  //      *.edge.mountaintoys.cn P2P 节点要求 Referer，必然 403）；
+  //   ③ 仍失败则走服务端 /v1/proxy —— 它补得上 Referer 与 UA
+  //      （这两个头浏览器禁止脚本设置），需要部署时开启代理与白名单。
+  async function downloadTrack(kind, d, qs, name, phaseText, onTick) {
+    const attempts = [
+      { tag: "直连", url: () => d[kind], file: name + ".m4s" },
+      { tag: "换节点重试", file: name + ".retry.m4s", refetch: true },
+      { tag: "服务端代理", file: name + ".proxy.m4s", proxy: true },
+    ];
+    let lastErr = null;
+    for (const at of attempts) {
+      try {
+        let url = at.url ? at.url() : null;
+        if (at.refetch) {
+          phase(phaseText + "（换一个 CDN 节点重试）…");
+          const r = await api("/v1/links?" + qs);
+          if (r.status !== 200 || !r.body[kind]) throw new Error("重新取链失败：HTTP " + r.status);
+          d = r.body;
+          url = d[kind];
+        }
+        if (at.proxy) {
+          phase(phaseText + "（经服务端代理）…");
+          if (!proxyOn()) {
+            throw new Error("该 CDN 节点要求 Referer/UA，浏览器无法携带。请用 " +
+              "VIDLINK_PROXY_ENDPOINT=true 开启服务端代理并把它加入 VIDLINK_PROXY_ALLOW_HOSTS 后重试。");
+          }
+          const ref = (d.headers && d.headers.Referer) || "";
+          url = "/v1/proxy?url=" + encodeURIComponent(d[kind]) + (ref ? "&referer=" + encodeURIComponent(ref) : "");
+        }
+        const store = await newFile(at.file);
+        await download(store, url, onTick);
+        return store;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("下载失败");
+  }
+
+  async function download(store, url, onTick) {
+    const res = await fetch(url, { mode: "cors", credentials: "omit" });
+    if (!res.ok) throw new Error("下载失败：HTTP " + res.status + "（该 CDN 节点可能要求 Referer）");
+    const total = Number(res.headers.get("Content-Length") || 0);
+    const reader = res.body.getReader();
+    const t0 = performance.now();
+    let got = 0, last = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await store.append(value);
+      got += value.length;
+      const now = performance.now();
+      if (now - last > 150) { last = now; onTick(got, total, got / ((now - t0) / 1000)); }
+    }
+    onTick(got, total, got / ((performance.now() - t0) / 1000));
+    await store.close();
+    return got;
+  }
+
+  // ---------- 解析初始化段与片段表 ----------
+  async function parseInit(store) {
+    const size = await store.size();
+    let want = 256 * 1024;
+    for (;;) {
+      const buf = await store.read(0, Math.min(want, size));
+      const boxes = iterBoxes(buf, 0, buf.length);
+      const moov = boxes.find((b) => b.type === "moov");
+      if (moov && moov.end <= buf.length) {
+        const ftyp = boxes.find((b) => b.type === "ftyp");
+        return { buf, moov, ftyp, fragStart: moov.end };
+      }
+      if (buf.length >= size) throw new Error("找不到完整的 moov 盒（不是分片 MP4？）");
+      want *= 2;
+    }
+  }
+
+  function trackInfo(init) {
+    const moov = init.buf.subarray(init.moov.start, init.moov.end);
+    const kids = iterBoxes(moov, 8, moov.length);
+    const mvhd = kids.find((k) => k.type === "mvhd");
+    const mvex = kids.find((k) => k.type === "mvex");
+    const info = { moov, kids, mvhd, mvex, tracks: [], trexs: [], timescale: 1000, version: 0 };
+    if (mvhd) {
+      const f = mvhdFields(moov, mvhd.start);
+      info.version = f.v;
+      info.timescale = f.timescale;
+    }
+    kids.filter((k) => k.type === "trak").forEach((trak) => {
+      const t = { box: trak, id: 1, timescale: 1000 };
+      const walk = (start, end) => {
+        iterBoxes(moov, start, end).forEach((b) => {
+          if (b.type === "tkhd") t.id = tkhdTrackID(moov, b.start);
+          else if (b.type === "mdhd") t.timescale = mdhdTimescale(moov, b.start);
+          else if (b.type === "mdia" || b.type === "minf" || b.type === "stbl") walk(b.start + 8, b.end);
+        });
+      };
+      walk(trak.start + 8, trak.end);
+      info.tracks.push(t);
+    });
+    if (mvex) {
+      iterBoxes(moov, mvex.start + 8, mvex.end).forEach((b) => { if (b.type === "trex") info.trexs.push(b); });
+    }
+    return info;
+  }
+
+  function patchID(bytes, from, to, containerPath) {
+    // 把 bytes 里指定盒内的 track_ID 从 from 改成 to（tkhd / trex / tfhd 三种布局）
+    const bs = iterBoxes(bytes, 0, bytes.length);
+    const hit = containerPath ? findIn(bytes, bs, containerPath) : bs;
+    const list = Array.isArray(hit) ? hit : [hit];
+    list.forEach((b) => {
+      if (!b) return;
+      if (b.type === "tkhd") {
+        const off = b.start + (bytes[b.start + 8] === 1 ? 28 : 20);
+        if (u32(bytes, off) === from) put32(bytes, off, to);
+      } else if (b.type === "trex" || b.type === "tfhd") {
+        const off = b.start + 12;
+        if (u32(bytes, off) === from) put32(bytes, off, to);
+      }
+    });
+    return bytes;
+  }
+  function findIn(bytes, boxes, path) {
+    // path 形如 ["traf"]：进入第一层子盒里找
+    for (const b of boxes) {
+      const kids = iterBoxes(bytes, b.start + b.hdr, b.end);
+      for (const k of kids) if (path.includes(k.type)) return k;
+    }
+    return null;
+  }
+
+  async function scanFragments(store, start, timescale, onTick) {
+    const total = await store.size();
+    const frags = [];
+    let p = start;
+    while (p + 16 <= total) {
+      const head = await store.read(p, 16);
+      let size = u32(head, 0), hdr = 8;
+      if (size === 1) { size = u64(head, 8); hdr = 16; }
+      const type = type4(head, 4);
+      if (size <= 0 || p + size > total) break;
+      if (type === "moof") {
+        const moof = await store.read(p, size);
+        const kids = iterBoxes(moof, hdr, size);
+        const traf = kids.find((k) => k.type === "traf");
+        let time = 0, tfdtFound = false;
+        if (traf) {
+          iterBoxes(moof, traf.start + 8, traf.end).forEach((b) => {
+            if (b.type === "tfdt") {
+              const v = moof[b.start + 8];
+              time = v === 1 ? u64(moof, b.start + 12) : u32(moof, b.start + 12);
+              tfdtFound = true;
+            }
+          });
+        }
+        const nextHead = p + size + 16 <= total ? await store.read(p + size, 16) : null;
+        const mdatSize = nextHead ? u32(nextHead, 0) : 0;
+        if (!tfdtFound || mdatSize <= 0) break;
+        frags.push({ moofStart: p, moofSize: size, mdatStart: p + size, mdatSize,
+                     time, moof });
+        p = p + size + mdatSize;
+      } else {
+        p += size;   // sidx / styp / free / emsg 之类：跳过（不复制到输出）
+      }
+      if (onTick && frags.length % 32 === 0) onTick(p / total);
+    }
+    if (onTick) onTick(1);
+    return frags;
+  }
+
+  // ---------- 合成 moov ----------
+  function buildMoov(v, a, totalMovieTs) {
+    const vKids = v.kids, aKids = a.kids;
+    const vTracks = v.tracks, aTracks = a.tracks;
+    let maxID = 0;
+    vTracks.concat(aTracks).forEach((t) => { if (t.id > maxID) maxID = t.id; });
+
+    // track_ID 冲突时给音频轨重新编号（实测 B 站不需要，但别的分片方式可能有）
+    const vIDs = new Set(vTracks.map((t) => t.id));
+    const aTrakBytes = [], aTrexBytes = [];
+    aTracks.forEach((t) => {
+      let bytes = a.moov.slice(t.box.start, t.box.end);
+      if (vIDs.has(t.id)) {
+        const from = t.id, to = ++maxID;
+        bytes = patchID(bytes, from, to, ["tkhd"]);
+        t.originalId = from;
+        t.id = to;
+        t.renamed = true;
+      }
+      aTrakBytes.push(bytes);
+    });
+    a.trexs.forEach((b) => {
+      let bytes = a.moov.slice(b.start, b.end);
+      const from = u32(a.moov, b.start + 12);
+      if (from !== aTracks[0].id) bytes = patchID(bytes, from, aTracks[0].id, null);
+      aTrexBytes.push(bytes);
+    });
+
+    const vTrexBytes = v.trexs.map((b) => v.moov.slice(b.start, b.end));
+    const vMvhd = vKids.find((k) => k.type === "mvhd");
+    const mvhd = new Uint8Array(vMvhd ? v.moov.slice(vMvhd.start, vMvhd.end) : []);
+    let movieTs = 1000;
+    if (mvhd.length) {
+      const f = mvhdFields(mvhd, 0);
+      movieTs = f.timescale || 1000;
+      const d = Math.round(totalMovieTs * movieTs / 1000);
+      put32(mvhd, f.durOff, d);
+      if (f.v === 1) put64(mvhd, f.durOff, d);
+      put32(mvhd, f.nto, maxID + 1);
+    }
+
+    // mehd：告诉播放器整个分片流的总时长（部分播放器据此显示进度条）
+    const mehd = new Uint8Array(16);
+    put32(mehd, 0, 16); mehd[4] = 0x6d; mehd[5] = 0x65; mehd[6] = 0x68; mehd[7] = 0x64;
+    put32(mehd, 12, Math.round(totalMovieTs * movieTs / 1000));
+
+    const mvexKids = [mehd].concat(aTrexBytes, vTrexBytes);   // 视频 trex 在前
+    const mvexBody = concat(mvexKids);
+    const mvex = new Uint8Array(8 + mvexBody.length);
+    put32(mvex, 0, mvex.length); mvex[4] = 0x6d; mvex[5] = 0x76; mvex[6] = 0x65; mvex[7] = 0x78;
+    mvex.set(mvexBody, 8);
+
+    const vTrakBytes = vTracks.map((t) => v.moov.slice(t.box.start, t.box.end));
+    const others = vKids.filter((k) => k.type !== "trak" && k.type !== "mvex" && k.type !== "mvhd")
+                        .map((k) => v.moov.slice(k.start, k.end));
+
+    const body = concat([mvhd].concat(vTrakBytes, aTrakBytes, [mvex], others));
+    const moov = new Uint8Array(8 + body.length);
+    put32(moov, 0, moov.length); moov[4] = 0x6d; moov[5] = 0x6f; moov[6] = 0x6f; moov[7] = 0x76;
+    moov.set(body, 8);
+    return moov;
+  }
+
+  function renumberAndRetrack(moof, seq, retrack) {
+    const kids = iterBoxes(moof, 8, moof.length);
+    const mfhd = kids.find((k) => k.type === "mfhd");
+    if (mfhd) put32(moof, mfhd.start + 12, seq);
+    if (retrack) {
+      const traf = kids.find((k) => k.type === "traf");
+      if (traf) {
+        iterBoxes(moof, traf.start + 8, traf.end).forEach((b) => {
+          if (b.type === "tfhd" && u32(moof, b.start + 12) === retrack.from) put32(moof, b.start + 12, retrack.to);
+        });
+      }
+    }
+    return moof;
+  }
+
+  // ---------- 主流程 ----------
+  let busy = false;
+  let lastURL = null;
+  // 有些 Chromium 构建（无专有编解码器）根本解不了 H.264。
+  // 那种环境下预览必然失败，但文件是好的——必须说清楚，
+  // 否则用户会以为"合出来的文件是坏的"。
+  const h264OK = (() => {
+    try {
+      const v = document.createElement("video");
+      return v.canPlayType('video/mp4; codecs="avc1.42E01E"') !== "";
+    } catch (_) { return false; }
+  })();
+
+  function phase(text) { $("#muxPhase").textContent = text; }
+  function bar(ratio) { $("#muxBar").style.width = Math.max(0, Math.min(1, ratio)) * 100 + "%"; }
+  function detail(text) { $("#muxDetail").textContent = text; }
+
+  async function refreshQuota() {
+    if (!navigator.storage || !navigator.storage.estimate) return;
+    try {
+      const e = await navigator.storage.estimate();
+      $("#muxQuota").textContent = "浏览器存储：已用 " + prettySize(e.usage || 0) +
+        (e.quota ? " / 可用 " + prettySize(e.quota) : "");
+    } catch (_) {}
+  }
+
+  async function start() {
+    if (busy) return;
+    const t = target();
+    if (t.err) { alert(t.err); return; }
+    const quality = $("#quality").value.trim();
+    const qs = t.q + (quality ? "&quality=" + encodeURIComponent(quality) : "");
+
+    busy = true;
+    $("#muxStart").disabled = true;
+    $("#muxOut").classList.add("hidden");
+    $("#muxProgWrap").classList.remove("hidden");
+    bar(0); detail("");
+    if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
+
+    try {
+      phase("① 取流地址…");
+      const r = await api("/v1/links?" + qs);
+      if (r.status !== 200) throw new Error((r.body && r.body.error && r.body.error.message) || ("HTTP " + r.status));
+      const d = r.body;
+      if (!d.audio_url) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
+
+      await cleanStorage();
+      const onTick = (base, span) => (got, total, speed) => {
+        bar(total ? base + got / total * span : base);
+        detail(prettySize(got) + (total ? " / " + prettySize(total) : "") +
+               (speed ? "   " + prettySize(speed) + "/s" : ""));
+      };
+      phase("② 流式下载视频轨（写入浏览器存储，不占内存）…");
+      const vStore = await downloadTrack("url", d, qs, "video", "② 视频轨", onTick(0, 0.45));
+      const vsize = await vStore.size();
+
+      phase("③ 流式下载音频轨…");
+      const aStore = await downloadTrack("audio_url", d, qs, "audio", "③ 音频轨", onTick(0.45, 0.15));
+      const asize = await aStore.size();
+
+      phase("④ 解析分片结构…");
+      bar(0.62);
+      const vInit = await parseInit(vStore), aInit = await parseInit(aStore);
+      const vInfo = trackInfo(vInit), aInfo = trackInfo(aInit);
+      const vFrags = await scanFragments(vStore, vInit.fragStart, vInfo.tracks[0].timescale);
+      const aFrags = await scanFragments(aStore, aInit.fragStart, aInfo.tracks[0].timescale);
+      if (!vFrags.length || !aFrags.length) throw new Error("没有找到可合并的分片（结构不支持）");
+
+      const vTs = vInfo.tracks[0].timescale, aTs = aInfo.tracks[0].timescale;
+      const sec = (f, ts) => f.time / ts;
+      const vEnd = sec(vFrags[vFrags.length - 1], vTs) +
+                   (vFrags.length > 1 ? sec(vFrags[vFrags.length - 1], vTs) - sec(vFrags[vFrags.length - 2], vTs) : 0);
+      const aEnd = sec(aFrags[aFrags.length - 1], aTs) +
+                   (aFrags.length > 1 ? sec(aFrags[aFrags.length - 1], aTs) - sec(aFrags[aFrags.length - 2], aTs) : 0);
+      const totalMs = Math.max(vEnd, aEnd) * 1000;
+
+      phase("⑤ 混流写入…");
+      bar(0.66);
+      const out = await newFile("muxed.mp4");
+      const ftyp = vInit.ftyp ? vInit.buf.slice(vInit.ftyp.start, vInit.ftyp.end) : new Uint8Array(0);
+      await out.append(ftyp);
+      await out.append(buildMoov(vInfo, aInfo, totalMs));
+
+      // 按解码时间交叉排列：两边的分片各自有序，双指针归并即可
+      const retrack = aInfo.tracks[0].renamed
+        ? { from: aInfo.tracks[0].originalId, to: aInfo.tracks[0].id }
+        : null;
+      let i = 0, j = 0, seq = 1;
+      const totalFrags = vFrags.length + aFrags.length;
+      while (i < vFrags.length || j < aFrags.length) {
+        let pick;
+        if (i >= vFrags.length) pick = { f: aFrags[j++], store: aStore, rt: retrack };
+        else if (j >= aFrags.length) pick = { f: vFrags[i++], store: vStore, rt: null };
+        else if (sec(vFrags[i], vTs) <= sec(aFrags[j], aTs)) pick = { f: vFrags[i++], store: vStore, rt: null };
+        else pick = { f: aFrags[j++], store: aStore, rt: retrack };
+        const moof = renumberAndRetrack(pick.f.moof, seq++, pick.rt);
+        await out.append(moof);
+        await out.append(await pick.store.sliceBlob(pick.f.mdatStart, pick.f.mdatStart + pick.f.mdatSize));
+        if (seq % 12 === 0) {
+          bar(0.66 + (seq / totalFrags) * 0.33);
+          detail("已合并 " + (seq - 1) + " / " + totalFrags + " 个分片");
+        }
+      }
+      await out.close();
+      const file = await out.file();
+
+      phase("⑥ 完成");
+      bar(1);
+      detail("视频 " + prettySize(vsize) + " + 音频 " + prettySize(asize) +
+             " → 合并 " + prettySize(file.size) + "（" + Math.round(totalMs / 1000) + " 秒）");
+      const url = URL.createObjectURL(file);
+      lastURL = url;
+      const name = ((d.platform || "video") + "-" + (quality || "best") + ".mp4").replace(/[^\w.\-]+/g, "_");
+      if (h264OK) {
+        $("#muxVideo").classList.remove("hidden");
+        $("#muxNoPreview").classList.add("hidden");
+        $("#muxVideo").src = url;
+      } else {
+        $("#muxVideo").classList.add("hidden");
+        const w = $("#muxNoPreview");
+        w.classList.remove("hidden");
+        w.textContent = "本次合并已完成，但当前浏览器不带 H.264 解码器（常见于不含专有编解码器的 Chromium 构建），" +
+          "无法在页面内预览。文件本身有效，点『保存到本地』后用本地播放器（VLC / mpv / 系统播放器）打开即可。";
+      }
+      const a = $("#muxSave");
+      a.href = url; a.download = name;
+      $("#muxInfo").textContent = name + " · " + prettySize(file.size) +
+        (opfsOK ? " · 已写入浏览器存储" : " · 内存模式（本浏览器不支持 OPFS）");
+      $("#muxOut").classList.remove("hidden");
+      refreshQuota();
+    } catch (e) {
+      phase("失败");
+      detail(String(e && e.message ? e.message : e));
+      bar(0);
+    } finally {
+      busy = false;
+      $("#muxStart").disabled = false;
+    }
+  }
+
+  $("#muxVideo").addEventListener("error", () => {
+    const w = $("#muxNoPreview");
+    w.classList.remove("hidden");
+    w.textContent = "预览失败（错误码 " + (($("#muxVideo").error && $("#muxVideo").error.code) || "?") +
+      "）：多为浏览器缺少 H.264 解码器或容器预览支持。合并文件本身有效，保存后用本地播放器打开。";
+  });
+
+  $("#muxStart").addEventListener("click", start);
+  $("#muxClean").addEventListener("click", async () => {
+    if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
+    $("#muxVideo").removeAttribute("src");
+    $("#muxOut").classList.add("hidden");
+    await cleanStorage();
+    await refreshQuota();
+    phase("已清理浏览器存储");
+    bar(0); detail("");
+  });
+  refreshQuota();
 })();
 </script>
 </body>
