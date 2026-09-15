@@ -1209,3 +1209,49 @@ func TestSchemeLessURLIsAccepted(t *testing.T) {
 		t.Errorf("platform + id 应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
 }
+
+// TestProxyHostAllowList：白名单留空 = 不限制；填了则按后缀收紧。
+func TestProxyHostAllowList(t *testing.T) {
+	open := newTestEnv(t, nil, defaultStub())
+	for _, host := range []string{"evil.example.com", "cdn.bilivideo.com", "127.0.0.1"} {
+		if !open.srv.proxyHostAllowed(host) {
+			t.Errorf("白名单留空应放行 %s", host)
+		}
+	}
+
+	limited := newTestEnv(t, func(c *config.Config) {
+		c.ProxySrv.Enabled = true
+		c.ProxySrv.AllowHosts = []string{"bilivideo.com", "douyinvod.com"}
+	}, defaultStub())
+	cases := map[string]bool{
+		"cdn.bilivideo.com":     true,
+		"upos-sz.bilivideo.com": true,
+		"douyinvod.com":         true,
+		"evil-bilivideo.com":    false, // 后缀匹配不能用 Contains
+		"bilivideo.com.evil.cn": false,
+		"example.com":           false,
+		"":                      false,
+	}
+	for host, want := range cases {
+		if got := limited.srv.proxyHostAllowed(host); got != want {
+			t.Errorf("proxyHostAllowed(%q) = %v，想要 %v", host, got, want)
+		}
+	}
+}
+
+// TestEaseModeProxyEnabledByDefault：免校验模式下 /v1/proxy 默认就挂载。
+func TestEaseModeProxyEnabledByDefault(t *testing.T) {
+	env := newEaseEnv(t, func(c *config.Config) {
+		c.ProxySrv.Enabled = true // 等价于 config.Load 在 ease 下的默认值
+	}, defaultStub())
+	// 缺 url 参数 → 400（说明路由存在）；若路由不存在会是 404
+	w := do(env.handler(), http.MethodGet, "/v1/proxy", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("/v1/proxy 应存在（400 缺参数），得到 %d（%s）", w.Code, w.Body.String())
+	}
+	// 白名单留空时不拦任何域名 —— 判定逻辑单独测（TestProxyHostAllowList），
+	// 这里只确认配置面上确实是"空"的，不发真实上游请求（单测不该依赖网络）。
+	if got := env.srv.cfg.ProxySrv.AllowHosts; len(got) != 0 {
+		t.Fatalf("白名单应为空，得到 %v", got)
+	}
+}

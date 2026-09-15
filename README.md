@@ -115,7 +115,8 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
    但部分 B 站 P2P 节点（如 `*.edge.mountaintoys.cn`）**同时要求 Referer 与 UA**，
    缺任一个都 403，而这两个头浏览器禁止脚本设置。
    页面因此是三级兜底：直连 → 重新取链换节点 → 走 `/v1/proxy`
-   （服务端补 Referer/UA；需要 `VIDLINK_PROXY_ENDPOINT=true` 与白名单）。
+   （服务端补 Referer/UA；代理在免校验模式下**默认开启**，账户模式需显式
+   `VIDLINK_PROXY_ENDPOINT=true`）。
 2. **预览可能不可用**：不含专有编解码器的 Chromium 构建
    （`canPlayType('avc1') === ''`）根本解不了 H.264。
    这种情况下页面会明确告诉你"文件有效，请保存后用本地播放器打开"，
@@ -138,6 +139,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | 按 Key 串行闸门 | 1 个并发解析 | 不适用（没有 Key） |
 | 按 IP 限流 | `VIDLINK_RATE_LIMIT_RPM` | **关闭**（连同它一起关） |
 | `/v1/usage`、`/v1/admin/*` | 存在 | **404**（根本不注册） |
+| `/v1/proxy` | 默认关闭 | **默认开启**（显式 `false` 可关），且不校验白名单 |
 | `/v1/info`、`/v1/links`、`/v1/detail`、`/v1/batch/links` | 需 Key | **完全可用** |
 | `/v1/platforms`、`/v1/version`、`/v1/health`、探针 | 公开 | 公开（不再返回 `rates`/`unit`） |
 | 全局解析槽位（10 + 队列 30） | 有 | **保留**（这是资源保护，不是校验） |
@@ -169,7 +171,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 | **只有直链** |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
 | POST | `/v1/batch/links` | Key | 0.75/条 | 批量直链，5~20 条，**无抖音** |
-| GET | `/v1/proxy?url=` | Key | — | 流式媒体代理（默认关闭，需白名单） |
+| GET | `/v1/proxy?url=` | Key | — | 流式媒体代理（ease 模式默认开启，账户模式默认关闭） |
 | GET/POST | `/v1/admin/accounts` | 管理员 | — | 账号列表 / 创建账号（免校验模式下不存在） |
 | GET/PATCH/DELETE | `/v1/admin/accounts/{key}` | 管理员 | — | 查 / 改 / 删账号 |
 | GET | `/v1/admin/stats` | 管理员 | — | 运行统计 |
@@ -310,13 +312,15 @@ curl -X PATCH ... -d '{"disabled":false}' ...
 | `VIDLINK_UPSTREAM_RPS` | `8` | 每主机每秒上游请求上限 |
 | `VIDLINK_UPSTREAM_BURST` | `16` | 每主机令牌桶突发容量 |
 | `VIDLINK_MAX_IDLE_PER_HOST` | `32` | 每主机空闲连接数 |
-| `VIDLINK_PROXY_ENDPOINT` | `false` | 是否开启媒体代理 |
-| `VIDLINK_PROXY_ALLOW_HOSTS` | 空 | 媒体代理域名白名单（开启代理时**必填**） |
+| `VIDLINK_PROXY_ENDPOINT` | `false`（ease 模式下 `true`） | 是否开启媒体代理；显式 `false` 可关掉 |
+| `VIDLINK_PROXY_ALLOW_HOSTS` | 空 | 媒体代理域名白名单；**留空 = 不限制**（等同于开放代理，勿暴露公网） |
 | `VIDLINK_TRUSTED_PROXY_HEADER` | 空 | 如 `X-Forwarded-For`，用于取真实客户端 IP |
 | `VIDLINK_PPROF` | `false` | 开启 pprof（仅 `127.0.0.1:6060`） |
 
-> ⚠️ **媒体代理是开放代理风险点**。默认关闭；开启时必须配置
-> `VIDLINK_PROXY_ALLOW_HOSTS` 白名单，否则服务启动即报错。
+> ⚠️ **媒体代理等同于一个 HTTP 代理**。账户模式默认关闭；免校验模式默认开启
+> （浏览器内混流遇到要求 Referer 的 CDN 节点时要靠它）。
+> `VIDLINK_PROXY_ALLOW_HOSTS` 留空表示放行任意目标，此时**绝不能暴露到公网**——
+> 不想开就把 `VIDLINK_PROXY_ENDPOINT=false` 显式写上。
 
 ## 部署
 

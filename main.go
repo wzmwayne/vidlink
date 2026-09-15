@@ -272,6 +272,11 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 		"cache_ttl", cfg.Service.CacheTTL.String(),
 		"proxy_endpoint", cfg.ProxySrv.Enabled,
 	)
+	if cfg.ProxySrv.Enabled && len(cfg.ProxySrv.AllowHosts) == 0 {
+		logger.Warn("媒体代理已开启且未配置 VIDLINK_PROXY_ALLOW_HOSTS：" +
+			"/v1/proxy 会转发到任意 http/https 地址（等同于一个开放代理），" +
+			"请勿将该端口暴露到公网；需要收紧就填域名后缀白名单")
+	}
 	switch {
 	case cfg.IsEase():
 		// 免校验模式下账户参数一律无意义，说了只会误导

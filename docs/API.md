@@ -68,8 +68,7 @@ curl 'http://127.0.0.1:8080/v1/links?url=...'   # 不带任何凭据
 
 - 合并产物是**片段级重排**（不重新编码），只调用本服务的 `/v1/links`；
 - 若某个 CDN 节点要求 Referer/UA（浏览器禁止脚本设置这两个头），
-  页面会自动改走 `/v1/proxy` —— 那时需要开启 `VIDLINK_PROXY_ENDPOINT=true`
-  并把该域名加入 `VIDLINK_PROXY_ALLOW_HOSTS`。
+  页面会自动改走 `/v1/proxy`（免校验模式下默认开启，无需额外配置）。
 
 ### 拿到的直链怎么用
 
@@ -516,16 +515,19 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 | `url` | 是 | 媒体地址（http/https 绝对地址） |
 | `referer` | 否 | 覆盖默认 Referer |
 
-开启条件（两个都要）：
+开启条件：
 
 ```bash
-VIDLINK_PROXY_ENDPOINT=true
-VIDLINK_PROXY_ALLOW_HOSTS=*.bilivideo.com,*.douyinvod.com   # 白名单，必填
+VIDLINK_PROXY_ENDPOINT=true                    # 免校验模式下默认就是 true
+VIDLINK_PROXY_ALLOW_HOSTS=*.bilivideo.com      # 可选；留空 = 不限制
 ```
 
-不在白名单的域名 → `403 forbidden`。**默认关闭**，因为开着它等于对外提供一个
-受白名单约束的代理，会占服务端带宽——这与"只返回直链、几乎不耗带宽"的定位相反，
-只在你确实需要浏览器直连时才开。
+- **白名单留空表示放行任意 http/https 目标**（想收紧就填域名后缀，多个用逗号分隔）；
+- 填了白名单时，不在其中的域名 → `403 forbidden`；
+- **默认值跟随运行模式**：免校验模式默认开启（浏览器内混流遇到要求 Referer/UA 的
+  CDN 节点时要靠它），账户模式默认关闭；显式写 `VIDLINK_PROXY_ENDPOINT=false` 一律关掉；
+- 账户模式下它需要 Key；免校验模式下它是公开的——**这时它就是一个开放代理，
+  别把端口暴露到公网**（启动日志会就此给出警告）。
 
 ---
 

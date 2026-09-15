@@ -58,3 +58,50 @@ func TestAccountModeKeepsLedgerPath(t *testing.T) {
 		t.Fatal("账户模式下 AccountsPath 不应为空（否则账号与配额重启即丢）")
 	}
 }
+
+// TestProxyEndpointDefaultsFollowMode 锁住媒体代理开关的三条规则：
+//
+//  1. 账户模式默认关闭（老行为不变）；
+//  2. **免校验模式默认开启** —— 浏览器内混流遇到要求 Referer 的 CDN 节点时
+//     必须能走代理，默认关着会让那个功能时灵时不灵；
+//  3. 显式设置一律优先，尤其"显式 false 要能关掉"。
+func TestProxyEndpointDefaultsFollowMode(t *testing.T) {
+	cases := []struct {
+		ease, endpoint, want string
+	}{
+		{"", "", "false"},          // 账户模式，未设置 → 关
+		{"", "true", "true"},       // 账户模式，显式开
+		{"", "false", "false"},     // 账户模式，显式关
+		{"true", "", "true"},       // ease，未设置 → 开
+		{"true", "true", "true"},   // ease，显式开
+		{"true", "false", "false"}, // ease，显式关 ← 用户明确要求的例外
+	}
+	for _, c := range cases {
+		t.Run("ease="+c.ease+",endpoint="+c.endpoint, func(t *testing.T) {
+			t.Setenv("VL_EASE", c.ease)
+			t.Setenv("VIDLINK_PROXY_ENDPOINT", c.endpoint)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load 失败: %v", err)
+			}
+			want := c.want == "true"
+			if cfg.ProxySrv.Enabled != want {
+				t.Fatalf("ProxySrv.Enabled = %v，想要 %v", cfg.ProxySrv.Enabled, want)
+			}
+		})
+	}
+}
+
+// TestProxyWhitelistIsOptional：开启代理不再强制要求白名单。
+func TestProxyWhitelistIsOptional(t *testing.T) {
+	t.Setenv("VL_EASE", "")
+	t.Setenv("VIDLINK_PROXY_ENDPOINT", "true")
+	t.Setenv("VIDLINK_PROXY_ALLOW_HOSTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("开启代理但没配白名单不应报错，却得到: %v", err)
+	}
+	if len(cfg.ProxySrv.AllowHosts) != 0 {
+		t.Fatalf("白名单应为空，得到 %v", cfg.ProxySrv.AllowHosts)
+	}
+}

@@ -347,8 +347,13 @@ paths:
   /v1/proxy:
     get:
       tags: [运维]
-      summary: 流式媒体代理（默认关闭，需白名单）
-      description: 透传 Range/If-Range。仅当 `VIDLINK_PROXY_ENDPOINT=true` 且配置了白名单时该路由才存在。
+      summary: 流式媒体代理（免校验模式默认开启）
+      description: |
+        透传 Range/If-Range。仅当 `VIDLINK_PROXY_ENDPOINT=true` 时该路由才存在；
+        该开关的默认值跟随运行模式（免校验模式为 true，账户模式为 false），
+        显式设成 false 可关闭。
+        `VIDLINK_PROXY_ALLOW_HOSTS` 留空表示放行任意 http/https 目标
+        （等同于开放代理，勿暴露公网）；填了则只放行匹配后缀的域名，其余 403。
       operationId: proxyMedia
       parameters:
         - name: url

@@ -100,16 +100,25 @@ type ProxyOptions struct {
 	Enabled bool
 	// MaxBytes 单次代理的最大字节数（0 表示不限）。
 	MaxBytes int64
-	// AllowHosts 允许代理的目标域名后缀白名单；为空表示不限制。
-	// 生产环境强烈建议配置，否则该接口会变成开放代理。
+	// AllowHosts 允许代理的目标域名后缀白名单。
+	//
+	// **为空表示不限制**（允许任意 http/https 目标）。这是刻意的默认：
+	// 打开代理这件事本身就是"我要用它取流"，再强制填一份域名清单
+	// 只会让人随手写个通配符，既不安全也不省事。
+	// 想收紧就填具体后缀，例如 *.bilivideo.com。
 	AllowHosts []string
 }
 
 // Load 从环境变量读取配置并填充默认值。
 func Load() (*Config, error) {
+	// 免校验模式要先算出来：媒体代理的**默认开关跟随它**——
+	// ease 是"本机/内网自用"，浏览器内混流遇到需要 Referer 的 CDN 节点时
+	// 必须能走代理，默认关着会让那个功能时灵时不灵。
+	ease := envBool("VL_EASE", false)
+
 	c := &Config{
 		Addr:               env("VIDLINK_ADDR", ":8080"),
-		Ease:               envBool("VL_EASE", false),
+		Ease:               ease,
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
@@ -143,7 +152,10 @@ func Load() (*Config, error) {
 		QueueMax:          envInt("VIDLINK_QUEUE_MAX", 30),
 		QueueWaitTimeout:  envDuration("VIDLINK_QUEUE_WAIT_TIMEOUT", 15*time.Second),
 		ProxySrv: ProxyOptions{
-			Enabled:    envBool("VIDLINK_PROXY_ENDPOINT", false),
+			// 默认值 = 是否处于免校验模式；显式设置 VIDLINK_PROXY_ENDPOINT
+			// （true/false）时以显式值为准。"显式 false 要能关掉"是这条的硬要求，
+			// 所以用 envBool 的默认值参数，而不是"设了 true 才开"。
+			Enabled:    envBool("VIDLINK_PROXY_ENDPOINT", ease),
 			MaxBytes:   int64(envInt("VIDLINK_PROXY_MAX_MB", 0)) << 20,
 			AllowHosts: splitList(env("VIDLINK_PROXY_ALLOW_HOSTS", "")),
 		},
@@ -211,10 +223,6 @@ func (c *Config) validate() error {
 	}
 	if c.Net.Burst < 1 {
 		c.Net.Burst = 4
-	}
-	if c.ProxySrv.Enabled && len(c.ProxySrv.AllowHosts) == 0 {
-		return fmt.Errorf("config: 开启媒体代理(VIDLINK_PROXY_ENDPOINT) 时必须配置 " +
-			"VIDLINK_PROXY_ALLOW_HOSTS 白名单，否则该接口等同于开放代理")
 	}
 	return nil
 }

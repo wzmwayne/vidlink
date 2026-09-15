@@ -19,7 +19,8 @@ import (
 //
 // 安全上它是本项目风险最高的接口，因此：
 //   - 默认关闭（VIDLINK_PROXY_ENDPOINT=false）；
-//   - 开启时必须配置域名白名单，否则启动即报错；
+//   - 域名白名单**可选**：填了就按后缀收紧，留空则放行任意 http/https 目标
+//     （留空等于对外提供一个 HTTP 代理，别暴露到公网，启动日志会警告）；
 //   - 不跟随重定向（避免白名单被 302 绕过）；
 //   - 只允许 GET/HEAD。
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +36,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 白名单校验：防止该接口被当作开放代理使用
+	// 白名单校验（留空即不限制）
 	if !s.proxyHostAllowed(target.Hostname()) {
 		writeError(w, core.Errf(core.KindForbidden, "", "proxy",
 			"目标域名 %s 不在 VIDLINK_PROXY_ALLOW_HOSTS 白名单内", target.Hostname()))
@@ -122,9 +123,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// proxyHostAllowed 判断目标域名是否放行。
+//
+// 空白名单 = **不限制**：配置了 VIDLINK_PROXY_ENDPOINT=true 就是明确要用它，
+// 此时再要求一份域名清单只会逼人写个 `*`。要收紧就填具体后缀。
+// 注意这条把口子开得很大：这个接口等同于一个 HTTP 代理，
+// 别把它暴露到公网（启动日志会就此给出警告）。
 func (s *Server) proxyHostAllowed(host string) bool {
 	if len(s.cfg.ProxySrv.AllowHosts) == 0 {
-		return false
+		return true
 	}
 	for _, suffix := range s.cfg.ProxySrv.AllowHosts {
 		if urlx.HostHasSuffix(host, suffix) {
