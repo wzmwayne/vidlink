@@ -126,6 +126,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: 读取 %s 失败: %w", path, err)
 	}
+	// 显式指定的路径不存在时必须报错：那说明部署脚本写错了，
+	// 而"默默按默认值跑起来"会让人以为配置生效了。
+	if want := strings.TrimSpace(os.Getenv(VL_CONFIG_KEY)); want != "" && path == "" {
+		return nil, fmt.Errorf("config: %s 指定的文件不存在: %s", VL_CONFIG_KEY, want)
+	}
 	dotVL = kv
 
 	// 免校验模式要先算出来：媒体代理的**默认开关跟随它**——
@@ -288,21 +293,38 @@ func lookupEnv(key string) (string, bool) {
 	return "", false
 }
 
-// findDotVL 在候选目录里找第一个存在的 .vl，返回解析结果与路径。
+// VL_CONFIG_KEY 是指定配置文件路径的变量名（只能来自进程环境变量）。
+const VL_CONFIG_KEY = "VL_CONFIG"
+
+// findDotVL 找出生效的 .vl，返回解析结果与路径。
 //
-// 候选顺序：可执行文件所在目录 → 当前工作目录。
-// 先看可执行文件旁边，是因为"把 .vl 放在程序旁边"最符合直觉；
-// 再看工作目录，是为了兼容 systemd 之类把 cwd 设成 /var/lib/vidlink 的部署。
+// 候选顺序（先命中先用）：
+//
+//  1. $VL_CONFIG 指定的文件      —— 显式指定，写错路径要报错而不是静默忽略
+//  2. 当前工作目录/.vl           —— 最具体：cd 进哪个目录就用哪份配置
+//  3. 可执行文件所在目录/.vl      —— 兜底：给"装在 PATH 里的那个二进制"设全局默认
+//
+// 为什么工作目录优先于程序目录：程序目录常常是 ~/.local/bin 这类**共享**位置，
+// 放在那里的 .vl 会对这个二进制的所有调用生效；如果它优先级更高，
+// 任何按目录区分的配置（例如某项目想用账户模式）就永远没机会生效。
+// 反过来，程序目录的 .vl 依然能作为全局默认兜住"在任意目录直接敲 vidlink"。
 func findDotVL() (map[string]string, string, error) {
-	var dirs []string
-	if exe, err := os.Executable(); err == nil {
-		dirs = append(dirs, filepath.Dir(exe))
+	var candidates []string
+	if p := strings.TrimSpace(os.Getenv(VL_CONFIG_KEY)); p != "" {
+		candidates = append(candidates, p)
 	}
 	if wd, err := os.Getwd(); err == nil {
-		dirs = append(dirs, wd)
+		candidates = append(candidates, filepath.Join(wd, ".vl"))
 	}
-	for _, dir := range dirs {
-		path := filepath.Join(dir, ".vl")
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), ".vl"))
+	}
+	return firstDotVL(candidates)
+}
+
+// firstDotVL 返回候选路径里第一个存在且可读的配置。
+func firstDotVL(candidates []string) (map[string]string, string, error) {
+	for _, path := range candidates {
 		data, err := os.ReadFile(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue

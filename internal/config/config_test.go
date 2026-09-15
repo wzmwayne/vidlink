@@ -198,3 +198,63 @@ func TestDotVLAbsentIsFine(t *testing.T) {
 		t.Fatalf("没有 .vl 时 Load 不应报错: %v", err)
 	}
 }
+
+// TestFirstDotVLOrder：候选顺序就是优先级，必须钉死。
+//
+// 顺序错了的后果很隐蔽：装在 ~/.local/bin 的那个 .vl 会压掉所有按目录的配置，
+// 表现为"我在项目目录里写的 .vl 完全没生效"。
+func TestFirstDotVLOrder(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(a+"/.vl", []byte("VIDLINK_BATCH_MAX=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b+"/.vl", []byte("VIDLINK_BATCH_MAX=2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 第一个存在的胜出
+	kv, path, err := firstDotVL([]string{a + "/.vl", b + "/.vl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kv["VIDLINK_BATCH_MAX"] != "1" || path != a+"/.vl" {
+		t.Fatalf("应取第一个候选，得到 %v (%s)", kv, path)
+	}
+	// 前面的不存在就跳到后面那个
+	kv, path, err = firstDotVL([]string{a + "/没有这个文件", b + "/.vl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kv["VIDLINK_BATCH_MAX"] != "2" || path != b+"/.vl" {
+		t.Fatalf("应跳过不存在的候选，得到 %v (%s)", kv, path)
+	}
+	// 一个都不存在：返回空 map，不报错
+	kv, path, err = firstDotVL([]string{a + "/x", b + "/y"})
+	if err != nil || path != "" || len(kv) != 0 {
+		t.Fatalf("都不存在时应返回空结果，得到 %v %q %v", kv, path, err)
+	}
+}
+
+// TestVLConfigOverride：$VL_CONFIG 显式指定配置文件，写错路径必须报错。
+func TestVLConfigOverride(t *testing.T) {
+	dir := t.TempDir()
+	conf := dir + "/custom.vl"
+	if err := os.WriteFile(conf, []byte("VL_EASE=true\nVIDLINK_BATCH_MAX=5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VL_CONFIG", conf)
+	t.Setenv("VL_EASE", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if !cfg.IsEase() || cfg.BatchMax != 5 || cfg.ConfigFile != conf {
+		t.Fatalf("未按 VL_CONFIG 读取: ease=%v batch=%d file=%s",
+			cfg.IsEase(), cfg.BatchMax, cfg.ConfigFile)
+	}
+
+	// 指向不存在的文件：报错而不是默默跑默认值
+	t.Setenv("VL_CONFIG", dir+"/不存在.vl")
+	if _, err := Load(); err == nil {
+		t.Fatal("VL_CONFIG 指向不存在的文件时应报错")
+	}
+}
