@@ -2,9 +2,11 @@ package server
 
 import (
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"vidlink/internal/core"
 	"vidlink/internal/urlx"
@@ -23,6 +25,14 @@ import (
 //     （留空等于对外提供一个 HTTP 代理，别暴露到公网，启动日志会警告）；
 //   - 不跟随重定向（避免白名单被 302 绕过）；
 //   - 只允许 GET/HEAD。
+//
+// 另外支持两个可选参数，用来把"直链"变成一个名字正确的下载：
+//
+//	filename=<名字>   设置 Content-Disposition: attachment; filename=...
+//	type=video/mp4    覆盖上游的 Content-Type（CDN 常返回 octet-stream）
+//
+// 没有它们的话，浏览器只能按 URL 最后一段命名——实测就是下载到一个
+// 名叫 `proxy`、没有后缀的文件。
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimSpace(r.URL.Query().Get("url"))
 	if raw == "" {
@@ -42,6 +52,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			"目标域名 %s 不在 VIDLINK_PROXY_ALLOW_HOSTS 白名单内", target.Hostname()))
 		return
 	}
+
+	// 下载文件名与 Content-Type 覆盖（都可选）。文件名会进响应头，
+	// 必须消毒——它来自查询参数，放任就等于给了响应头注入的口子。
+	filename := sanitizeFilename(r.URL.Query().Get("filename"))
+	ctype := safeContentType(r.URL.Query().Get("type"))
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
 	if err != nil {
@@ -92,6 +107,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
+	}
+	if ctype != "" {
+		// 上游对 .m4s 常回 application/octet-stream，浏览器据此无法判断类型；
+		// 调用方明确知道这是什么时允许覆盖。
+		w.Header().Set("Content-Type", ctype)
+	}
+	if filename != "" {
+		// mime.FormatMediaType 会按 RFC 2231 处理非 ASCII（中文标题），
+		// 手写 filename="..." 在中文名上会被浏览器截断或乱码。
+		w.Header().Set("Content-Disposition",
+			mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 	}
 	if w.Header().Get("Accept-Ranges") == "" {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -145,6 +171,66 @@ func (s *Server) proxyHostAllowed(host string) bool {
 //
 // 平台的 CDN 会校验 Referer 是否属于自家域，因此这里按域名映射，
 // 而不是统一用一个固定值。
+// sanitizeFilename 把调用方给的文件名消毒到"可以安全放进响应头"。
+//
+// 三件事必须做，少一件都有真实后果：
+//
+//  1. 去掉控制字符与引号、反斜杠 —— 否则可以闭合 Content-Disposition 的
+//     引号往里塞新头（响应头注入），或让某些客户端解析错乱；
+//  2. 去掉路径分隔符 —— 名字里带 `/` 或 `..` 时，部分浏览器会把它当路径，
+//     变成"写到别的目录"（目录穿越）；
+//  3. 限长 —— 标题可以很长，某些系统对文件名有 255 字节上限，
+//     超长会被截断成乱码甚至保存失败。
+//
+// 保留中文与空格：现在的浏览器都支持 RFC 2231 编码，没有必要为了兼容
+// 把中文标题抹掉。名字为空时返回空串，调用方据此不设 Content-Disposition。
+func sanitizeFilename(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r == '/' || r == '\\' || r == '"' || r == '\'' || unicode.IsControl(r):
+			// 丢弃这些字符而不是替换成下划线：替换会让 "a/b" 变成 "a_b"，
+			// 看起来像用户原意，实际上已经不是一个路径了。
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	// 去掉纯点号的名字（"." ".." 这类在文件系统里有特殊含义）
+	if strings.Trim(out, ".") == "" {
+		return ""
+	}
+	const maxRunes = 120 // 约 360 字节 UTF-8，留出扩展名与 .crdownload 的余量
+	if rs := []rune(out); len(rs) > maxRunes {
+		out = strings.TrimSpace(string(rs[:maxRunes]))
+	}
+	return out
+}
+
+// safeContentType 只放行媒体类与 octet-stream，避免这个参数被用来
+// 让代理回 text/html（那等于给自己开一个 XSS 落点）。
+func safeContentType(v string) string {
+	v = strings.TrimSpace(strings.ToLower(v))
+	if v == "" {
+		return ""
+	}
+	if i := strings.IndexByte(v, ';'); i >= 0 { // 去掉 charset 之类的参数
+		v = strings.TrimSpace(v[:i])
+	}
+	switch v {
+	case "video/mp4", "audio/mp4", "video/webm", "audio/webm",
+		"video/x-matroska", "audio/mpeg", "video/mp2t",
+		"application/octet-stream":
+		return v
+	default:
+		return ""
+	}
+}
+
 func defaultReferer(host string) string {
 	switch {
 	case urlx.HostHasSuffix(host, "bilibili.com"), urlx.HostHasSuffix(host, "bilivideo.com"),

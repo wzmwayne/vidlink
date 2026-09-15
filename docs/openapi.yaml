@@ -366,6 +366,20 @@ paths:
           required: false
           description: 覆盖默认 Referer
           schema: { type: string }
+        - name: filename
+          in: query
+          required: false
+          description: |
+            设置 `Content-Disposition: attachment; filename=...`（中文按 RFC 2231 编码）。
+            服务端会消毒：去掉控制字符、引号、路径分隔符并限长 120 字符。
+          schema: { type: string, example: "标题VL视频1080P.mp4" }
+        - name: type
+          in: query
+          required: false
+          description: |
+            覆盖上游 `Content-Type`（CDN 对 .m4s 常回 application/octet-stream）。
+            只放行 video/*、audio/* 与 application/octet-stream。
+          schema: { type: string, enum: [video/mp4, audio/mp4, video/webm, audio/webm, application/octet-stream] }
       responses:
         "200":
           description: 媒体字节流

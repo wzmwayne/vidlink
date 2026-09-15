@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1108,7 +1110,10 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`id="muxSave"`,
 		`navigator.storage.getDirectory`,
 		`canPlayType`, // 无 H.264 解码器的浏览器要给出解释，而不是静默失败
-		`代理播放`,        // 视频轨与音频轨都要有代理入口（音频同样受防盗链限制）
+		`代理下载`,        // 视频轨与音频轨都要有代理入口（音频同样受防盗链限制）
+		`前端混合`,        // 下载命名里的四种类型
+		`原生混合`,
+		`+ "VL" +`, // 命名拼接：标题 + "VL" + 类型 + 清晰度/码率
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("页面缺少 %q", want)
@@ -1262,5 +1267,118 @@ func TestEaseModeProxyEnabledByDefault(t *testing.T) {
 	// 这里只确认配置面上确实是"空"的，不发真实上游请求（单测不该依赖网络）。
 	if got := env.srv.cfg.ProxySrv.AllowHosts; len(got) != 0 {
 		t.Fatalf("白名单应为空，得到 %v", got)
+	}
+}
+
+// TestProxySetsDownloadFilename：/v1/proxy 能把"直链"变成一个名字正确的下载。
+//
+// 没有它时浏览器只能按 URL 最后一段命名，实测就是下载到一个叫
+// `proxy`、没有后缀的文件——内容对，但用户拿到手完全不知道是什么。
+func TestProxySetsDownloadFilename(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "4")
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	h := env.handler()
+
+	name := "【官方MV】Never Gonna Give You UpVL视频1080P.mp4"
+	// 账户模式下代理要鉴权，带上普通用户的 Key
+	w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL)+
+		"&filename="+url.QueryEscape(name)+"&type=video/mp4", userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("代理应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	cd := w.Header().Get("Content-Disposition")
+	if !strings.HasPrefix(cd, "attachment") {
+		t.Fatalf("Content-Disposition = %q，想要 attachment", cd)
+	}
+	// 中文名按 RFC 2231 编码；解析回来必须与请求的一致
+	_, params, err := mime.ParseMediaType(cd)
+	if err != nil {
+		t.Fatalf("Content-Disposition 不合法: %v (%q)", err, cd)
+	}
+	if params["filename"] != name {
+		t.Errorf("filename = %q，想要 %q", params["filename"], name)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "video/mp4" {
+		t.Errorf("Content-Type = %q，想要覆盖成 video/mp4", ct)
+	}
+}
+
+// TestProxyFilenameIsSanitized：文件名来自查询参数，必须消毒。
+func TestProxyFilenameIsSanitized(t *testing.T) {
+	cases := map[string]string{
+		`a/b/c.mp4`:          "abc.mp4",        // 路径分隔符：防目录穿越
+		`..`:                 "",               // 纯点号：文件系统里有特殊含义
+		"a\r\nX-Evil: 1.mp4": "aX-Evil: 1.mp4", // 控制字符：防响应头注入
+		`a"b.mp4`:            "ab.mp4",         // 引号：防闭合 Content-Disposition
+		``:                   "",               // 空：调用方据此不设头
+		`  正常 名字 .mp4  `:     "正常 名字 .mp4",     // 中文与空格要保留
+	}
+	for in, want := range cases {
+		if got := sanitizeFilename(in); got != want {
+			t.Errorf("sanitizeFilename(%q) = %q，想要 %q", in, got, want)
+		}
+	}
+	// 超长要截断（按 rune 而不是字节，避免把中文截成半个字符）
+	long := strings.Repeat("名", 300)
+	if got := sanitizeFilename(long); len([]rune(got)) != 120 {
+		t.Errorf("超长文件名截断后 rune 数 = %d，想要 120", len([]rune(got)))
+	}
+}
+
+// TestProxyContentTypeWhitelist：type 参数不能被用来让代理回 text/html。
+func TestProxyContentTypeWhitelist(t *testing.T) {
+	allow := []string{"video/mp4", "audio/mp4", "application/octet-stream", "VIDEO/MP4", "video/mp4; charset=x"}
+	deny := []string{"text/html", "application/javascript", "image/svg+xml", "", "  "}
+	for _, v := range allow {
+		if got := safeContentType(v); got == "" {
+			t.Errorf("safeContentType(%q) 应放行", v)
+		}
+	}
+	for _, v := range deny {
+		if got := safeContentType(v); got != "" {
+			t.Errorf("safeContentType(%q) = %q，应拒绝", v, got)
+		}
+	}
+}
+
+// TestUIScriptsShareAllHelpers：页面里两个 <script> 是各自独立的 IIFE，
+// 第二个（混流器）只能用第一个显式挂在 window.VL 上的东西。
+//
+// 这条测试来自两次真实踩坑：dlName 与 ensureTitle 都曾在混流脚本里
+// 直接调用而没被导出，运行到那一步才报 "xxx is not defined"——
+// 而"运行到那一步"意味着用户已经等完了下载。静态检查能在构建期挡住它。
+func TestUIScriptsShareAllHelpers(t *testing.T) {
+	body := string(uiHTML)
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(body, -1)
+	if len(blocks) < 2 {
+		t.Fatalf("页面应有至少两个 script 块，找到 %d 个", len(blocks))
+	}
+	main, mux := blocks[0][1], blocks[len(blocks)-1][1]
+
+	m := regexp.MustCompile(`(?s)window\.VL = \{(.*?)\};`).FindStringSubmatch(main)
+	if m == nil {
+		t.Fatal("主脚本没有导出 window.VL")
+	}
+	exported := m[1]
+
+	// 主脚本里定义、混流脚本可能想复用的符号
+	helpers := []string{
+		"api", "el", "copyBtn", "openBtn", "prettySize", "prettyNum", "target",
+		"dlName", "qualityLabel", "DL", "ensureTitle",
+	}
+	for _, h := range helpers {
+		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(h) + `\b`).MatchString(mux) {
+			continue // 没用到就不必导出
+		}
+		if !strings.Contains(exported, h) {
+			t.Errorf("混流脚本用了 %s，但它没出现在 window.VL 的导出列表里"+
+				"（否则运行时会 xxx is not defined）", h)
+		}
 	}
 }

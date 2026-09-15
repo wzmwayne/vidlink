@@ -304,9 +304,91 @@
     return String(n);
   }
 
-  // 服务端代理按钮。只在服务端开启了 /v1/proxy 时出现（未开启该路由不存在）。
-  function proxyBtn(url) {
-    return openBtn("/v1/proxy?url=" + encodeURIComponent(url), "代理播放");
+  // ---------- 下载命名 ----------
+  //
+  // 统一为：标题 + "VL" + 类型 + 清晰度/音频码率 + 后缀
+  // 例：【官方MV】Never Gonna Give You UpVL前端混合1080P.mp4
+  //
+  // 为什么不让浏览器自己命名：直链的最后一段是 CDN 的资源 ID，
+  // 经 /v1/proxy 下载时更是只能得到一个叫 `proxy`、没有后缀的文件——
+  // 内容对，但用户拿到手不知道那是什么。
+  const DL = { MUX: "前端混合", NATIVE: "原生混合", AUDIO: "音频", VIDEO: "视频" };
+
+  // 文件名里不能出现的字符（Windows 比 POSIX 更严，按 Windows 来）
+  function fsSafe(s) {
+    return (s || "").replace(/[\\/:*?"<>|\r\n\t]/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  function dlName(title, kind, quality, ext) {
+    const t = fsSafe(title).slice(0, 80) || "vidlink";
+    const q = fsSafe(quality).slice(0, 16);
+    return t + "VL" + kind + q + "." + ext;
+  }
+
+  // 用户填的清晰度可能是 1080 / 720P / qn:80，只有前两种能进文件名
+  function qualityLabel(q) {
+    q = (q || "").trim();
+    if (/^\d+$/.test(q)) return q + "P";
+    if (/^\d+[pP]$/.test(q)) return q.toUpperCase();
+    return "";
+  }
+
+  function mimeOf(ext) {
+    return ext === "m4a" ? "audio/mp4" : "video/mp4";
+  }
+
+  // 标题缓存：links 档刻意不含元信息，所以下载命名需要的标题
+  // 来自用户此前看过的 info/detail，或按需补一次 /v1/info（ease 模式不计量）。
+  const titleCache = new Map();
+  function targetKey() {
+    const t = target();
+    return t.err ? "" : t.q;
+  }
+  function rememberTitle(body) {
+    const k = targetKey();
+    if (k && body && body.title) titleCache.set(k, body.title);
+  }
+  async function ensureTitle() {
+    const k = targetKey();
+    if (!k) return "";
+    if (titleCache.has(k)) return titleCache.get(k);
+    try {
+      const r = await api("/v1/info?" + k);
+      if (r.status === 200 && r.body && r.body.title) {
+        titleCache.set(k, r.body.title);
+        return r.body.title;
+      }
+    } catch (_) { /* 拿不到就用占位名，不能因此阻断下载 */ }
+    return "";
+  }
+
+  // 代理下载按钮：经服务端代理取流（补 Referer/UA），并带上统一命名的文件名。
+  // 未开启代理时该路由不存在，所以只在 proxyEnabled 时出现。
+  function proxyBtn(url, kind, quality, ext) {
+    const b = el("button", null, "代理下载");
+    b.title = "经服务端代理下载（自动补 Referer/UA）";
+    b.addEventListener("click", async () => {
+      const old = b.textContent;
+      b.disabled = true;
+      b.textContent = "准备中…";
+      try {
+        const title = await ensureTitle();
+        const name = dlName(title, kind, quality, ext);
+        const href = "/v1/proxy?url=" + encodeURIComponent(url) +
+                     "&filename=" + encodeURIComponent(name) +
+                     "&type=" + encodeURIComponent(mimeOf(ext));
+        const a = document.createElement("a");
+        a.href = href;
+        a.download = name;   // 兜底：服务端已给 Content-Disposition，这个属性再保一层
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } finally {
+        b.disabled = false;
+        b.textContent = old;
+      }
+    });
+    return b;
   }
 
   function prettySize(n) {
@@ -362,7 +444,11 @@
     return wrap;
   }
 
+  // opts.kind: "video" | "native" | "audio"，决定文件名里的类型与后缀
   function streamTable(list, opts) {
+    opts = opts || {};
+    const kind = opts.kind === "audio" ? DL.AUDIO : (opts.kind === "native" ? DL.NATIVE : DL.VIDEO);
+    const ext = opts.kind === "audio" ? "m4a" : "mp4";
     const t = el("table");
     const tr = el("tr");
     ["档位", "分辨率", "编码", "码率", "大小", "操作"].forEach((h) => tr.appendChild(el("th", null, h)));
@@ -378,7 +464,12 @@
       const box = el("div", "btns");
       box.appendChild(copyBtn(s.url, "复制地址"));
       box.appendChild(openBtn(s.url, "打开"));
-      if (opts && opts.proxy) box.appendChild(proxyBtn(s.url));
+      if (opts.proxy) {
+        const q = opts.kind === "audio"
+          ? (s.quality || (s.bandwidth ? Math.round(s.bandwidth / 1000) + "K" : ""))
+          : (s.quality || (s.height ? s.height + "P" : ""));
+        box.appendChild(proxyBtn(s.url, kind, q, ext));
+      }
       td.appendChild(box);
       r.appendChild(td);
       t.appendChild(r);
@@ -390,10 +481,13 @@
     const box = el("div");
     const urlBox = el("div", "url", d.url);
     box.appendChild(urlBox);
+    // 没有 audio_url = 平台给的就是音视频一体的文件（原生混合）
+    const reqQ = qualityLabel($("#quality").value);
+    const kind = d.audio_url ? DL.VIDEO : DL.NATIVE;
     const btns = el("div", "btns");
     btns.appendChild(copyBtn(d.url, "复制直链"));
     btns.appendChild(openBtn(d.url, "浏览器打开"));
-    if (proxyEnabled) btns.appendChild(proxyBtn(d.url));
+    if (proxyEnabled) btns.appendChild(proxyBtn(d.url, kind, reqQ, "mp4"));
     box.appendChild(btns);
 
     if (d.needs_mux) {
@@ -410,7 +504,7 @@
       b2.appendChild(openBtn(d.audio_url, "打开"));
       // 音频轨同样受防盗链限制（Referer/UA），浏览器直接打开常常 403，
       // 所以它和视频轨一样需要代理这条路。
-      if (proxyEnabled) b2.appendChild(proxyBtn(d.audio_url));
+      if (proxyEnabled) b2.appendChild(proxyBtn(d.audio_url, DL.AUDIO, "", "m4a"));
       box.appendChild(b2);
     }
     if (d.backup_urls && d.backup_urls.length) {
@@ -491,11 +585,14 @@
     if (full) {
       if (d.videos && d.videos.length) {
         box.appendChild(el("h2", null, "视频轨"));
-        box.appendChild(streamTable(d.videos, { proxy: proxyEnabled }));
+        // needs_mux=false 表示这一条本身就是音视频一体的文件
+        box.appendChild(streamTable(d.videos, {
+          proxy: proxyEnabled, kind: d.needs_mux ? "video" : "native",
+        }));
       }
       if (d.audios && d.audios.length) {
         box.appendChild(el("h2", null, "音频轨"));
-        box.appendChild(streamTable(d.audios, { proxy: proxyEnabled }));
+        box.appendChild(streamTable(d.audios, { proxy: proxyEnabled, kind: "audio" }));
       }
       if (d.subtitles && d.subtitles.length) {
         box.appendChild(el("h2", null, "字幕"));
@@ -515,7 +612,8 @@
         const bm = el("div", "btns");
         bm.appendChild(copyBtn(d.music.url, "复制地址"));
         bm.appendChild(openBtn(d.music.url, "打开"));
-        if (proxyEnabled) bm.appendChild(proxyBtn(d.music.url));
+        const mq = d.music.bandwidth ? Math.round(d.music.bandwidth / 1000) + "K" : "";
+        if (proxyEnabled) bm.appendChild(proxyBtn(d.music.url, DL.AUDIO, mq, "m4a"));
         box.appendChild(bm);
       }
     }
@@ -545,8 +643,9 @@
         const b = el("div", "btns");
         b.appendChild(copyBtn(it.links.url, "复制"));
         if (proxyEnabled) {
-          b.appendChild(proxyBtn(it.links.url));
-          if (it.links.audio_url) b.appendChild(proxyBtn(it.links.audio_url));
+          const lk = it.links.audio_url ? DL.VIDEO : DL.NATIVE;
+          b.appendChild(proxyBtn(it.links.url, lk, qualityLabel($("#quality").value), "mp4"));
+          if (it.links.audio_url) b.appendChild(proxyBtn(it.links.audio_url, DL.AUDIO, "", "m4a"));
         }
         td.appendChild(b);
       } else if (it.error) {
@@ -602,6 +701,7 @@
       if (res.status !== 200) { fail(res); return; }
       const v = ok(res);
       v.textContent = "";
+      if (res.body && res.body.title) rememberTitle(res.body);
       if (act === "links") v.appendChild(renderLinks(res.body));
       else if (act === "detail") {
         if (res.body.needs_mux && !res.body.audio_url) {
@@ -692,6 +792,7 @@
 
   // 供下面的"浏览器内混流"脚本复用（同一个页面，没必要写两遍）
   window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target,
+                dlName, qualityLabel, DL, ensureTitle,
                 proxyOn: () => proxyEnabled };
   boot();
 })();
@@ -724,7 +825,7 @@
  */
 (() => {
   "use strict";
-  const { api, el, prettySize, target, proxyOn } = window.VL;
+  const { api, el, prettySize, target, proxyOn, dlName, qualityLabel, DL, ensureTitle } = window.VL;
   const $ = (s) => document.querySelector(s);
   const DIR = "vidlink-mux";
   const MEM_LIMIT = 400 * 1024 * 1024;   // 无 OPFS 时的内存兜底上限
@@ -1222,7 +1323,8 @@
              " → 合并 " + prettySize(file.size) + "（" + Math.round(totalMs / 1000) + " 秒）");
       const url = URL.createObjectURL(file);
       lastURL = url;
-      const name = ((d.platform || "video") + "-" + (quality || "best") + ".mp4").replace(/[^\w.\-]+/g, "_");
+      // 与代理下载用同一套命名：标题 + VL + 前端混合 + 清晰度 + .mp4
+      const name = dlName(await ensureTitle(), DL.MUX, qualityLabel(quality), "mp4");
       if (h264OK) {
         $("#muxVideo").classList.remove("hidden");
         $("#muxNoPreview").classList.add("hidden");
