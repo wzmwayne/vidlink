@@ -263,10 +263,15 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 	if cfg.IsEase() {
 		mode = "免校验模式"
 	}
+	conf := "环境变量"
+	if cfg.ConfigFile != "" {
+		conf = cfg.ConfigFile
+	}
 	logger.Info("vidlink 启动",
 		"version", buildVersion,
 		"addr", cfg.Addr,
 		"mode", mode,
+		"config", conf,
 		"platforms", fmt.Sprint(platforms),
 		"cookie_configured", fmt.Sprint(authed),
 		"cache_ttl", cfg.Service.CacheTTL.String(),

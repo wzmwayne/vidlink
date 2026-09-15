@@ -22,6 +22,10 @@ coverage.out
 .env
 .env.local
 
+# 配置兜底文件：可能含 Cookie、管理员 Key、账号路径，绝不入库
+/.vl
+.vl
+
 # 编辑器 / 系统
 .vscode/
 .idea/

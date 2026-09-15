@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // TestEaseModeFromEnv 锁住 VL_EASE 的解析与它对限流的连带影响。
 //
@@ -103,5 +106,95 @@ func TestProxyWhitelistIsOptional(t *testing.T) {
 	}
 	if len(cfg.ProxySrv.AllowHosts) != 0 {
 		t.Fatalf("白名单应为空，得到 %v", cfg.ProxySrv.AllowHosts)
+	}
+}
+
+// TestParseDotVL：.vl 的解析要足够宽容——它是给人手写的，
+// 而"因为一行写错服务就起不来"的代价远大于忽略那一行。
+func TestParseDotVL(t *testing.T) {
+	in := "\ufeff# vidlink 配置\n" + // BOM + 注释
+		"VL_EASE=true\n" +
+		"\n" +
+		"   \t \n" +
+		"export VIDLINK_BATCH_MAX = 7 \n" + // shell 风格 + 等号两侧空格
+		`VIDLINK_ADMIN_KEY="vl_admin_引号包裹"` + "\n" +
+		"VIDLINK_CACHE_TTL=15m\r\n" + // CRLF
+		"# VIDLINK_PROXY_ENDPOINT=true\n" + // 注释掉的一行
+		"这行没有等号\n" +
+		"=没有键\n" +
+		"VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=a=b;ttwid=c\n" // 值里含 = 要保留
+	got := parseDotVL([]byte(in))
+	want := map[string]string{
+		"VL_EASE":               "true",
+		"VIDLINK_BATCH_MAX":     "7",
+		"VIDLINK_ADMIN_KEY":     "vl_admin_引号包裹",
+		"VIDLINK_CACHE_TTL":     "15m",
+		"VIDLINK_COOKIE_DOUYIN": "UIFID_TEMP=a=b;ttwid=c",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("解析出 %d 项，想要 %d 项：%v", len(got), len(want), got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q，想要 %q", k, got[k], v)
+		}
+	}
+}
+
+// TestDotVLIsFallbackForEnv：.vl 与进程环境变量同时存在时的优先级。
+func TestDotVLIsFallbackForEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/.vl", []byte("VL_EASE=true\nVIDLINK_BATCH_MAX=7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 切到该目录：.vl 的查找顺序里包含工作目录
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+
+	// ① 环境变量没设 → 用文件里的值
+	t.Setenv("VL_EASE", "")
+	t.Setenv("VIDLINK_BATCH_MAX", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if !cfg.IsEase() {
+		t.Error("VL_EASE=true 应来自 .vl 文件")
+	}
+	if cfg.BatchMax != 7 {
+		t.Errorf("BatchMax = %d，想要文件里的 7", cfg.BatchMax)
+	}
+	if cfg.ConfigFile == "" {
+		t.Error("ConfigFile 应记录实际生效的文件路径")
+	}
+
+	// ② 环境变量优先：临时覆盖一个值不该去改文件
+	t.Setenv("VIDLINK_BATCH_MAX", "9")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.BatchMax != 9 {
+		t.Errorf("BatchMax = %d，环境变量应覆盖文件里的 7", cfg.BatchMax)
+	}
+}
+
+// TestDotVLAbsentIsFine：没有 .vl 是常态，不能有任何副作用。
+func TestDotVLAbsentIsFine(t *testing.T) {
+	dir := t.TempDir()
+	oldWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	t.Setenv("VL_EASE", "")
+	if _, err := Load(); err != nil {
+		t.Fatalf("没有 .vl 时 Load 不应报错: %v", err)
 	}
 }

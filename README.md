@@ -300,7 +300,33 @@ curl -X PATCH ... -d '{"disabled":false}' ...
 
 ## 配置
 
-全部通过环境变量注入，**代码里不写死任何 Cookie 或密钥**。
+配置有**两个来源，环境变量优先**：进程环境变量，以及可执行文件同目录
+（或工作目录）下的 `.vl` 文件。**代码里不写死任何 Cookie 或密钥。**
+
+为什么还要一个文件：有些运行环境（面板、systemd 单元、部分容器运行时、
+Windows 计划任务）设环境变量会失败或悄悄丢掉，而"配置没生效"在服务端
+看起来和"配置写错了"一模一样。给一个能直接编辑的文件兜底，
+比让人去和运行环境搏斗划算。
+
+```bash
+# .vl —— 与可执行文件同目录（找不到就看当前工作目录）
+# 一行一个 KEY=VALUE；空行与 # 开头的行忽略
+VL_EASE=true
+VIDLINK_ACCOUNTS_PATH=/var/lib/vidlink/accounts.jsonl
+VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
+```
+
+- 取值顺序：**环境变量 → `.vl` → 内置默认值**。环境变量优先是刻意的：
+  临时覆盖一个值不该去改文件（`docker run -e` 更省事）；
+  反过来"文件覆盖环境变量"会让排障时看到的配置与实际生效的不一致。
+- 格式宽容：支持 `export KEY=VALUE`、`KEY="VALUE"`、等号两侧空格、CRLF、BOM；
+  坏行会被跳过而不是让服务起不来。值里可以含 `=`（Cookie 常见）。
+- **`.vl` 已在 `.gitignore` 与 `.dockerignore` 里**——它可能含 Cookie 与管理员 Key。
+  容器里请挂载：`-v /host/vidlink.vl:/app/.vl:ro`。
+- 启动日志会打印实际生效的来源（`config=环境变量` 或 `config=/path/.vl`），
+  用来分辨"文件路径不对"与"被环境变量覆盖了"。
+
+### 全部变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|

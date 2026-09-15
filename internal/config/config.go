@@ -5,8 +5,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +34,13 @@ type Config struct {
 	// 安全性由部署方式来保证：这个模式没有任何身份校验，
 	// **绝不能直接暴露到公网**（见 README 的警告）。
 	Ease bool
+
+	// ConfigFile 是实际生效的 .vl 文件路径（没有则为空串）。
+	//
+	// 只用于启动日志：配置文件这类东西必须可观测——
+	// "我改了文件但没生效"最常见的两个原因是路径不对与被环境变量覆盖，
+	// 把路径和键数打出来，一眼就能分辨。
+	ConfigFile string
 
 	// AdminKey 是**首次启动时**用来创建初始管理员的 Key。
 	//
@@ -111,12 +121,20 @@ type ProxyOptions struct {
 
 // Load 从环境变量读取配置并填充默认值。
 func Load() (*Config, error) {
+	// 先把同目录 .vl 读进来，后面所有 env* 取值都自动获得"文件兜底"能力。
+	kv, path, err := findDotVL()
+	if err != nil {
+		return nil, fmt.Errorf("config: 读取 %s 失败: %w", path, err)
+	}
+	dotVL = kv
+
 	// 免校验模式要先算出来：媒体代理的**默认开关跟随它**——
 	// ease 是"本机/内网自用"，浏览器内混流遇到需要 Referer 的 CDN 节点时
 	// 必须能走代理，默认关着会让那个功能时灵时不灵。
 	ease := envBool("VL_EASE", false)
 
 	c := &Config{
+		ConfigFile:         path,
 		Addr:               env("VIDLINK_ADDR", ":8080"),
 		Ease:               ease,
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
@@ -235,17 +253,113 @@ func (c *Config) ApplyCookies(store *deps.Cookies) {
 }
 
 // --- 环境变量小工具 ---
+//
+// 取值顺序：**进程环境变量优先，同目录的 .vl 文件兜底**。
+//
+// 为什么要文件：有些运行环境（面板、systemd 单元、部分容器运行时、
+// Windows 计划任务）设环境变量会失败或悄悄丢掉，而"配置没生效"这件事
+// 在服务端看起来和"配置写错了"一模一样。给一个可直接编辑的文件兜底，
+// 比让人去和运行环境搏斗划算。
+//
+// 文件格式刻意做得极简——就是 KEY=VALUE 逐行，忽略空行与 # 开头的注释：
+//
+//	# /opt/vidlink/.vl
+//	VL_EASE=true
+//	VIDLINK_ACCOUNTS_PATH=/var/lib/vidlink/accounts.jsonl
+//
+// 环境变量优先是刻意的：临时覆盖一个值不该去改文件（docker run -e 更省事），
+// 反过来"文件覆盖环境变量"会让排障时看到的配置与实际生效的不一致。
+
+// dotVL 是 .vl 文件里读到的键值对，只在 Load 期间被填充。
+//
+// 用包级变量是为了让下面这些 env* 帮助函数保持原样的签名——
+// 它们有二十多个调用点，为了传一个 map 而全改一遍不值得。
+// Load 不是并发入口（进程启动时调一次），因此不需要加锁。
+var dotVL = map[string]string{}
+
+// lookupEnv 按"环境变量 → .vl 文件"的顺序取一个非空值。
+func lookupEnv(key string) (string, bool) {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v, true
+	}
+	if v := strings.TrimSpace(dotVL[key]); v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+// findDotVL 在候选目录里找第一个存在的 .vl，返回解析结果与路径。
+//
+// 候选顺序：可执行文件所在目录 → 当前工作目录。
+// 先看可执行文件旁边，是因为"把 .vl 放在程序旁边"最符合直觉；
+// 再看工作目录，是为了兼容 systemd 之类把 cwd 设成 /var/lib/vidlink 的部署。
+func findDotVL() (map[string]string, string, error) {
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dirs = append(dirs, wd)
+	}
+	for _, dir := range dirs {
+		path := filepath.Join(dir, ".vl")
+		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			// 文件存在但读不了（权限、是目录）必须报出来：
+			// 静默忽略会让人以为"文件里写的都生效了"。
+			return nil, path, err
+		}
+		return parseDotVL(data), path, nil
+	}
+	return map[string]string{}, "", nil
+}
+
+// parseDotVL 解析 .vl 文件内容。
+//
+// 容错取向：**坏行跳过，不报错**。这个文件的定位是"环境变量的替代品"，
+// 里面通常还有人手写的注释与临时注释掉的行；因为一行写错就让服务起不来，
+// 代价比忽略它大得多。真正拼错的键名会在启动日志的配置摘要里露出来。
+func parseDotVL(data []byte) map[string]string {
+	out := map[string]string{}
+	text := strings.TrimPrefix(string(data), "\ufeff") // 编辑器可能带 BOM
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// 允许写成 shell 风格：export VL_EASE=true
+		line = strings.TrimPrefix(line, "export ")
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue // 没有 = 的行忽略（注释写漏 # 时不至于把整份配置带偏）
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		// 去掉成对的引号：VL_EASE="true" 也能用
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1]
+		}
+		if key == "" {
+			continue
+		}
+		out[key] = val
+	}
+	return out
+}
 
 func env(key, def string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+	if v, ok := lookupEnv(key); ok {
 		return v
 	}
 	return def
 }
 
 func envInt(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
+	v, ok := lookupEnv(key)
+	if !ok {
 		return def
 	}
 	n, err := strconv.Atoi(v)
@@ -256,8 +370,8 @@ func envInt(key string, def int) int {
 }
 
 func envFloat(key string, def float64) float64 {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
+	v, ok := lookupEnv(key)
+	if !ok {
 		return def
 	}
 	f, err := strconv.ParseFloat(v, 64)
@@ -268,10 +382,11 @@ func envFloat(key string, def float64) float64 {
 }
 
 func envBool(key string, def bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	switch v {
-	case "":
+	raw, ok := lookupEnv(key)
+	if !ok {
 		return def
+	}
+	switch strings.ToLower(raw) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
@@ -280,8 +395,8 @@ func envBool(key string, def bool) bool {
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
+	v, ok := lookupEnv(key)
+	if !ok {
 		return def
 	}
 	if d, err := time.ParseDuration(v); err == nil {
