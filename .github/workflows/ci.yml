@@ -26,12 +26,23 @@ jobs:
           go-version: '1.22'
           cache: true
 
-      # 本模块零第三方依赖，但仍会读 go.mod 决定工具链版本
-      - name: 校验 go.mod 未被意外改动
+      # 本模块零第三方依赖，但仍会读 go.mod 决定工具链版本。
+      #
+      # 注意 git diff 的路径写法：必须用 `--` 分隔，且只列**已跟踪**的文件。
+      # 若把不存在的 go.sum 一起写进去，git 会直接以 128 退出，
+      # 于是这条检查会在"什么都没变"的情况下报"go.mod 被改了"。
+      - name: 校验依赖没有增长
         run: |
           go mod tidy
-          git diff --exit-code go.mod go.sum 2>/dev/null \
+          git diff --exit-code -- go.mod \
             || { echo "::error::go.mod 有未提交的改动（本项目应保持零第三方依赖）"; exit 1; }
+          if [ -e go.sum ]; then
+            echo "::error::本项目零第三方依赖，不应出现 go.sum"
+            exit 1
+          fi
+          count=$(go list -m all | tail -n +2 | wc -l)
+          echo "第三方依赖数: $count"
+          [ "$count" -eq 0 ] || { echo "::error::依赖数应为 0"; exit 1; }
 
       - name: 格式检查
         run: make fmt-check
