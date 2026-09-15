@@ -134,9 +134,13 @@ jobs:
             sleep 5
           done
           [ "$ok" = 1 ] || { echo "::error::产物下载连续失败"; exit 1; }
-          # gh 会按产物名建子目录，这里摊平到 dist/ 根下
-          find dist -mindepth 2 -type f -exec mv -f {} dist/ \;
-          find dist -mindepth 1 -type d -exec rm -rf {} +
+          # gh 按产物名建子目录（dist/vidlink-linux-amd64/vidlink-linux-amd64），
+          # 摊平时不能直接往 dist/ 里 mv：文件名与同名的目录会撞车
+          # （mv: cannot overwrite directory 'dist/vidlink-linux-amd64'）。
+          # 先收进一个干净的 out/ 再整体替换。
+          mkdir -p out
+          find dist -type f -exec mv -f {} out/ \;
+          rm -rf dist && mv out dist
           ls -lh dist/
 
       - name: 创建 Release

@@ -1382,3 +1382,47 @@ func TestUIScriptsShareAllHelpers(t *testing.T) {
 		}
 	}
 }
+
+// TestGraphicalUIIsEaseOnly：图形化页面**只在免校验模式**可达。
+//
+// 这条是硬约束，不是风格问题：
+//   - 页面按设计不带任何凭据，账户模式下它需要有 Key 才能干活，
+//     而"Key 从哪来"在浏览器里没有干净的答案；
+//   - 账户模式常常部署在公网，多一个匿名可达的界面就多一片攻击面
+//     （它也确实是本项目里唯一会执行大量前端逻辑的地方）。
+//
+// 因此：ease 下根路径是 text/html 的解析页；账户下必须是纯文本导航页，
+// 且任何路径都不得吐出那段 HTML。
+func TestGraphicalUIIsEaseOnly(t *testing.T) {
+	// 取页面里的一个独有标记，确保判据不是"看起来像网页"
+	marker := `id="muxStart"` // 只存在于图形化页面
+	if !strings.Contains(string(uiHTML), marker) {
+		t.Fatalf("uiHTML 里找不到标记 %q，测试判据需要更新", marker)
+	}
+
+	ease := newEaseEnv(t, nil, defaultStub())
+	w := do(ease.handler(), http.MethodGet, "/", nil)
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("ease 模式根路径应为 text/html，得到 %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), marker) {
+		t.Error("ease 模式根路径应返回图形化页面")
+	}
+
+	acct := newTestEnv(t, nil, defaultStub())
+	h := acct.handler()
+	// 带 Key（已认证）也不该给网页
+	if w := do(h, http.MethodGet, "/", userHdr(acct.userKey)); strings.Contains(w.Body.String(), marker) {
+		t.Error("账户模式根路径泄露了图形化页面")
+	}
+	// 其它任何路径同样不该吐这段 HTML
+	for _, path := range []string{"/", "/index.html", "/ui", "/v1/usage", "/v1/platforms", "/nope"} {
+		w := do(h, http.MethodGet, path, userHdr(acct.userKey))
+		if strings.Contains(w.Body.String(), marker) {
+			t.Errorf("账户模式 %s 返回了图形化页面", path)
+		}
+		if ct := w.Header().Get("Content-Type"); strings.Contains(ct, "text/html") {
+			t.Errorf("账户模式 %s 的 Content-Type 是 %q，不应有 HTML", path, ct)
+		}
+	}
+}
