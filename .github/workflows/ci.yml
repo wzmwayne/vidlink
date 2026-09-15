@@ -117,13 +117,27 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: 列出产物
-        run: ls -lh dist/
+      # 用 gh CLI 而不是 actions/download-artifact：前者能在循环里重试。
+      # 实测遇到过一次"8 个产物下了 7 个，最后一个 5 次重试后失败"——
+      # 纯粹的瞬时抖动，不该让整场发布失败。
+      - name: 下载全部产物（失败自动重试）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ok=0
+          for i in 1 2 3 4 5; do
+            rm -rf dist && mkdir -p dist
+            if gh run download "$GITHUB_RUN_ID" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --pattern 'vidlink-*' --dir dist; then ok=1; break; fi
+            echo "第 $i 次下载失败，5 秒后重试"
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo "::error::产物下载连续失败"; exit 1; }
+          # gh 会按产物名建子目录，这里摊平到 dist/ 根下
+          find dist -mindepth 2 -type f -exec mv -f {} dist/ \;
+          find dist -mindepth 1 -type d -exec rm -rf {} +
+          ls -lh dist/
 
       - name: 创建 Release
         env:
