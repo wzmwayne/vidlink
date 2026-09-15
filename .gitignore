@@ -1,0 +1,29 @@
+# 运行期数据：账号账本（JSONL，含账号与配额）
+/data/
+
+# 构建产物
+/vidlink
+/vidlink-*
+/dist/
+coverage.out
+
+# 调研用的参考仓库（约 63 MB，与项目源码无关）
+/refs/
+
+# 原始取证材料：从第三方仓库逐行摘录的逆向笔记（含对他人源码的成段引用）。
+# 留在本地作为设计依据，但不随仓库分发。
+/docs/evidence/
+
+# 访客身份/签名铸造工具：会下载并执行平台下发的混淆 JS 虚拟机。
+# 属于"绕过平台风控"的操作类工具，不公开发布。
+/tools/douyin-mint/
+
+# 本地环境
+.env
+.env.local
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store

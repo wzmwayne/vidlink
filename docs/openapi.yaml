@@ -1,0 +1,735 @@
+openapi: 3.0.3
+
+info:
+  title: vidlink API
+  version: "1.4.0"
+  description: |
+    多平台视频解析 API：输入分享链接或平台内容 ID，返回平台已发布的直链。
+    支持抖音、哔哩哔哩、快手、小红书。人读版本见 API.md，系数见 配额倍率表.md。
+
+    计量单位是**配额**（管理员分配的用量额度，不是余额、与支付无关，API 中无金额字段）：
+    `消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率`，只在实际成功时扣减，配额不足返回 429。
+
+    默认只返回 CDN 直链，服务端不代理视频字节。直链通常带 Referer 防盗链，
+    浏览器直接 `<video src>` 可能 403：请带上 `Links.headers`，或启用 `/v1/proxy`（默认关闭）。
+
+    鉴权三选一：`X-API-Key` 头 / `Authorization: Bearer` / `?key=`。失败一律 403 且不区分原因。
+    并发三层：按 IP 限流（429）、按 Key 并发 1（仅计量端点；429，不排队）、
+    全局解析槽位 10 + 队列 30（503）。
+
+servers:
+  - { url: "http://127.0.0.1:8080", description: 本地默认 }
+
+tags:
+  - { name: 元信息, description: 公开端点 }
+  - { name: 账号, description: 账号自查（需 Key） }
+  - { name: 计量, description: 按配额计量（需 Key） }
+  - { name: 管理, description: 管理面（需管理员 Key） }
+  - { name: 运维, description: 探针与可选代理 }
+
+paths:
+  /v1/version:
+    get:
+      tags: [元信息]
+      summary: 版本信息
+      security: []
+      operationId: getVersion
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/Version" } } }
+
+  /v1/health:
+    get:
+      tags: [元信息]
+      summary: 健康检查 + 缓存统计
+      security: []
+      operationId: getHealth
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } }
+
+  /v1/platforms:
+    get:
+      tags: [元信息]
+      summary: 平台清单与各端点系数（不消耗配额）
+      security: []
+      operationId: listPlatforms
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/PlatformList" } } }
+
+  /healthz:
+    get:
+      tags: [运维]
+      summary: 存活探针
+      security: []
+      operationId: getHealthz
+      responses:
+        "200":
+          description: 存活
+          content:
+            application/json:
+              schema: { type: object, properties: { status: { type: string, example: alive } } }
+
+  /readyz:
+    get:
+      tags: [运维]
+      summary: 就绪探针（无可用平台时 503）
+      security: []
+      operationId: getReadyz
+      responses:
+        "200":
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+                  platforms: { type: integer, example: 4 }
+        "503":
+          description: 未就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: not_ready }
+                  reason: { type: string }
+
+  /v1/usage:
+    get:
+      tags: [账号]
+      summary: 自己的配额、用量、倍率与各端点系数（不消耗配额）
+      operationId: getUsage
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/Usage" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/info:
+    get:
+      tags: [计量]
+      summary: 元信息 + 可用档位列表（无直链）
+      description: 消耗 0.5（抖音 0.75）。
+      operationId: getInfo
+      parameters:
+        - $ref: "#/components/parameters/Url"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ContentID"
+      responses:
+        "200":
+          description: OK
+          headers: { $ref: "#/components/headers/QuotaHeaders" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Info" } } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "502": { $ref: "#/components/responses/Upstream" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/links:
+    get:
+      tags: [计量]
+      summary: 只取直链（无元信息）
+      description: 消耗 1.0（抖音 1.1）。
+      operationId: getLinks
+      parameters:
+        - $ref: "#/components/parameters/Url"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ContentID"
+        - $ref: "#/components/parameters/Quality"
+      responses:
+        "200":
+          description: OK
+          headers: { $ref: "#/components/headers/QuotaHeaders" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Links" } } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "502": { $ref: "#/components/responses/Upstream" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/detail:
+    get:
+      tags: [计量]
+      summary: 元信息 + 全部档位直链 + 字幕/图集
+      description: 消耗 1.2（抖音 1.5）。
+      operationId: getDetail
+      parameters:
+        - $ref: "#/components/parameters/Url"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/ContentID"
+      responses:
+        "200":
+          description: OK
+          headers: { $ref: "#/components/headers/QuotaHeaders" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Detail" } } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "502": { $ref: "#/components/responses/Upstream" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/batch/links:
+    post:
+      tags: [计量]
+      summary: 批量取直链（5~20 条，不支持抖音）
+      description: |
+        每条 0.75，只按**成功条数**结算。抖音在解析前就被挡掉（纯本地判定）。
+        下限 5 条，否则 1 条也能享受批量下调，失去引导合并的意义。
+      operationId: postBatchLinks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BatchLinksRequest" }
+      responses:
+        "200":
+          description: OK
+          headers: { $ref: "#/components/headers/QuotaHeaders" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchLinksResponse" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/admin/accounts:
+    get:
+      tags: [管理]
+      summary: 账号列表（Key 掩码）
+      operationId: adminListAccounts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts: { type: array, items: { $ref: "#/components/schemas/Account" } }
+                  stats: { $ref: "#/components/schemas/AccountStats" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [管理]
+      summary: 创建账号
+      description: 不填 `key` 时自动生成 256 位随机 Key，明文只在本次响应返回一次。
+      operationId: adminCreateAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAccountRequest" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account: { $ref: "#/components/schemas/Account" }
+                  key: { type: string, description: 自动生成时的明文 Key（只此一次） }
+                  notice: { type: string }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/admin/accounts/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        description: 账号的明文 Key
+        schema: { type: string }
+    get:
+      tags: [管理]
+      summary: 查看单个账号（Key 掩码）
+      operationId: adminGetAccount
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { account: { $ref: "#/components/schemas/Account" } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [管理]
+      summary: 修改账号（配额 / 倍率 / 停用 / 管理员）
+      operationId: adminPatchAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatchAccountRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { account: { $ref: "#/components/schemas/Account" } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [管理]
+      summary: 删除账号（不能删除自己）
+      operationId: adminDeleteAccount
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { deleted: { type: boolean, example: true } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/admin/stats:
+    get:
+      tags: [管理]
+      summary: 运行统计（账号 / 闸门 / 缓存 / 流量）
+      operationId: adminStats
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts: { $ref: "#/components/schemas/AccountStats" }
+                  gate: { $ref: "#/components/schemas/GateStats" }
+                  cache: { $ref: "#/components/schemas/CacheStats" }
+                  traffic:
+                    type: object
+                    properties:
+                      requests: { type: integer, format: int64 }
+                      errors: { type: integer, format: int64 }
+                      uptime_sec: { type: integer }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/admin/quota:
+    get:
+      tags: [管理]
+      summary: 配额系数全貌（只读）
+      description: 系数是共享参数，影响所有账号，因此只提供读接口；单账号调整请改 `multiplier`。
+      operationId: adminQuota
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/QuotaTable" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/proxy:
+    get:
+      tags: [运维]
+      summary: 流式媒体代理（默认关闭，需白名单）
+      description: 透传 Range/If-Range。仅当 `VIDLINK_PROXY_ENDPOINT=true` 且配置了白名单时该路由才存在。
+      operationId: proxyMedia
+      parameters:
+        - name: url
+          in: query
+          required: true
+          description: 媒体地址（http/https 绝对地址）
+          schema: { type: string }
+        - name: referer
+          in: query
+          required: false
+          description: 覆盖默认 Referer
+          schema: { type: string }
+      responses:
+        "200":
+          description: 媒体字节流
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        "206": { description: 部分内容（Range） }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    ApiKeyHeader: { type: apiKey, in: header, name: X-API-Key }
+    BearerAuth: { type: http, scheme: bearer }
+    ApiKeyQuery: { type: apiKey, in: query, name: key }
+
+  security:
+    - ApiKeyHeader: []
+    - BearerAuth: []
+    - ApiKeyQuery: []
+
+  headers:
+    QuotaHeaders:
+      X-Quota-Consumed:
+        description: 本次调用消耗的配额
+        schema: { type: number, format: double, example: 1 }
+      X-Quota-Remaining:
+        description: 该账号剩余可用配额
+        schema: { type: number, format: double, example: 99 }
+
+  parameters:
+    Url:
+      name: url
+      in: query
+      required: false
+      description: 分享链接或整段分享文案（自动提取链接）。与 platform + id 二选一。
+      schema: { type: string }
+    Platform:
+      name: platform
+      in: query
+      required: false
+      description: 平台标识（与 id 一起使用）
+      schema: { type: string, enum: [douyin, bilibili, kuaishou, xiaohongshu] }
+    ContentID:
+      name: id
+      in: query
+      required: false
+      description: 平台内内容 ID（与 platform 一起使用）
+      schema: { type: string }
+    Quality:
+      name: quality
+      in: query
+      required: false
+      description: 目标清晰度：`1080` / `720P` / `qn:80`；缺省取推荐档。档位不存在返回 400（不消耗配额）。
+      schema: { type: string, example: "1080" }
+
+  responses:
+    BadInput:
+      description: 参数不合法
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: 缺少或无效 Key、账号停用、需要登录态
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: 内容不存在或已删除
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: 配额不足（quota_exhausted）、按 Key 并发超限（concurrency_limited）或按 IP 限流（rate_limited）
+      headers:
+        Retry-After:
+          description: 建议重试间隔（秒）
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Upstream:
+      description: 上游平台异常（抖音限流也表现为这里）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: 本地过载：解析槽位与排队都满
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [kind, message]
+          properties:
+            kind:
+              type: string
+              enum: [bad_input, unsupported, not_found, forbidden, rate_limited,
+                     concurrency_limited, quota_exhausted, timeout, upstream_error,
+                     unavailable, method_not_allowed, internal]
+            message: { type: string }
+            request_id: { type: string }
+
+    Version:
+      type: object
+      properties:
+        version: { type: string, example: "1.4.0" }
+        api_version: { type: string, example: v1 }
+        platform: { type: string, example: linux/arm64 }
+
+    CacheStats:
+      type: object
+      description: coalesced 是被请求合并省掉的上游调用数
+      properties:
+        entries: { type: integer }
+        hits: { type: integer, format: int64 }
+        misses: { type: integer, format: int64 }
+        coalesced: { type: integer, format: int64 }
+        loads: { type: integer, format: int64 }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, example: ok }
+        version: { type: string }
+        api_version: { type: string }
+        uptime_sec: { type: integer }
+        requests: { type: integer, format: int64 }
+        errors: { type: integer, format: int64 }
+        cache: { $ref: "#/components/schemas/CacheStats" }
+
+    PlatformList:
+      type: object
+      properties:
+        platforms:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string, example: bilibili }
+              hosts: { type: array, items: { type: string } }
+              supports_id: { type: boolean }
+              has_cookie: { type: boolean }
+              rates:
+                type: object
+                additionalProperties: true
+                description: 各端点系数；不支持批量时 batch_links 是带 reason 的对象
+              batch: { type: boolean }
+              batch_reason: { type: string }
+        unit: { type: string, example: 配额 }
+        limits:
+          type: object
+          properties:
+            batch_min: { type: integer, example: 5 }
+            batch_max: { type: integer, example: 20 }
+
+    Usage:
+      type: object
+      properties:
+        name: { type: string }
+        unit: { type: string, example: 配额 }
+        quota: { type: number, description: 剩余可用配额 }
+        used: { type: number }
+        calls: { type: integer }
+        multiplier: { type: number }
+        rates: { type: object, additionalProperties: true }
+        limits:
+          type: object
+          properties:
+            per_key_concurrency: { type: integer }
+            global_concurrency: { type: integer }
+            batch_min: { type: integer }
+            batch_max: { type: integer }
+
+    Author:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        avatar: { type: string }
+
+    Stats:
+      type: object
+      properties:
+        view: { type: integer, format: int64 }
+        like: { type: integer, format: int64 }
+        comment: { type: integer, format: int64 }
+        collect: { type: integer, format: int64 }
+        share: { type: integer, format: int64 }
+        danmaku: { type: integer, format: int64 }
+        duration: { type: integer, description: 秒 }
+
+    Quality:
+      type: object
+      description: 可选档位描述，不含直链
+      properties:
+        height: { type: integer, example: 1080 }
+        label: { type: string, example: 1080P }
+        quality_id: { type: integer, example: 80 }
+        codecs: { type: array, items: { type: string } }
+
+    Image:
+      type: object
+      properties:
+        url: { type: string }
+        live_photo_url: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+
+    Stream:
+      type: object
+      properties:
+        url: { type: string }
+        backup_urls: { type: array, items: { type: string } }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: 播放/下载该直链时必须携带的请求头
+        quality: { type: string, example: 1080P }
+        quality_id: { type: integer }
+        codec: { type: string, example: avc1.640032 }
+        mime_type: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        frame_rate: { type: string }
+        bandwidth: { type: integer }
+        size: { type: integer, format: int64 }
+        duration: { type: number, format: double }
+
+    Subtitle:
+      type: object
+      properties:
+        lang: { type: string }
+        name: { type: string }
+        url: { type: string }
+        format: { type: string }
+
+    Info:
+      type: object
+      properties:
+        platform: { type: string }
+        id: { type: string }
+        title: { type: string }
+        desc: { type: string }
+        cover: { type: string }
+        author: { $ref: "#/components/schemas/Author" }
+        stats: { $ref: "#/components/schemas/Stats" }
+        source_url: { type: string }
+        qualities: { type: array, items: { $ref: "#/components/schemas/Quality" } }
+        images: { type: array, items: { $ref: "#/components/schemas/Image" } }
+        warning: { type: string, description: 降级提示（例如只拿到 480P） }
+        cached: { type: boolean }
+
+    Links:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string }
+        backup_urls: { type: array, items: { type: string } }
+        headers: { type: object, additionalProperties: { type: string } }
+        audio_url: { type: string, description: DASH 分离流的音频直链 }
+        needs_mux: { type: boolean, description: 为 true 时需要自行混流 }
+
+    Detail:
+      allOf:
+        - $ref: "#/components/schemas/Info"
+        - type: object
+          properties:
+            videos: { type: array, items: { $ref: "#/components/schemas/Stream" } }
+            audios: { type: array, items: { $ref: "#/components/schemas/Stream" } }
+            needs_mux: { type: boolean }
+            music: { $ref: "#/components/schemas/Stream" }
+            subtitles: { type: array, items: { $ref: "#/components/schemas/Subtitle" } }
+            best_video_url: { type: string }
+            best_video_headers: { type: object, additionalProperties: { type: string } }
+            best_audio_url: { type: string }
+
+    BatchLinksRequest:
+      type: object
+      description: urls 与 text 至少给一个；text 按行拆分
+      properties:
+        urls: { type: array, items: { type: string } }
+        text: { type: string }
+        quality: { type: string }
+
+    BatchLinksResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        success: { type: integer }
+        failed: { type: integer }
+        cost: { type: number, description: 本次消耗（只计成功条数，已含账号倍率） }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              input: { type: string }
+              links: { $ref: "#/components/schemas/Links" }
+              error:
+                type: object
+                properties:
+                  kind: { type: string }
+                  message: { type: string }
+
+    Account:
+      type: object
+      properties:
+        key: { type: string, description: 掩码后的 Key（仅创建时返回明文） }
+        name: { type: string }
+        note: { type: string }
+        admin: { type: boolean }
+        quota: { type: number, description: 剩余可用配额 }
+        used: { type: number }
+        calls: { type: integer }
+        multiplier: { type: number }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AccountStats:
+      type: object
+      properties:
+        accounts: { type: integer }
+        active: { type: integer }
+        used_total: { type: number }
+        calls_total: { type: integer, format: int64 }
+        quota_total: { type: number }
+
+    GateStats:
+      type: object
+      properties:
+        global_limit: { type: integer }
+        global_in_use: { type: integer }
+        global_free: { type: integer }
+        waiting: { type: integer, format: int64 }
+        max_queue: { type: integer }
+        active_keys: { type: integer }
+        rejected_key_busy: { type: integer, format: int64 }
+        rejected_queue_full: { type: integer, format: int64 }
+        timed_out: { type: integer, format: int64 }
+
+    CreateAccountRequest:
+      type: object
+      properties:
+        key: { type: string, description: 留空则自动生成 256 位随机 Key }
+        name: { type: string }
+        quota: { type: number, description: 初始配额 }
+        multiplier: { type: number, default: 1, description: "缺省 1.0；0 表示不扣配额，是有含义的取值" }
+        admin: { type: boolean, default: false }
+        note: { type: string }
+
+    PatchAccountRequest:
+      type: object
+      description: 全部字段可选；quota 与 add_quota 不能同时使用
+      properties:
+        name: { type: string }
+        note: { type: string }
+        quota: { type: number, description: 设为该值（剩余配额） }
+        add_quota: { type: number, description: 在现有剩余配额上加减 }
+        multiplier: { type: number }
+        disabled: { type: boolean }
+        admin: { type: boolean }
+
+    QuotaTable:
+      type: object
+      properties:
+        unit: { type: string, example: 配额 }
+        formula: { type: string, example: "消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率" }
+        endpoints: { type: object, additionalProperties: { type: string } }
+        preauth_max:
+          type: object
+          additionalProperties: { type: number }
+          description: 各端点的预授权上限（该端点在所有平台中的最高系数）
+        platforms: { type: object, additionalProperties: true }
+        note: { type: string }

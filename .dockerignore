@@ -1,0 +1,24 @@
+# 构建上下文里不需要的东西。
+# refs/ 是调研时克隆的 14 个参考仓库（约 63 MB），与本项目源码无关——
+# 不排除的话每次 docker build 都要把它们打包上传给 daemon。
+
+refs/
+.git/
+.github/
+docs/evidence/
+tools/
+
+# 运行期数据（账号账本，绝不进镜像）
+data/
+
+# 构建产物
+vidlink
+vidlink-*
+dist/
+coverage.out
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store

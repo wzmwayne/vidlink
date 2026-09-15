@@ -1,0 +1,279 @@
+package server
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"vidlink/internal/account"
+	"vidlink/internal/core"
+	"vidlink/internal/quota"
+)
+
+// adminRoutes 是管理面路由。
+//
+// 为什么单独一张表：管理端点的鉴权规则与业务端点不同（要 admin 标记），
+// 而它们**同样不能**被 404/405 判定逻辑漏掉，所以必须与业务路由一起
+// 交给同一套 fallback 处理。
+func (s *Server) adminRoutes() []routeSpec {
+	return []routeSpec{
+		{method: http.MethodGet, path: "/v1/admin/accounts", admin: true,
+			handler: s.handleAdminListAccounts},
+		{method: http.MethodPost, path: "/v1/admin/accounts", admin: true,
+			handler: s.handleAdminCreateAccount},
+		{method: http.MethodGet, path: "/v1/admin/accounts/{key}", admin: true,
+			handler: s.handleAdminGetAccount},
+		{method: http.MethodPatch, path: "/v1/admin/accounts/{key}", admin: true,
+			handler: s.handleAdminPatchAccount},
+		{method: http.MethodDelete, path: "/v1/admin/accounts/{key}", admin: true,
+			handler: s.handleAdminDeleteAccount},
+		{method: http.MethodGet, path: "/v1/admin/stats", admin: true,
+			handler: s.handleAdminStats},
+		{method: http.MethodGet, path: "/v1/admin/quota", admin: true,
+			handler: s.handleAdminQuota},
+	}
+}
+
+// handleAdminQuota 返回配额消耗系数的全貌。
+//
+// 只读：系数是**共享的运营参数**，影响所有账号，所以刻意不提供写接口——
+// 改它要走代码评审（见 docs/配额倍率表.md 的"怎么改"）。
+// 单个账号的临时调整请改该账号的 multiplier，那是按账号隔离的。
+//
+// 这个端点的意义是"让管理员能自己核对一次调用到底扣多少"，
+// 而不用去读源码或翻文档。
+func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	preauth := map[string]float64{}
+	for _, ep := range quota.AllEndpoints {
+		preauth[string(ep)] = s.quotaTable.MaxCoefficient(ep)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"unit":    unitName,
+		"formula": "消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率",
+		"endpoints": map[string]any{
+			"info":        "仅元信息与可用档位列表，不含任何直链",
+			"links":       "仅直链，不含元信息",
+			"detail":      "元信息 + 全部档位直链 + 字幕/图集",
+			"batch_links": "批量只取直链，按成功条数计量",
+		},
+		// 预授权上限：解析开始前按该端点在所有平台中的最高系数检查一次配额。
+		// 客户端据此可以预判"最少要留多少配额才能调这个端点"。
+		"preauth_max": preauth,
+		"platforms":   s.allRates(),
+		"note": "系数只影响后续调用，已发生的用量不重算；" +
+			"单个账号的调整请改该账号的 multiplier",
+	})
+}
+
+// requireAdmin 校验当前账号是不是管理员。
+//
+// 返回的是**未掩码**的账号，因为后续操作（改配额、改倍率）需要它。
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (account.Account, bool) {
+	acct, ok := accountFrom(r.Context())
+	if !ok {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth", "缺少 API Key"))
+		return account.Account{}, false
+	}
+	if !acct.Admin {
+		// 刻意不透露"这个端点存在但你没权限"以外的任何信息
+		writeError(w, core.Errf(core.KindForbidden, "", "auth",
+			"该端点需要管理员权限"))
+		return account.Account{}, false
+	}
+	return acct, true
+}
+
+func (s *Server) handleAdminListAccounts(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts": s.accounts.List(),
+		"stats":    s.accounts.Stats(),
+	})
+}
+
+// createAccountRequest 是创建账号的请求体。
+//
+// 倍率用**指针**：nil 表示"没提"，此时按 1.0（标准）；
+// 而显式的 0 表示"不扣配额"，是有意义的取值。不用指针就无法区分这两者，
+// 结果是每个新建账号默认不扣配额——那会让用量统计失去意义。
+type createAccountRequest struct {
+	Key        string   `json:"key"`
+	Name       string   `json:"name"`
+	Quota      *float64 `json:"quota"`
+	Multiplier *float64 `json:"multiplier"`
+	Admin      bool     `json:"admin"`
+	Note       string   `json:"note"`
+}
+
+func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	var req createAccountRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeError(w, core.BadInput("", "请求体不是合法 JSON: %v", err))
+		return
+	}
+
+	key := strings.TrimSpace(req.Key)
+	generated := false
+	if key == "" {
+		// 不填就自动生成，避免管理员用弱 Key
+		var err error
+		key, err = newAPIKey()
+		if err != nil {
+			writeError(w, core.E(core.KindInternal, "", "admin", "生成 Key 失败", err))
+			return
+		}
+		generated = true
+	}
+
+	mult := 1.0 // 默认标准倍率；0 是有含义的取值（不扣配额），不能当默认值
+	if req.Multiplier != nil {
+		mult = *req.Multiplier
+	}
+	q := 0.0
+	if req.Quota != nil {
+		q = *req.Quota
+	}
+
+	a, err := s.accounts.Create(account.Account{
+		Key: key, Name: req.Name, Quota: q, Multiplier: mult,
+		Admin: req.Admin, Note: req.Note,
+	})
+	if err != nil {
+		if errors.Is(err, account.ErrDuplicate) {
+			writeError(w, core.BadInput("", "该 Key 已存在"))
+			return
+		}
+		writeError(w, core.E(core.KindInternal, "", "admin", "创建账号失败", err))
+		return
+	}
+
+	// 明文 Key 只在**创建这一次**返回。此后所有接口都只回掩码，
+	// 避免 Key 出现在日志、浏览器历史和运维截屏里。
+	resp := map[string]any{"account": a}
+	if generated {
+		resp["key"] = a.Key
+		resp["notice"] = "请立即保存这个 Key，它只会出现这一次"
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleAdminGetAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	key := r.PathValue("key")
+	a, ok := s.accounts.Get(key)
+	if !ok {
+		writeError(w, core.NotFound("", "账号不存在"))
+		return
+	}
+	// Public() 掩码 Key：明文只在创建时返回一次，
+	// 否则 Key 会出现在浏览器历史、代理日志、运维截屏里。
+	writeJSON(w, http.StatusOK, map[string]any{"account": a.Public()})
+}
+
+// patchAccountRequest 是局部修改。所有字段用指针以区分"没提"与"设为零"。
+type patchAccountRequest struct {
+	Name       *string  `json:"name"`
+	Note       *string  `json:"note"`
+	Quota      *float64 `json:"quota"`
+	AddQuota   *float64 `json:"add_quota"`
+	Multiplier *float64 `json:"multiplier"`
+	Disabled   *bool    `json:"disabled"`
+	Admin      *bool    `json:"admin"`
+}
+
+func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	key := r.PathValue("key")
+	var req patchAccountRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeError(w, core.BadInput("", "请求体不是合法 JSON: %v", err))
+		return
+	}
+	if req.Quota != nil && req.AddQuota != nil {
+		writeError(w, core.BadInput("", "quota 与 add_quota 不能同时使用："+
+			"前者是设为该值，后者是在现有值上加减"))
+		return
+	}
+
+	a, err := s.accounts.Update(key, account.Patch{
+		Name: req.Name, Note: req.Note,
+		Quota: req.Quota, AddQuota: req.AddQuota,
+		Multiplier: req.Multiplier, Disabled: req.Disabled, Admin: req.Admin,
+	})
+	if err != nil {
+		if errors.Is(err, account.ErrNotFound) {
+			writeError(w, core.NotFound("", "账号不存在"))
+			return
+		}
+		writeError(w, core.BadInput("", "%v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"account": a.Public()})
+}
+
+func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	admin, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	key := r.PathValue("key")
+	if key == admin.Key {
+		// 删掉自己会立刻失去管理能力，且没有任何界面能恢复
+		writeError(w, core.BadInput("", "不能删除当前正在使用的管理员账号"))
+		return
+	}
+	if err := s.accounts.Delete(key); err != nil {
+		if errors.Is(err, account.ErrNotFound) {
+			writeError(w, core.NotFound("", "账号不存在"))
+			return
+		}
+		writeError(w, core.E(core.KindInternal, "", "admin", "删除失败", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts": s.accounts.Stats(),
+		"gate":     s.gate.Stats(),
+		"cache":    s.svc.CacheStats(),
+		"traffic": map[string]any{
+			"requests":   s.reqCount.Load(),
+			"errors":     s.errCount.Load(),
+			"uptime_sec": int(time.Since(s.startedAt).Seconds()),
+		},
+	})
+}
+
+// newAPIKey 生成一个 256 位随机 Key。
+//
+// 用 crypto/rand 而不是 math/rand：Key 就是账号本身，
+// 可预测等于别人的配额能被随便花。
+func newAPIKey() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("熵源不可用: %w", err)
+	}
+	return "vl_" + hex.EncodeToString(b[:]), nil
+}

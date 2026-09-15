@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消进行中的旧运行，避免排队浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 格式 / 静态检查 / 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # 本模块零第三方依赖，但仍会读 go.mod 决定工具链版本
+      - name: 校验 go.mod 未被意外改动
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum 2>/dev/null \
+            || { echo "::error::go.mod 有未提交的改动（本项目应保持零第三方依赖）"; exit 1; }
+
+      - name: 格式检查
+        run: make fmt-check
+
+      - name: 静态检查
+        run: make vet
+
+      - name: 单元测试（含竞态检测）
+        run: go test -race ./...
+
+      - name: 校验 OpenAPI 规格
+        run: make openapi
+
+  build:
+    name: 交叉编译
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: 构建 linux/amd64 与 linux/arm64
+        run: make build-all
+
+      - name: 报告产物大小与依赖数
+        run: |
+          ls -lh dist/
+          echo "第三方依赖数: $(go list -m all | tail -n +2 | wc -l)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vidlink-binaries
+          path: dist/
+          retention-days: 7
+
+  docker:
+    name: 容器镜像
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 只验证能构建，不推送（推送需要仓库配置 registry 凭据）
+      - name: 构建镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
