@@ -52,9 +52,11 @@ build-arm64: ## 构建树莓派用的 linux/arm64 二进制
 # outname 把 GOOS/GOARCH[/GOARM] 映射成产物文件名：
 #   linux/arm/7     -> vidlink-linux-armv7
 #   windows/amd64   -> vidlink-windows-amd64.exe
-# Windows 的后缀交给 Go 自己加（GOOS=windows 时它一定会加），
-# 我们只在打印时按 .exe 展示，避免出现 amd64.exe.exe 这种事。
-outname = $(BINARY)-$(subst /,-,$(subst arm/7,armv7,$(subst arm/6,armv6,$(TARGET))))
+#
+# Windows 的 .exe 必须自己加：`go build -o dist/x` 在 GOOS=windows 下
+# **不会**补后缀（实测产物就叫 dist/vidlink-windows-amd64），
+# 少了它用户在 Windows 上双击没反应、下载页也认不出是程序。
+outname = $(BINARY)-$(subst /,-,$(subst arm/7,armv7,$(subst arm/6,armv6,$(TARGET))))$(if $(filter windows/%,$(TARGET)),.exe)
 
 .PHONY: build-one
 build-one: ## 构建单个目标：make build-one TARGET=linux/arm64
