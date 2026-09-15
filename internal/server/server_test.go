@@ -1108,14 +1108,23 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`id="muxSave"`,
 		`navigator.storage.getDirectory`,
 		`canPlayType`, // 无 H.264 解码器的浏览器要给出解释，而不是静默失败
+		`代理播放`,        // 视频轨与音频轨都要有代理入口（音频同样受防盗链限制）
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("页面缺少 %q", want)
 		}
 	}
-	// 页面必须自包含：不能有外链脚本/样式/字体，否则离线与内网环境会残缺
-	for _, forbidden := range []string{"<script src", "<link ", "cdn.", "googleapis", "unpkg"} {
-		if strings.Contains(strings.ToLower(body), forbidden) {
+	// 页面必须自包含：不能有外链脚本/样式/字体，否则离线与内网环境会残缺。
+	//
+	// 这里查的是**资源引用**（src/link/@import/url(...)），不是裸子串——
+	// 页面注释里出现 "mcdn.bilivideo.cn" 这类域名是在讲 CDN 行为，
+	// 用 "cdn." 做子串匹配会把这种说明误判成外链。
+	low := strings.ToLower(body)
+	for _, forbidden := range []string{
+		"<script src", "<link ", "@import", "url(http", `src="http`, "src='http",
+		`href="http`, "href='http", "googleapis", "unpkg", "jsdelivr",
+	} {
+		if strings.Contains(low, forbidden) {
 			t.Errorf("页面引用了外部资源: %q", forbidden)
 		}
 	}
