@@ -162,11 +162,11 @@
 
   <!-- 浏览器内混流 -->
   <section id="muxsec">
-    <h2>浏览器内混流（DASH 音视频合并，无需 ffmpeg）</h2>
+    <h2>浏览器内混流（DASH 音视频合并）</h2>
     <div class="hint" style="margin:0 0 10px">
       流程：按上面的链接与清晰度，<b>流式下载</b>视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
       在页面内合并为单个 MP4 → 保存到本地。适用于返回 <code>audio_url</code> 的平台（如 B 站）。
-      合并是**片段级重排**，不重新编码，所以速度只取决于下载。
+      合并是<b>片段级重排</b>，不重新编码，所以速度只取决于下载。
     </div>
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
