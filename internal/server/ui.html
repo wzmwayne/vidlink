@@ -1256,7 +1256,9 @@
       const r = await api("/v1/checkin", { method: "POST" });
       if (r.status === 200 && r.body) {
         st.textContent = r.body.message || "签到完成";
+        // 余额与账单都要刷新：签到会同时改这两处，只刷一个会让人以为没生效
         await loadUsage();
+        await loadLedger();
       } else {
         const e = (r.body && r.body.error) || {};
         st.textContent = "HTTP " + r.status + " " + (e.message || "");
