@@ -626,6 +626,25 @@
       kvInto(box, d.preauth_max, null);
     }
 
+    // 代理是唯一不按"端点 × 平台"计费的出口，单独一段说明。
+    // 不显示它的话，管理员核对用量时只会看到 used 涨了却对不上任何系数。
+    if (d.proxy) {
+      box.appendChild(el("h3", null, "媒体代理（按体积计费，不乘平台系数）"));
+      const pdl = el("dl", "kv");
+      const P = d.proxy;
+      const prow = (k, v) => {
+        if (v === undefined || v === null || v === "") return;
+        pdl.appendChild(el("dt", null, k));
+        pdl.appendChild(el("dd", null, String(v)));
+      };
+      prow("费率", P.rate);
+      prow("计费单位（字节）", P.unit_bytes);
+      prow("乘平台系数", P.platform_factor === false ? "否" : String(P.platform_factor));
+      prow("计算式", P.formula);
+      prow("说明", P.note);
+      box.appendChild(pdl);
+    }
+
     if (d.platforms) {
       box.appendChild(el("h3", null, "各平台系数（消耗 = 系数 × 条数 × 账号倍率）"));
       const t = el("table");

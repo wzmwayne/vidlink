@@ -221,6 +221,7 @@
         </label>
       </div>
     </div>
+    <div class="hint" id="muxCost"></div>
     <div class="hint" id="muxTrackState">
       在上面的「<b>全部详情</b>」里取一次完整信息，档位会自动填到这里（<code>/v1/detail</code>，
       消耗对应配额）；直接点下面的「下载并混流」也会自动取一次。勾上代理表示两轨都经服务端拉取
@@ -282,6 +283,9 @@
   };
   let proxyEnabled = false;
   let webuiMode = "account";     // 由 /v1/health 告知
+  // 账号倍率：代理按体积计费时要乘它（1 配额/MiB × 倍率）。
+  // 免校验模式下保持 null —— 那时没有账户，任何"预计消耗"都是假的。
+  let myMultiplier = null;
   const KEY_STORE = "vidlink_key";
   let APIKEY = "";               // 账户模式下的 Key；免校验模式恒为空
 
@@ -441,9 +445,36 @@
 
   // 代理下载按钮：经服务端代理取流（补 Referer/UA），并带上统一命名的文件名。
   // 未开启代理时该路由不存在，所以只在 proxyEnabled 时出现。
-  function proxyBtn(url, kind, quality, ext) {
+  // ---- 代理计费预估 ----
+  //
+  // 服务端按体积扣配额：实扣 = 体积(MiB) × 1 × 账号倍率（不乘平台系数）。
+  // 前端只做**预估展示**，真正的数值以响应头 X-Quota-Consumed 为准，
+  // 所以这里算不出来（免校验模式、上游没给体积）就不显示，绝不编一个数。
+  const MIB = 1024 * 1024;
+
+  function proxyCost(size) {
+    if (myMultiplier === null || !size) return null;
+    return Math.round((size / MIB) * myMultiplier * 10000) / 10000;
+  }
+
+  function fmtUnits(v) {
+    if (v === null || v === undefined) return "";
+    return String(Math.round(v * 10000) / 10000);
+  }
+
+  function proxyHint(size) {
+    const c = proxyCost(size);
+    if (c === null) return "经服务端代理下载（自动补 Referer/UA）";
+    return "经服务端代理下载（自动补 Referer/UA）；按体积计费：" +
+      fmtUnits(size / MIB) + " MiB × 1 配额/MiB × 账号倍率 " + myMultiplier +
+      " ≈ " + fmtUnits(c) + " 配额";
+  }
+
+  function proxyBtn(url, kind, quality, ext, size) {
+    const wrap = el("span");
+    wrap.style.cssText = "display:inline-flex;align-items:center;gap:6px";
     const b = el("button", null, "代理下载");
-    b.title = "经服务端代理下载（自动补 Referer/UA）";
+    b.title = proxyHint(size);
     b.addEventListener("click", async () => {
       const old = b.textContent;
       b.disabled = true;
@@ -465,7 +496,10 @@
         b.textContent = old;
       }
     });
-    return b;
+    wrap.appendChild(b);
+    const c = proxyCost(size);
+    if (c !== null) wrap.appendChild(el("span", "pill", "≈" + fmtUnits(c) + " 配额"));
+    return wrap;
   }
 
   function prettySize(n) {
@@ -545,7 +579,7 @@
         const q = opts.kind === "audio"
           ? (s.quality || (s.bandwidth ? Math.round(s.bandwidth / 1000) + "K" : ""))
           : (s.quality || (s.height ? s.height + "P" : ""));
-        box.appendChild(proxyBtn(s.url, kind, q, ext));
+        box.appendChild(proxyBtn(s.url, kind, q, ext, s.size));
       }
       td.appendChild(box);
       r.appendChild(td);
@@ -690,7 +724,7 @@
         bm.appendChild(copyBtn(d.music.url, "复制地址"));
         bm.appendChild(openBtn(d.music.url, "打开"));
         const mq = d.music.bandwidth ? Math.round(d.music.bandwidth / 1000) + "K" : "";
-        if (proxyEnabled) bm.appendChild(proxyBtn(d.music.url, DL.AUDIO, mq, "m4a"));
+        if (proxyEnabled) bm.appendChild(proxyBtn(d.music.url, DL.AUDIO, mq, "m4a", d.music.size));
         box.appendChild(bm);
       }
     }
@@ -849,6 +883,7 @@
       add("累计消耗", d.used);
       add("累计调用", d.calls + " 次");
       add("账号倍率", d.multiplier);
+      if (typeof d.multiplier === "number") myMultiplier = d.multiplier;
       add("单位", d.unit);
       box.appendChild(dl);
       if (d.limits) {
@@ -913,7 +948,8 @@
       if (webuiMode === "ease") {
         $("#easeNote").classList.remove("hidden");
       } else {
-        $("#muxCostNote").textContent = "注意：本模式下取完整信息（/v1/detail）与代理下载都会消耗账号配额。";
+        $("#muxCostNote").textContent = "注意：本模式下取完整信息按端点系数扣配额；" +
+          "代理下载按**体积**扣（1 配额/MiB × 你的账号倍率），直连下载不消耗配额。";
         $("#authsec").classList.remove("hidden");
         $("#usagesec").classList.remove("hidden");
         const stored = loadStoredKey();
@@ -1006,6 +1042,8 @@
   // 供下面的"浏览器内混流"脚本复用（同一个页面，没必要写两遍）
   window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target, withKey,
                 dlName, qualityLabel, DL, ensureTitle,
+                proxyCost, fmtUnits, refreshUsage: loadUsage,
+                multiplier: () => myMultiplier,
                 proxyOn: () => proxyEnabled };
   boot();
 })();
@@ -1038,7 +1076,8 @@
  */
 (() => {
   "use strict";
-  const { api, el, prettySize, target, proxyOn, withKey, dlName, qualityLabel, DL, ensureTitle } = window.VL;
+  const { api, el, prettySize, target, proxyOn, withKey, dlName, qualityLabel, DL, ensureTitle,
+          proxyCost, fmtUnits, refreshUsage, multiplier } = window.VL;
   let muxKey = "";        // 当前已取到的清晰度列表对应哪个目标（换了链接就重取）
   const $ = (s) => document.querySelector(s);
   const DIR = "vidlink-mux";
@@ -1207,6 +1246,9 @@
 
   async function download(store, url, onTick) {
     const res = await fetch(url, { mode: "cors", credentials: "omit" });
+    // 代理按体积扣配额，实扣值由服务端回在响应头里；直连时没有这个头。
+    const spent = Number(res.headers.get("X-Quota-Consumed") || 0);
+    if (Number.isFinite(spent) && spent > 0) proxySpent += spent;
     if (!res.ok) {
       const err = new Error("下载失败：HTTP " + res.status + "（该 CDN 节点可能要求 Referer）");
       err.status = res.status;   // 上层据此决定是"换节点"还是"直接上代理"
@@ -1424,6 +1466,36 @@
   // 而 links 只返回"最优的一条视频 + 一条音频"。这里一次取全，随后两轨都从
   // 这份结果里选，下载时不再产生额外的解析计费（直链有效期约 2 小时）。
   let tracks = null;   // 最近一次 /v1/detail 的响应
+  let proxySpent = 0;  // 本次混流经代理实际扣掉的配额（读自响应头，不是估算）
+
+  // updateMuxNote 说明"这次下载要花多少"。
+  //
+  // 只有账户模式且上游给了体积时才给数字；其余情况说清规则而不是编一个值——
+  // 前端算不出来的东西不该装成算得出来（真正的数值在响应头里）。
+  function updateMuxNote() {
+    const box = $("#muxCost");
+    // 看的是**复选框**（这次下载走哪条通道），不是"服务端有没有开代理"：
+    // 服务端开着代理但用户没勾，这次就是直连，提示必须说直连。
+    if (!$("#muxProxy").checked || !proxyOn()) {
+      box.textContent = "当前走直连：不消耗配额（若 CDN 要求 Referer 会失败，那时再勾上代理）。";
+      return;
+    }
+    const m = multiplier();
+    if (m === null) {
+      box.textContent = "代理下载（免校验模式：不计量配额）。";
+      return;
+    }
+    const v = ((tracks || {}).videos || [])[Number($("#muxVq").value) || 0];
+    const a = ((tracks || {}).audios || [])[Number($("#muxAq").value) || 0];
+    if (v && a && v.size && a.size) {
+      const mib = (v.size + a.size) / (1024 * 1024);
+      box.textContent = "代理按体积计费：1 配额/MiB × 账号倍率 " + m + "；本次两轨约 " +
+        fmtUnits(mib) + " MiB ≈ " + fmtUnits(proxyCost(v.size + a.size)) + " 配额（实际以响应头为准）。";
+    } else {
+      box.textContent = "代理按体积计费：1 配额/MiB × 账号倍率 " + m +
+        "；上游没给体积，实际消耗以响应头 X-Quota-Consumed 为准。";
+    }
+  }
 
   function trackText(st, kind) {
     const bits = [];
@@ -1471,6 +1543,7 @@
   function applyTracks(d, key) {
     if (!d || !key) return;
     syncProxyBox();   // 这时健康检查早回来了，代理是否可用是确定的
+    updateMuxNote();
     tracks = d;
     muxKey = key;
     fillSelect($("#muxVq"), d.videos, "video");
@@ -1537,6 +1610,7 @@
     if (t.err) { alert(t.err); return; }
 
     busy = true;
+    proxySpent = 0;
     $("#muxStart").disabled = true;
     $("#muxOut").classList.add("hidden");
     $("#muxProgWrap").classList.remove("hidden");
@@ -1625,7 +1699,9 @@
       phase("⑥ 完成");
       bar(1);
       detail("视频 " + prettySize(vsize) + " + 音频 " + prettySize(asize) +
-             " → 合并 " + prettySize(file.size) + "（" + Math.round(totalMs / 1000) + " 秒）");
+             " → 合并 " + prettySize(file.size) + "（" + Math.round(totalMs / 1000) + " 秒）" +
+             (proxySpent > 0 ? " · 代理消耗 " + fmtUnits(proxySpent) + " 配额" : " · 直连，未消耗配额"));
+      if (proxySpent > 0) refreshUsage();   // 用量面板跟着更新，别让人以为没扣
       const url = URL.createObjectURL(file);
       lastURL = url;
       // 与代理下载用同一套命名：标题 + VL + 前端混合 + 清晰度 + .mp4
@@ -1681,6 +1757,8 @@
   });
 
   $("#muxStart").addEventListener("click", start);
+  $("#muxVq").addEventListener("change", updateMuxNote);
+  $("#muxAq").addEventListener("change", updateMuxNote);
 
   // 代理开关：默认跟随服务端是否开了代理，用户改过就记住（存本机浏览器）。
   //
@@ -1695,6 +1773,7 @@
     const box = $("#muxProxy");
     box.disabled = !proxyOn();
     if (!proxyTouched) box.checked = proxyOn();
+    updateMuxNote();
   }
 
   (function initProxyBox() {
@@ -1705,6 +1784,7 @@
     box.addEventListener("change", () => {
       proxyTouched = true;
       try { localStorage.setItem(PROXY_STORE, box.checked ? "1" : "0"); } catch (_) {}
+      updateMuxNote();
     });
   })();
   $("#muxClean").addEventListener("click", async () => {
@@ -1717,6 +1797,7 @@
     bar(0); detail("");
   });
   refreshQuota();
+  updateMuxNote();
 })();
 </script>
 </body>

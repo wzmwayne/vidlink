@@ -1234,6 +1234,7 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`id="muxVq"`,         // 混流区直接选视频清晰度
 		`id="muxAq"`,         // 与音频清晰度
 		`id="muxTrackState"`, // 档位状态（没有"取清晰度列表"按钮）
+		`id="muxCost"`,       // 代理按体积计费的预估/实际消耗
 		`id="muxProxy"`,      // 是否经服务端代理下载（由使用者决定，不自动兜底）
 		`applyDetail`,        // 「全部详情」的结果直接喂给混流区
 		`/v1/detail`,
@@ -1742,6 +1743,8 @@ func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
 		`el("option", null,`, `o.value = String(i)`,
 		// 代理通道：必须把 Key 拼进 URL，否则账户模式下 /v1/proxy 直接 403
 		`withKey("/v1/proxy?url="`,
+		// 代理按体积计费：预估展示 + 读响应头拿实际值（前端不编数字）
+		`id="muxCost"`, `proxyCost`, `X-Quota-Consumed`, `1 配额/MiB`,
 		// 直连失败时的提示要指向那个复选框，而不是自动改走代理
 		`使用服务端代理下载`,
 	} {
@@ -2058,3 +2061,16 @@ func TestProxyEaseModeChargesNothing(t *testing.T) {
 }
 
 func floatPtr(f float64) *float64 { return &f }
+
+// TestAdminPanelShowsProxyPricing：管理面板要显示代理的计费口径。
+//
+// 代理是唯一不乘平台系数的出口；面板不显示它，管理员核对用量时
+// 只会看到 used 在涨、却对不上任何一条系数。
+func TestAdminPanelShowsProxyPricing(t *testing.T) {
+	body := string(adminHTML)
+	for _, want := range []string{"d.proxy", "媒体代理", "platform_factor", "unit_bytes"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("管理面板缺少 %q", want)
+		}
+	}
+}
