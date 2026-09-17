@@ -273,10 +273,24 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 		"cache_ttl", cfg.Service.CacheTTL.String(),
 		"proxy_endpoint", cfg.ProxySrv.Enabled,
 	)
-	if cfg.ProxySrv.Enabled && len(cfg.ProxySrv.AllowHosts) == 0 {
-		logger.Warn("媒体代理已开启且未配置 VIDLINK_PROXY_ALLOW_HOSTS：" +
-			"/v1/proxy 会转发到任意 http/https 地址（等同于一个开放代理），" +
-			"请勿将该端口暴露到公网；需要收紧就填域名后缀白名单")
+	if cfg.ProxySrv.Enabled {
+		switch {
+		case len(cfg.ProxySrv.AllowHosts) == 0:
+			logger.Warn("媒体代理已开启且未配置 VIDLINK_PROXY_ALLOW_HOSTS：" +
+				"/v1/proxy 会转发到任意 http/https 地址（等同于一个开放代理），" +
+				"请勿将该端口暴露到公网；需要收紧就填域名后缀白名单")
+		default:
+			// 把**生效的**白名单打出来：规范化会改写条目（剥掉 scheme/路径/
+			// 通配符），不打印的话"填了却没生效"只能靠猜。
+			logger.Info("媒体代理白名单已生效",
+				"allow_hosts", strings.Join(cfg.ProxySrv.AllowHosts, ","))
+		}
+		// 被丢弃的条目必须露出来，否则白名单会处于"部分生效"的静默状态。
+		if len(cfg.ProxySrv.RejectedHosts) > 0 {
+			logger.Warn("VIDLINK_PROXY_ALLOW_HOSTS 里有条目没通过校验，已被忽略（"+
+				"只接受形如 bilivideo.com 的域名后缀，单标签、含 * 或非法字符的条目一律丢弃）",
+				"rejected", strings.Join(cfg.ProxySrv.RejectedHosts, ","))
+		}
 	}
 	switch {
 	case cfg.IsEase():

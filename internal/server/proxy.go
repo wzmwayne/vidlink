@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"vidlink/internal/core"
 	"vidlink/internal/urlx"
@@ -39,10 +40,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, core.BadInput("", "缺少 url 参数"))
 		return
 	}
+	// 长度上限：URL 本身没有理由超过 4KB（超过的多半是构造出来的），
+	// 提前拒掉可以省下解析与日志上的开销。
+	if len(raw) > 4096 {
+		writeError(w, core.BadInput("", "url 过长（上限 4096 字节）"))
+		return
+	}
 
 	target, err := url.Parse(raw)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") {
 		writeError(w, core.BadInput("", "url 必须是 http/https 绝对地址"))
+		return
+	}
+	// 带 userinfo 的 URL（http://user:pass@host/）会把这串凭据转发给上游，
+	// 也会让日志里出现不该出现的东西。合法媒体直链不需要它。
+	if target.User != nil {
+		writeError(w, core.BadInput("", "url 不允许携带用户名/密码"))
 		return
 	}
 
@@ -72,15 +85,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("If-Range", im)
 	}
 
-	// Referer/UA：可由调用方覆盖，否则用默认值
-	referer := r.URL.Query().Get("referer")
-	if referer == "" {
+	// Referer/UA：可由调用方覆盖，否则用默认值。
+	//
+	// 这两个值都来自查询参数并会被写进**请求头**，所以按"外来字符串"处理：
+	// 只接受 http/https 绝对地址（Referer），去掉控制字符并限长。
+	// Go 的 transport 本身会拒掉含 CR/LF 的头值（防响应/请求头注入），
+	// 这里再收一道是纵深防御，也顺手把超长值挡在日志之外。
+	referer := strings.TrimSpace(r.URL.Query().Get("referer"))
+	if referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			writeError(w, core.BadInput("", "referer 必须是 http/https 绝对地址"))
+			return
+		}
+		referer = sanitizeHeaderValue(referer, 1024)
+	} else {
 		referer = defaultReferer(target.Hostname())
 	}
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
-	ua := r.URL.Query().Get("ua")
+	ua := sanitizeHeaderValue(r.URL.Query().Get("ua"), 256)
 	if ua == "" {
 		ua = s.cfg.Net.DefaultUserAgent()
 	}
@@ -165,6 +190,28 @@ func (s *Server) proxyHostAllowed(host string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeHeaderValue 把一个外来字符串收拾成"可以安全放进请求头"的值。
+//
+// 去控制字符（含 CR/LF/NUL）、去掉首尾空白、按 rune 截断到 max 字节以内。
+// 返回空串表示这个值不可用，调用方据此回退到默认值。
+func sanitizeHeaderValue(v string, max int) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range v {
+		if unicode.IsControl(r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // defaultReferer 依据目标域名给出合适的 Referer。

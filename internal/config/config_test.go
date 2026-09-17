@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -337,5 +338,78 @@ func TestAdminKeyComesFromEnvOrDotVL(t *testing.T) {
 	}
 	if cfg.AdminKey != "" {
 		t.Errorf("AdminKey = %q，想要空串", cfg.AdminKey)
+	}
+}
+
+// TestNormalizeHostSuffixes：白名单条目要能容忍人手写的各种形态，
+// 但**绝不能**让"匹配一切"的条目生效。
+//
+// 用户实际写进来的就是这样一串：重复项、混着一条完整直链（带 scheme
+// 与结尾斜杠）。这些必须被规范化成同一个裸域名后缀，否则后缀匹配要么
+// 失效（填了等于没填），要么被绕过。
+func TestNormalizeHostSuffixes(t *testing.T) {
+	ok, bad := normalizeHostSuffixes([]string{
+		"upos-sz-mirrorcos.bilivideo.com",
+		"upos-sz-mirrorcos.bilivideo.com", // 重复
+		"https://upos-sz-mirror08c.bilivideo.com/",
+		"*.bilivideo.com",
+		"UPOS-SZ-MIRRORCOS.BILIVIDEO.COM.",
+		"https://user:pass@cdn.example.com:8443/path?q=1#frag",
+		"  example.com  ",
+	})
+	want := []string{
+		"upos-sz-mirrorcos.bilivideo.com",
+		"upos-sz-mirror08c.bilivideo.com",
+		"bilivideo.com",
+		"cdn.example.com",
+		"example.com",
+	}
+	if len(ok) != len(want) {
+		t.Fatalf("规范化结果 = %v，想要 %v", ok, want)
+	}
+	for i := range want {
+		if ok[i] != want[i] {
+			t.Errorf("第 %d 项 = %q，想要 %q", i, ok[i], want[i])
+		}
+	}
+	if len(bad) != 0 {
+		t.Errorf("这些都应被接受，却进了拒绝清单：%v", bad)
+	}
+
+	// 能匹配一切 / 无意义的条目一律拒绝
+	rejects := []string{
+		"", "   ", "*", "*.", "com", "localhost", ".", "..",
+		"http://", "a..b", "-bad.com", "bad-.com", "bad_host.com",
+		"a b.com", "例子.com", strings.Repeat("a", 64) + ".com",
+	}
+	gotOK, gotBad := normalizeHostSuffixes(rejects)
+	if len(gotOK) != 0 {
+		t.Errorf("这些都不该通过校验：%v", gotOK)
+	}
+	if len(gotBad) != len(rejects)-2 { // 空串与纯空白被直接跳过，不算"被拒条目"
+		t.Errorf("被拒条目数 = %d（%v），想要 %d", len(gotBad), gotBad, len(rejects)-2)
+	}
+}
+
+// TestProxyWhitelistIsNormalizedInLoad：配置层端到端——写 URL 形态也能生效，
+// 非法条目被丢弃但留在 RejectedHosts 里（启动日志据此告警）。
+func TestProxyWhitelistIsNormalizedInLoad(t *testing.T) {
+	t.Setenv("VIDLINK_PROXY_ALLOW_HOSTS",
+		"upos-sz-mirrorcos.bilivideo.com, https://upos-sz-mirror08c.bilivideo.com/, *, com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	want := []string{"upos-sz-mirrorcos.bilivideo.com", "upos-sz-mirror08c.bilivideo.com"}
+	if len(cfg.ProxySrv.AllowHosts) != len(want) {
+		t.Fatalf("AllowHosts = %v，想要 %v", cfg.ProxySrv.AllowHosts, want)
+	}
+	for i := range want {
+		if cfg.ProxySrv.AllowHosts[i] != want[i] {
+			t.Errorf("AllowHosts[%d] = %q，想要 %q", i, cfg.ProxySrv.AllowHosts[i], want[i])
+		}
+	}
+	if len(cfg.ProxySrv.RejectedHosts) != 2 {
+		t.Errorf("RejectedHosts = %v，想要 [* com]", cfg.ProxySrv.RejectedHosts)
 	}
 }

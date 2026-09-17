@@ -1226,6 +1226,11 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`id="muxStart"`,
 		`id="muxVideo"`,
 		`id="muxSave"`,
+		`id="muxVq"`,    // 混流区直接选视频清晰度
+		`id="muxAq"`,    // 与音频清晰度
+		`id="muxLoad"`,  // 取清晰度列表（一次 /v1/detail）
+		`id="muxProxy"`, // 是否经服务端代理下载（由使用者决定，不自动兜底）
+		`/v1/detail`,
 		`navigator.storage.getDirectory`,
 		`canPlayType`, // 无 H.264 解码器的浏览器要给出解释，而不是静默失败
 		`代理下载`,        // 视频轨与音频轨都要有代理入口（音频同样受防盗链限制）
@@ -1491,7 +1496,7 @@ func TestUIScriptsShareAllHelpers(t *testing.T) {
 	// 主脚本里定义、混流脚本可能想复用的符号
 	helpers := []string{
 		"api", "el", "copyBtn", "openBtn", "prettySize", "prettyNum", "target",
-		"dlName", "qualityLabel", "DL", "ensureTitle",
+		"withKey", "dlName", "qualityLabel", "DL", "ensureTitle",
 	}
 	for _, h := range helpers {
 		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(h) + `\b`).MatchString(mux) {
@@ -1707,5 +1712,115 @@ func TestAdminPanelStaysSelfContained(t *testing.T) {
 	}
 	if len(seen) < 4 {
 		t.Fatalf("只扫到 %d 个接口路径，正则可能失效：%v", len(seen), seen)
+	}
+}
+
+// TestMuxSectionChoosesTracksAndChannel：混流区必须自己带清晰度选择与
+// "是否走代理"的开关，而不是复用上面"解析一条"的清晰度、也不是自动兜底。
+//
+// 这条是静态检查（页面 JS 不在测试里跑），锁的是几个容易在重构中丢掉的
+// 事实：两个下拉真的存在、代理 URL 拼上了 Key、代理由复选框决定。
+func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
+	body := string(uiHTML)
+	for _, want := range []string{
+		`id="muxVq"`, `id="muxAq"`, `id="muxProxy"`, `id="muxLoad"`,
+		// 档位来自 /v1/detail（links 只给最优的一条，选不了）
+		`"/v1/detail?" + t.q`,
+		// 选项文本用 textContent，value 只放下标，不把 URL 塞进 DOM
+		`el("option", null,`, `o.value = String(i)`,
+		// 代理通道：必须把 Key 拼进 URL，否则账户模式下 /v1/proxy 直接 403
+		`withKey("/v1/proxy?url="`,
+		// 直连失败时的提示要指向那个复选框，而不是自动改走代理
+		`使用服务端代理下载`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("混流区块缺少 %q", want)
+		}
+	}
+	// 真的不再自动兜底：downloadTrack 里不该再出现"直连失败就自己上代理"的调用
+	if strings.Contains(body, "return await once(proxyURL()") {
+		t.Error("下载通道仍会自动兜底到代理，应由复选框决定")
+	}
+}
+
+// TestProxyRejectsUnsafeTargets：代理是风险最高的接口，参数校验要有明确边界。
+//
+// 四件事：目标地址不许带凭据、长度有上限、Referer 必须是 http/https 绝对地址、
+// UA 里的控制字符会被清掉（防请求头注入，虽然后端 transport 也会拦）。
+func TestProxyRejectsUnsafeTargets(t *testing.T) {
+	var gotReferer, gotUA string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotReferer, gotUA = r.Header.Get("Referer"), r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	h := env.handler()
+
+	// ① 带 userinfo 的 URL：会把凭据一起发给上游，直接拒
+	w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape("http://user:pass@example.com/x"),
+		userHdr(env.userKey))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("带用户名密码的 url 应 400，得到 %d", w.Code)
+	}
+
+	// ② 超长 URL：没有理由超过 4KB
+	long := "https://example.com/" + strings.Repeat("a", 5000)
+	if w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(long), userHdr(env.userKey)); w.Code != http.StatusBadRequest {
+		t.Errorf("超长 url 应 400，得到 %d", w.Code)
+	}
+
+	// ③ Referer 必须是 http/https 绝对地址（它会被写进请求头）
+	for _, bad := range []string{"not-a-url", "javascript:alert(1)", "//evil.com/", "file:///etc/passwd"} {
+		w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL)+
+			"&referer="+url.QueryEscape(bad), userHdr(env.userKey))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("referer=%q 应 400，得到 %d", bad, w.Code)
+		}
+	}
+
+	// ④ 合法 Referer 透传；UA 里的控制字符被清掉
+	w = do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL)+
+		"&referer="+url.QueryEscape("https://www.bilibili.com/")+
+		"&ua="+url.QueryEscape("Evil\r\nX-Injected: 1"), userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("正常请求应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if gotReferer != "https://www.bilibili.com/" {
+		t.Errorf("上游收到 Referer = %q", gotReferer)
+	}
+	if strings.ContainsAny(gotUA, "\r\n") {
+		t.Errorf("UA 里的控制字符没被清掉：%q", gotUA)
+	}
+	if gotUA != "EvilX-Injected: 1" {
+		t.Errorf("UA = %q，想要去掉控制字符后的值", gotUA)
+	}
+
+	// ⑤ 白名单按主机后缀收紧（127.0.0.1 不在 example.com 之下 → 403）
+	limited := newTestEnv(t, func(c *config.Config) {
+		c.ProxySrv.Enabled = true
+		c.ProxySrv.AllowHosts = []string{"bilivideo.com"}
+	}, defaultStub())
+	if w := do(limited.handler(), http.MethodGet,
+		"/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(limited.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("白名单外的目标应 403，得到 %d", w.Code)
+	}
+}
+
+// TestProxyAcceptsBareHostSuffix：白名单里写 URL 形态也能命中（规范化在配置层完成）。
+func TestProxyAcceptsBareHostSuffix(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) {
+		c.ProxySrv.Enabled = true
+		c.ProxySrv.AllowHosts = []string{"127.0.0.1"} // 规范化后的形态
+	}, defaultStub())
+	if w := do(env.handler(), http.MethodGet,
+		"/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("白名单命中应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
 }

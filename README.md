@@ -364,6 +364,15 @@ VL_WEBUI=true VIDLINK_ADMIN_KEY=... ./vidlink
 面板只在账户模式下存在：`VL_EASE=true` 时 `/admin` 是 404，
 因为那时没有账号体系可管理。
 
+解析页里的「浏览器内混流」自带两个档位下拉与一个通道开关：
+
+- **视频清晰度 / 音频清晰度**：点「取清晰度列表」拉一次 `/v1/detail`，
+  两轨的全部档位进下拉（选项文本里带编码、分辨率/码率、体积），选哪档就合哪档；
+  混流用的就是这份结果，下载时不再额外计费；
+- **使用服务端代理下载**：勾上则两轨都经 `/v1/proxy`（CDN 强制 Referer 时必须），
+  不勾则直连、失败时按 `backup_urls` 换镜像再试。**不再自动兜底**——
+  代理消耗服务端出口带宽与账号配额，用不用由使用者决定；开关状态记在本机浏览器里。
+
 ## 配置
 
 配置有**两个来源，环境变量优先**：进程环境变量，以及可执行文件同目录
@@ -440,7 +449,7 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VIDLINK_UPSTREAM_BURST` | `16` | 每主机令牌桶突发容量 |
 | `VIDLINK_MAX_IDLE_PER_HOST` | `32` | 每主机空闲连接数 |
 | `VIDLINK_PROXY_ENDPOINT` | `false`（ease 模式下 `true`） | 是否开启媒体代理；显式 `false` 可关掉 |
-| `VIDLINK_PROXY_ALLOW_HOSTS` | 空 | 媒体代理域名白名单；**留空 = 不限制**（等同于开放代理，勿暴露公网） |
+| `VIDLINK_PROXY_ALLOW_HOSTS` | 空 | 媒体代理域名后缀白名单；**留空 = 不限制**（等同于开放代理，勿暴露公网）。条目会被规范化（可写 `*.x.com` 或完整直链），`*`/单标签等条目被丢弃并在启动日志里列出 |
 | `VIDLINK_TRUSTED_PROXY_HEADER` | 空 | 如 `X-Forwarded-For`，用于取真实客户端 IP |
 | `VIDLINK_PPROF` | `false` | 开启 pprof（仅 `127.0.0.1:6060`） |
 
@@ -448,6 +457,21 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 > （浏览器内混流遇到要求 Referer 的 CDN 节点时要靠它）。
 > `VIDLINK_PROXY_ALLOW_HOSTS` 留空表示放行任意目标，此时**绝不能暴露到公网**——
 > 不想开就把 `VIDLINK_PROXY_ENDPOINT=false` 显式写上。
+
+白名单的写法很宽容，但**不会**接受能匹配一切的条目：
+
+```bash
+# 下面三种写法等价，都会被规范化成 upos-sz-mirror08c.bilivideo.com
+VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirror08c.bilivideo.com
+VIDLINK_PROXY_ALLOW_HOSTS=*.bilivideo.com
+VIDLINK_PROXY_ALLOW_HOSTS=https://upos-sz-mirror08c.bilivideo.com/
+```
+
+- 匹配按 DNS 标签后缀：`bilivideo.com` 命中 `upos-sz-mirror08c.bilivideo.com`，
+  不命中 `notbilivideo.com`、也不命中 `bilivideo.com.evil.cn`；
+- `*`、`com`、`localhost`、含非法字符或超长的条目会被**丢弃**并打印 WARN
+  （静默地"只生效一半"比直接报错更难查）；
+- 生效的白名单会以 `allow_hosts=...` 打在启动日志里。
 
 ## 部署
 

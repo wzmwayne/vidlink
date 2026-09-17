@@ -127,13 +127,120 @@ type ProxyOptions struct {
 	Enabled bool
 	// MaxBytes 单次代理的最大字节数（0 表示不限）。
 	MaxBytes int64
-	// AllowHosts 允许代理的目标域名后缀白名单。
+	// AllowHosts 允许代理的目标域名后缀白名单（**已规范化**，见
+	// normalizeHostSuffixes：只保留裸域名，小写、无通配符、无端口、无路径）。
 	//
 	// **为空表示不限制**（允许任意 http/https 目标）。这是刻意的默认：
 	// 打开代理这件事本身就是"我要用它取流"，再强制填一份域名清单
 	// 只会让人随手写个通配符，既不安全也不省事。
-	// 想收紧就填具体后缀，例如 *.bilivideo.com。
+	// 想收紧就填具体后缀，例如 bilivideo.com（写成 *.bilivideo.com 或
+	// https://upos-sz-mirror08c.bilivideo.com/ 也会被规范化成同一个后缀）。
+	//
+	// 匹配规则是**按 DNS 标签的后缀**（urlx.HostHasSuffix）：
+	// bilivideo.com 命中 upos-sz-mirror08c.bilivideo.com，
+	// 但不会命中 notbilivideo.com，也不会命中 bilivideo.com.evil.cn。
 	AllowHosts []string
+
+	// RejectedHosts 是白名单里**没通过校验**因而被丢弃的条目（原样保存）。
+	//
+	// 它们不会让服务起不来（与 .vl 的容错取向一致），但必须在启动日志里
+	// 露出来：白名单被静默地"部分生效"是运维最容易被骗过去的一种状态——
+	// 表现为"我明明填了，怎么还是 403"或者更糟"以为收紧了其实没生效"。
+	RejectedHosts []string
+}
+
+// normalizeHostSuffixes 把白名单条目规范化成"裸域名后缀"，并挑出非法项。
+//
+// 为什么要规范化：白名单是人手写的，实际见到的形态五花八门——
+// 直接抄一条直链（https://upos-sz-mirror08c.bilivideo.com/）、带通配符
+// （*.bilivideo.com）、带端口、大写、结尾多一个点、同一项写两遍。
+// 这些都不该让服务起不来，但**也绝不能原样拿去做后缀匹配**，
+// 那样结果是"填了等于没填"，而且很难看出来。
+//
+// 拒绝的条件（宁可丢弃这一条并告警，也不接受能"匹配一切"的条目）：
+//
+//   - 空、纯点号、含 `*`（开头的 `*.` 除外）、含 `://` 残留；
+//   - 单标签（`com`、`localhost`）——那等于放行整个顶级域或本机名；
+//   - 非法字符（只允许 a-z0-9- 与 `.`，且每段不能以 `-` 开头/结尾）；
+//   - 超过 DNS 上限（单段 63、总长 253）。
+//
+// 返回 (可用后缀, 被拒条目)，两者都保持输入顺序并去重。
+func normalizeHostSuffixes(in []string) (ok, bad []string) {
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		host := strings.ToLower(entry)
+
+		// 抄直链是常见写法：去掉 scheme、userinfo、路径、查询、片段。
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		host = strings.TrimPrefix(host, "//")
+		if i := strings.IndexAny(host, "/?#"); i >= 0 {
+			host = host[:i]
+		}
+		if i := strings.LastIndex(host, "@"); i >= 0 { // user:pass@host
+			host = host[i+1:]
+		}
+		// 端口：只在"冒号后全是数字"时剥掉（IPv6 字面量会在下面的字符校验里被拒）
+		if i := strings.LastIndex(host, ":"); i >= 0 && allDigits(host[i+1:]) {
+			host = host[:i]
+		}
+		host = strings.TrimPrefix(host, "*.") // 通配符只是写法，后缀匹配天然含子域
+		host = strings.Trim(host, ".")
+
+		if !validHostSuffix(host) {
+			bad = append(bad, entry)
+			continue
+		}
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		ok = append(ok, host)
+	}
+	return ok, bad
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validHostSuffix 校验一个已经规范化的域名后缀。
+func validHostSuffix(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 { // 单标签（com / localhost）会放行一整片，直接拒
+		return false
+	}
+	for _, l := range labels {
+		if l == "" || len(l) > 63 {
+			return false
+		}
+		if l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for _, r := range l {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // Load 从环境变量读取配置并填充默认值。
@@ -154,6 +261,10 @@ func Load() (*Config, error) {
 	// ease 是"本机/内网自用"，浏览器内混流遇到需要 Referer 的 CDN 节点时
 	// 必须能走代理，默认关着会让那个功能时灵时不灵。
 	ease := envBool("VL_EASE", false)
+
+	// 代理白名单先规范化：允许人手写直链或通配符，但**不允许**能匹配一切的
+	// 条目悄悄生效（那就是"以为收紧了，其实没有"）。
+	allowHosts, badHosts := normalizeHostSuffixes(splitList(env("VIDLINK_PROXY_ALLOW_HOSTS", "")))
 
 	c := &Config{
 		ConfigFile: path,
@@ -197,9 +308,10 @@ func Load() (*Config, error) {
 			// 默认值 = 是否处于免校验模式；显式设置 VIDLINK_PROXY_ENDPOINT
 			// （true/false）时以显式值为准。"显式 false 要能关掉"是这条的硬要求，
 			// 所以用 envBool 的默认值参数，而不是"设了 true 才开"。
-			Enabled:    envBool("VIDLINK_PROXY_ENDPOINT", ease),
-			MaxBytes:   int64(envInt("VIDLINK_PROXY_MAX_MB", 0)) << 20,
-			AllowHosts: splitList(env("VIDLINK_PROXY_ALLOW_HOSTS", "")),
+			Enabled:       envBool("VIDLINK_PROXY_ENDPOINT", ease),
+			MaxBytes:      int64(envInt("VIDLINK_PROXY_MAX_MB", 0)) << 20,
+			AllowHosts:    allowHosts,
+			RejectedHosts: badHosts,
 		},
 	}
 

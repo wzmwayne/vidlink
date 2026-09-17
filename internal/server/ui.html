@@ -88,6 +88,9 @@
   a.btn:hover { border-color: var(--accent); }
   a.btn.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; font-weight: 600; }
   a.btn.primary:hover { background: #2563eb; }
+  label.chk { display: flex; align-items: center; gap: 7px; font-size: 13px;
+              color: var(--fg); margin: 0; cursor: pointer; }
+  label.chk input { width: auto; margin: 0; }
   .pill { font: 11px/1 var(--mono); padding: 2px 6px; border-radius: 999px;
           border: 1px solid var(--line); color: var(--dim); }
   .pill.ok { color: var(--ok); border-color: #1d3d24; }
@@ -201,6 +204,30 @@
       在页面内合并为单个 MP4 → 保存到本地。适用于返回 <code>audio_url</code> 的平台（如 B 站）。
       合并是<b>片段级重排</b>，不重新编码，所以速度只取决于下载。
       <span id="muxCostNote"></span>
+    </div>
+    <div class="row">
+      <div class="col narrow">
+        <label for="muxVq">视频清晰度</label>
+        <select id="muxVq"><option value="">先取清晰度列表</option></select>
+      </div>
+      <div class="col narrow">
+        <label for="muxAq">音频清晰度</label>
+        <select id="muxAq"><option value="">先取清晰度列表</option></select>
+      </div>
+      <div class="col">
+        <label>下载通道</label>
+        <label class="chk" for="muxProxy">
+          <input type="checkbox" id="muxProxy"> 使用服务端代理下载
+        </label>
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button id="muxLoad" style="width:100%">取清晰度列表</button>
+      </div>
+    </div>
+    <div class="hint" id="muxTrackState">
+      先点「取清晰度列表」（调用一次 <code>/v1/detail</code>，会消耗对应配额），
+      再选视频与音频档位。勾上代理表示两轨都经服务端拉取（CDN 要求 Referer 时必须勾）。
     </div>
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
@@ -884,7 +911,7 @@
       if (webuiMode === "ease") {
         $("#easeNote").classList.remove("hidden");
       } else {
-        $("#muxCostNote").textContent = "注意：本模式下取流地址与代理下载都会消耗账号配额。";
+        $("#muxCostNote").textContent = "注意：本模式下「取清晰度列表」与代理下载都会消耗账号配额。";
         $("#authsec").classList.remove("hidden");
         $("#usagesec").classList.remove("hidden");
         const stored = loadStoredKey();
@@ -975,7 +1002,7 @@
   $("#url").addEventListener("keydown", (e) => { if (e.key === "Enter") run("links"); });
 
   // 供下面的"浏览器内混流"脚本复用（同一个页面，没必要写两遍）
-  window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target,
+  window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target, withKey,
                 dlName, qualityLabel, DL, ensureTitle,
                 proxyOn: () => proxyEnabled };
   boot();
@@ -1009,7 +1036,8 @@
  */
 (() => {
   "use strict";
-  const { api, el, prettySize, target, proxyOn, dlName, qualityLabel, DL, ensureTitle } = window.VL;
+  const { api, el, prettySize, target, proxyOn, withKey, dlName, qualityLabel, DL, ensureTitle } = window.VL;
+  let muxKey = "";        // 当前已取到的清晰度列表对应哪个目标（换了链接就重取）
   const $ = (s) => document.querySelector(s);
   const DIR = "vidlink-mux";
   const MEM_LIMIT = 400 * 1024 * 1024;   // 无 OPFS 时的内存兜底上限
@@ -1122,14 +1150,18 @@
 
   // ---------- 流式下载（分片写盘，只持有单个 chunk） ----------
   //
-  // 三级兜底，因为"能不能直连"取决于 CDN 节点而不是我们：
-  //   ① 直连（多数节点带 Access-Control-Allow-Origin: *，可以直取）；
-  //   ② 直连失败就重新取一次链接 —— 平台每次返回的镜像节点不同，
-  //      换一个常常就能直连（实测：1080P 节点可直连，某 720P 的
-  //      *.edge.mountaintoys.cn P2P 节点要求 Referer，必然 403）；
-  //   ③ 仍失败则走服务端 /v1/proxy —— 它补得上 Referer 与 UA
-  //      （这两个头浏览器禁止脚本设置），需要部署时开启代理与白名单。
-  async function downloadTrack(kind, d, qs, name, phaseText, onTick) {
+  // 通道由界面上的复选框决定，**不再自动兜底**：
+  //
+  //   - 直连：多数节点带 Access-Control-Allow-Origin: *，可以直取，省服务端带宽；
+  //     同一个档位通常有多个镜像，失败就按 backup_urls 换一个再试；
+  //   - 代理：/v1/proxy 补上 Referer/UA。实测 upos-sz-*.bilivideo.com 这类
+  //     节点强制校验 Referer，而浏览器禁止脚本设置 Referer/UA，
+  //     所以那一族**必须**勾选代理（403 时换节点也没用，同族都一样）。
+  //
+  // 为什么把选择权交出去：自动兜底会让"这一次用了多少服务端带宽与配额"
+  // 变得不可预测。代理是服务端出口流量 + 账号配额，该由使用者决定用不用。
+  async function downloadTrack(stream, useProxy, name, phaseText, onTick) {
+    const ref = (stream.headers && stream.headers.Referer) || "";
     const once = async (url, file) => {
       const store = await newFile(file);
       try {
@@ -1140,42 +1172,35 @@
       }
       return store;
     };
-    const proxyURL = () => {
-      const ref = (d.headers && d.headers.Referer) || "";
-      return "/v1/proxy?url=" + encodeURIComponent(d[kind]) +
-             (ref ? "&referer=" + encodeURIComponent(ref) : "");
-    };
 
-    // ① 直连：一部分节点（*.mcdn.bilivideo.cn）带 ACAO:* 且不校验 Referer，可以省掉服务端带宽
-    let firstErr = null;
-    try {
-      return await once(d[kind], name + ".m4s");
-    } catch (e) {
-      firstErr = e;
+    if (useProxy) {
+      if (!proxyOn()) {
+        throw new Error("服务端媒体代理未开启（部署时用 VIDLINK_PROXY_ENDPOINT=true 打开），" +
+          "取消勾选可以试直连。");
+      }
+      phase(phaseText + "（经服务端代理）…");
+      // withKey：账户模式下 /v1/proxy 也要鉴权，而这里走的是原生 fetch，
+      // 加不了自定义头，只能把 Key 拼进查询参数。
+      const url = withKey("/v1/proxy?url=" + encodeURIComponent(stream.url) +
+        (ref ? "&referer=" + encodeURIComponent(ref) : ""));
+      return await once(url, name + ".proxy.m4s");
     }
 
-    // ② 403/401 说明"这个节点就是要 Referer+UA"，而 Referer 必须是平台域名
-    //    （实测：本页 Referer 或任意 Referer 都是 403，浏览器无法伪造），
-    //    换节点多半还是同一族，直接上代理更省事；
-    //    网络错误/CORS 失败才值得换一个节点再试。
-    if (firstErr.status !== 403 && firstErr.status !== 401) {
+    const candidates = [stream.url].concat(stream.backup_urls || []).filter(Boolean);
+    let lastErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+      if (i > 0) phase(phaseText + "（换一个 CDN 节点重试）…");
       try {
-        phase(phaseText + "（换一个 CDN 节点重试）…");
-        const r = await api("/v1/links?" + qs);
-        if (r.status === 200 && r.body[kind]) {
-          d = r.body;
-          return await once(d[kind], name + ".retry.m4s");
-        }
-      } catch (_) { /* 落到代理那一步 */ }
+        return await once(candidates[i], name + (i ? ".retry" : "") + ".m4s");
+      } catch (e) {
+        lastErr = e;
+        // 403/401 说明这一族节点就是要 Referer+UA，换镜像也过不去
+        if (e && (e.status === 401 || e.status === 403)) break;
+      }
     }
-
-    // ③ 服务端代理：它补得上 Referer 与 UA
-    if (!proxyOn()) {
-      throw new Error("该 CDN 节点要求 Referer/UA（浏览器禁止脚本设置这两个头），" +
-        "且服务端媒体代理未开启。请用 VIDLINK_PROXY_ENDPOINT=true 开启后重试。");
-    }
-    phase(phaseText + "（经服务端代理）…");
-    return await once(proxyURL(), name + ".proxy.m4s");
+    throw new Error("直连下载失败（" + ((lastErr && lastErr.message) || lastErr) + "）：" +
+      "该 CDN 节点要求 Referer/UA，而浏览器不允许脚本设置这两个头。" +
+      "请勾选「使用服务端代理下载」后重试。");
   }
 
   async function download(store, url, onTick) {
@@ -1391,6 +1416,84 @@
     return moof;
   }
 
+  // ---------- 清晰度列表（视频 / 音频各一个下拉） ----------
+  //
+  // 为什么用 /v1/detail 而不是 /v1/links：混流要**同时**知道两条轨的全部档位，
+  // 而 links 只返回"最优的一条视频 + 一条音频"。这里一次取全，随后两轨都从
+  // 这份结果里选，下载时不再产生额外的解析计费（直链有效期约 2 小时）。
+  let tracks = null;   // 最近一次 /v1/detail 的响应
+
+  function trackText(st, kind) {
+    const bits = [];
+    if (kind === "video") {
+      bits.push(st.quality || (st.height ? st.height + "P" : "视频"));
+      if (st.width && st.height) bits.push(st.width + "×" + st.height);
+    } else {
+      bits.push(st.quality || (st.bandwidth ? Math.round(st.bandwidth / 1000) + " kbps" : "音频"));
+    }
+    if (st.codec) bits.push(st.codec);
+    if (kind === "video" && st.bandwidth) bits.push(Math.round(st.bandwidth / 1000) + " kbps");
+    if (st.size) bits.push(prettySize(st.size));
+    return bits.join(" · ");
+  }
+
+  function fillSelect(sel, streams, kind) {
+    sel.textContent = "";
+    const list = streams || [];
+    if (!list.length) {
+      const o = el("option", null, "（没有可用的档位）");
+      o.value = "";
+      sel.appendChild(o);
+      return;
+    }
+    list.forEach((st, i) => {
+      // 选项文本一律走 textContent；value 只放**下标**，URL 留在 JS 里，
+      // 避免把服务端返回的地址塞进 DOM 属性。
+      const o = el("option", null, (i === 0 ? "最高 · " : "") + trackText(st, kind));
+      o.value = String(i);
+      sel.appendChild(o);
+    });
+    sel.value = "0";
+  }
+
+  function setTrackState(text, bad) {
+    const n = $("#muxTrackState");
+    n.textContent = text;
+    n.style.color = bad ? "var(--err)" : "var(--dim)";
+  }
+
+  async function loadTracks() {
+    const t = target();
+    if (t.err) { setTrackState(t.err, true); return null; }
+    const btn = $("#muxLoad");
+    btn.disabled = true;
+    setTrackState("正在取清晰度列表…", false);
+    try {
+      const r = await api("/v1/detail?" + t.q);
+      if (r.status !== 200) {
+        const e = (r.body && r.body.error) || {};
+        setTrackState("取清晰度列表失败：HTTP " + r.status + " " + (e.message || ""), true);
+        return null;
+      }
+      const d = r.body || {};
+      tracks = d;
+      muxKey = t.q;
+      fillSelect($("#muxVq"), d.videos, "video");
+      fillSelect($("#muxAq"), d.audios, "audio");
+      const nv = (d.videos || []).length, na = (d.audios || []).length;
+      if (!d.needs_mux || !na) {
+        setTrackState("这一条返回的是单文件直链，不需要混流（视频 " + nv + " 档、音频 " + na +
+          " 档）：直接在「取直链」里下载即可。", true);
+      } else {
+        setTrackState("已取到 " + nv + " 个视频档位、" + na + " 个音频档位（HTTP " + r.status +
+          "，" + r.ms + " ms）。换链接后需要重新取一次。", false);
+      }
+      return d;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   // ---------- 主流程 ----------
   let busy = false;
   let lastURL = null;
@@ -1424,8 +1527,6 @@
     if (busy) return;
     const t = target();
     if (t.err) { alert(t.err); return; }
-    const quality = $("#quality").value.trim();
-    const qs = t.q + (quality ? "&quality=" + encodeURIComponent(quality) : "");
 
     busy = true;
     $("#muxStart").disabled = true;
@@ -1435,11 +1536,19 @@
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
 
     try {
-      phase("① 取流地址…");
-      const r = await api("/v1/links?" + qs);
-      if (r.status !== 200) throw new Error((r.body && r.body.error && r.body.error.message) || ("HTTP " + r.status));
-      const d = r.body;
-      if (!d.audio_url) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
+      // 清晰度列表按需拉取：换了链接（t.q 变了）就必须重取，否则两轨
+      // 可能属于上一个视频——那会合出一个时长对不上的文件。
+      phase("① 取清晰度列表…");
+      if (!tracks || muxKey !== t.q) {
+        const got = await loadTracks();
+        if (!got) throw new Error("取清晰度列表失败，看「浏览器内混流」里的提示");
+      }
+      const d = tracks;
+      const v = (d.videos || [])[Number($("#muxVq").value) || 0];
+      const a = (d.audios || [])[Number($("#muxAq").value) || 0];
+      if (!v) throw new Error("这一条没有可用的视频档位");
+      if (!a) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
+      const useProxy = $("#muxProxy").checked;
 
       await cleanStorage();
       const onTick = (base, span) => (got, total, speed) => {
@@ -1448,11 +1557,11 @@
                (speed ? "   " + prettySize(speed) + "/s" : ""));
       };
       phase("② 流式下载视频轨（写入浏览器存储，不占内存）…");
-      const vStore = await downloadTrack("url", d, qs, "video", "② 视频轨", onTick(0, 0.45));
+      const vStore = await downloadTrack(v, useProxy, "video", "② 视频轨", onTick(0, 0.45));
       const vsize = await vStore.size();
 
       phase("③ 流式下载音频轨…");
-      const aStore = await downloadTrack("audio_url", d, qs, "audio", "③ 音频轨", onTick(0.45, 0.15));
+      const aStore = await downloadTrack(a, useProxy, "audio", "③ 音频轨", onTick(0.45, 0.15));
       const asize = await aStore.size();
 
       phase("④ 解析分片结构…");
@@ -1508,7 +1617,10 @@
       const url = URL.createObjectURL(file);
       lastURL = url;
       // 与代理下载用同一套命名：标题 + VL + 前端混合 + 清晰度 + .mp4
-      const name = dlName(await ensureTitle(), DL.MUX, qualityLabel(quality), "mp4");
+      // 命名用**实际合成的那个档位**，而不是上面输入框里的值：
+      // 下拉里选了 720P 却命名成 1080P 会让人以为合错了文件。
+      const name = dlName(await ensureTitle(), DL.MUX,
+        qualityLabel(v.quality || (v.height ? String(v.height) : "")), "mp4");
       if (h264OK) {
         $("#muxVideo").classList.remove("hidden");
         $("#muxNoPreview").classList.add("hidden");
@@ -1544,6 +1656,20 @@
   });
 
   $("#muxStart").addEventListener("click", start);
+  $("#muxLoad").addEventListener("click", () => { muxKey = ""; loadTracks(); });
+
+  // 代理开关默认跟随服务端是否开了代理；用户改过就记住（存本机浏览器）。
+  const PROXY_STORE = "vidlink_mux_proxy";
+  (function initProxyBox() {
+    const box = $("#muxProxy");
+    let saved = null;
+    try { saved = localStorage.getItem(PROXY_STORE); } catch (_) {}
+    box.checked = saved === null ? proxyOn() : saved === "1";
+    if (!proxyOn()) box.disabled = true;   // 服务端没开，勾了也没用，直接禁掉
+    box.addEventListener("change", () => {
+      try { localStorage.setItem(PROXY_STORE, box.checked ? "1" : "0"); } catch (_) {}
+    });
+  })();
   $("#muxClean").addEventListener("click", async () => {
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
     $("#muxVideo").removeAttribute("src");

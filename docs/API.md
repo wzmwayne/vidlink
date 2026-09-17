@@ -565,11 +565,21 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 
 ```bash
 VIDLINK_PROXY_ENDPOINT=true                    # 免校验模式下默认就是 true
-VIDLINK_PROXY_ALLOW_HOSTS=*.bilivideo.com      # 可选；留空 = 不限制
+VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror08c.bilivideo.com/
 ```
 
 - **白名单留空表示放行任意 http/https 目标**（想收紧就填域名后缀，多个用逗号分隔）；
 - 填了白名单时，不在其中的域名 → `403 forbidden`；
+- 条目会被**规范化**成裸域名后缀：剥掉 scheme、userinfo、端口、路径与开头的 `*.`，
+  转小写、去首尾点、去重。所以 `*.bilivideo.com`、`https://upos-sz-mirror08c.bilivideo.com/`
+  与 `upos-sz-mirror08c.bilivideo.com` 是同一个后缀；
+- 匹配按 **DNS 标签后缀**：`bilivideo.com` 命中 `upos-sz-mirror08c.bilivideo.com`，
+  但不命中 `notbilivideo.com`、也不命中 `bilivideo.com.evil.cn`；
+- **会被丢弃的条目**：`*`、单个标签（`com`、`localhost`）、含非法字符或超长（单段 >63、
+  总长 >253）的条目。丢弃不影响服务启动，但启动日志会列出被忽略的原文——
+  白名单"悄悄只生效一半"是最坑人的状态；
+- 补充校验：`url` 必须是 http/https 绝对地址且**不能带用户名密码**（≤4096 字节）；
+  `referer` 必须是 http/https 绝对地址；`ua` 会去掉控制字符并限长。
 - **默认值跟随运行模式**：免校验模式默认开启（浏览器内混流遇到要求 Referer/UA 的
   CDN 节点时要靠它），账户模式默认关闭；显式写 `VIDLINK_PROXY_ENDPOINT=false` 一律关掉；
 - 账户模式下它需要 Key；免校验模式下它是公开的——**这时它就是一个开放代理，
