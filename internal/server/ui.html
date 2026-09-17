@@ -149,6 +149,40 @@
     </div>
   </section>
 
+  <!-- 配额流水（账单）：用户读自己的 -->
+  <section id="ledgersec" class="hidden">
+    <h2>配额流水（账单）</h2>
+    <div id="ledgerTotals"></div>
+    <div class="row" style="margin-top:10px">
+      <div class="col narrow">
+        <label for="ledgerType">类型</label>
+        <select id="ledgerType">
+          <option value="">全部</option>
+          <option value="consume">使用</option>
+          <option value="add">管理员增加</option>
+          <option value="reduce">管理员减少</option>
+          <option value="set">管理员设置</option>
+          <option value="create">创建账号</option>
+          <option value="delete">删除账号</option>
+        </select>
+      </div>
+      <div class="col narrow">
+        <label for="ledgerLimit">条数（上限 500）</label>
+        <input id="ledgerLimit" value="50" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button id="ledgerRefresh" style="width:100%">刷新流水</button>
+      </div>
+      <span class="status" id="ledgerStatus" style="align-self:center"></span>
+    </div>
+    <div id="ledger"></div>
+    <div class="hint">
+      这里只显示**你自己的**流水；按时间倒序，只保留最近若干条（汇总口径是全量）。
+      解析与代理的消耗、管理员对你账号的增加/减少/设置都在这里。本接口不消耗配额。
+    </div>
+  </section>
+
   <!-- 单个解析 -->
   <section>
     <h2>解析一条</h2>
@@ -914,11 +948,111 @@
           });
           t.appendChild(r2);
         });
+        // 媒体代理不按"端点 × 平台"定价，但它是配额出口之一，必须在这张表里
+        // 露面并说清口径——否则用户看到配额少了却找不到对应的系数。
+        const rp = el("tr");
+        rp.appendChild(el("td", null, "媒体代理"));
+        const pc = el("td", "mono");
+        pc.colSpan = 4;
+        const pr = (d.proxy && d.proxy.rate) || "1 配额/MiB";
+        pc.textContent = pr + " × 账号倍率 " + (d.multiplier === undefined ? "" : d.multiplier) +
+          "（按传输体积，不乘平台系数）";
+        rp.appendChild(pc);
+        t.appendChild(rp);
         box.appendChild(t);
+        const pnote = el("div", "hint");
+        pnote.textContent = "媒体代理按体积计费：实扣 = 传输体积(MiB) × 1 × 你的账号倍率；" +
+          "上游给了长度就先扣后传（不够直接 429），长度未知时按实际传输量扣。" +
+          "直连下载不消耗配额——能直连就别走代理。";
+        box.appendChild(pnote);
       }
     } catch (e) {
       box.textContent = "请求失败：" + e;
     }
+  }
+
+  // ---------- 配额流水（自己的账单） ----------
+
+  const LEDGER_TYPE_CN = {
+    consume: "使用", add: "管理员增加", reduce: "管理员减少",
+    set: "管理员设置", create: "创建账号", delete: "删除账号",
+  };
+
+  function ledgerTypeCell(t) {
+    const cn = LEDGER_TYPE_CN[t] || t || "";
+    const cls = t === "consume" ? "pill" : t === "add" ? "pill ok" : t === "reduce" ? "pill bad" : "pill warn";
+    return el("span", cls, cn);
+  }
+
+  // GET /v1/ledger —— 只能读自己的（服务端按 Key 限定，前端没有读别人的入口）
+  async function loadLedger() {
+    const box = $("#ledger");
+    const st = $("#ledgerStatus");
+    st.textContent = "";
+    box.textContent = "加载中…";
+    const limit = ($("#ledgerLimit").value || "50").trim();
+    const type = $("#ledgerType").value;
+    let qs = "?limit=" + encodeURIComponent(limit);
+    if (type) qs += "&type=" + encodeURIComponent(type);
+    try {
+      const r = await api("/v1/ledger" + qs);
+      box.textContent = "";
+      setStatus(st, r);
+      if (r.status !== 200) {
+        const e = (r.body && r.body.error) || {};
+        box.appendChild(el("div", "mono", "HTTP " + r.status + "  " + (e.kind || "")));
+        box.appendChild(el("div", null, e.message || ""));
+        return;
+      }
+      const d = r.body || {};
+      // 汇总：消耗取反成正向口径（后端存的是带符号净变化）
+      const dl = el("dl", "kv");
+      const T = d.totals || {};
+      const put = (k, v) => { dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, String(v))); };
+      const spent = T.consume ? -T.consume.units : 0;
+      put("累计使用", fmtNum(spent) + " （" + ((T.consume && T.consume.count) || 0) + " 次）");
+      put("管理员增加", fmtNum(T.add ? T.add.units : 0));
+      put("管理员减少", fmtNum(T.reduce ? -T.reduce.units : 0));
+      put("管理员设置", ((T.set && T.set.count) || 0) + " 次");
+      put("建号 / 删号", ((T.create && T.create.count) || 0) + " / " + ((T.delete && T.delete.count) || 0));
+      const tot = $("#ledgerTotals");
+      tot.textContent = "";
+      tot.appendChild(dl);
+
+      const list = d.entries || [];
+      if (!list.length) {
+        box.appendChild(el("div", "hint", "没有符合条件的流水。"));
+        return;
+      }
+      const t = el("table");
+      const tr = el("tr");
+      ["时间", "类型", "变化", "变化后余额", "说明"].forEach((h) => tr.appendChild(el("th", null, h)));
+      t.appendChild(tr);
+      list.forEach((e) => {
+        const row = el("tr");
+        row.appendChild(el("td", "mono", (e.time || "").replace("T", " ").slice(0, 19)));
+        const td = el("td");
+        td.appendChild(ledgerTypeCell(e.type));
+        row.appendChild(td);
+        const delta = el("td", "mono", e.units > 0 ? "+" + fmtNum(e.units) : fmtNum(e.units));
+        if (e.units < 0) delta.style.color = "var(--err)";
+        else if (e.units > 0) delta.style.color = "var(--ok)";
+        row.appendChild(delta);
+        row.appendChild(el("td", "mono", fmtNum(e.balance)));
+        row.appendChild(el("td", null, e.detail || ""));
+        t.appendChild(row);
+      });
+      box.appendChild(t);
+    } catch (e) {
+      box.textContent = "请求失败：" + e;
+    }
+  }
+
+  function fmtNum(v) {
+    if (v === undefined || v === null || v === "") return "0";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    return String(Math.round(n * 10000) / 10000);
   }
 
   async function applyKey(k, { save }) {
@@ -932,6 +1066,7 @@
     }
     setKeyState("已保存（仅存于本机浏览器）。", false);
     await loadUsage();
+    await loadLedger();
   }
 
   // ---------- 初始化 ----------
@@ -952,6 +1087,7 @@
           "代理下载按**体积**扣（1 配额/MiB × 你的账号倍率），直连下载不消耗配额。";
         $("#authsec").classList.remove("hidden");
         $("#usagesec").classList.remove("hidden");
+        $("#ledgersec").classList.remove("hidden");
         const stored = loadStoredKey();
         if (stored) {
           $("#apikey").value = stored;
@@ -1029,6 +1165,8 @@
     applyKey("", { save: true });
   });
   $("#usageRefresh").addEventListener("click", loadUsage);
+  $("#ledgerRefresh").addEventListener("click", loadLedger);
+  $("#ledgerType").addEventListener("change", loadLedger);
 
   $("#batch").addEventListener("input", () => {
     const n = $("#batch").value.split("\n").map((s) => s.trim()).filter(Boolean).length;

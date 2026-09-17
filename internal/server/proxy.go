@@ -234,7 +234,8 @@ func (s *Server) chargeProxyDeclared(w http.ResponseWriter, r *http.Request, dec
 		return true // 免校验模式：没有账户，也就没有配额
 	}
 	units := quota.ProxyCost(declared, acct.Multiplier)
-	rc, err := s.accounts.Consume(acct.Key, units)
+	rc, err := s.accounts.Consume(acct.Key, units,
+		fmt.Sprintf("proxy %.4g MiB（按体积）", float64(declared)/float64(quota.ProxyUnitBytes)))
 	if err != nil {
 		var insuf account.ErrQuotaExhausted
 		if errors.As(err, &insuf) {
@@ -267,7 +268,9 @@ func (s *Server) chargeProxyActual(r *http.Request, written int64) {
 	if units <= 0 {
 		return
 	}
-	if _, err := s.accounts.Consume(acct.Key, units); err != nil {
+	if _, err := s.accounts.Consume(acct.Key, units,
+		fmt.Sprintf("proxy %.4g MiB（上游未给长度，按实际传输）",
+			float64(written)/float64(quota.ProxyUnitBytes))); err != nil {
 		// 字节已经发出去了，只能记账：这是"上游不给长度"这条兜底路径的已知代价
 		s.log.Warn("代理按实际字节补扣未成功（流量已发出）",
 			"request_id", requestID(r.Context()), "key", acct.Masked(),

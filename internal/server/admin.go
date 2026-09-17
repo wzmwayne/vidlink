@@ -42,6 +42,8 @@ func (s *Server) adminRoutes() []routeSpec {
 			handler: s.handleAdminStats},
 		{method: http.MethodGet, path: "/v1/admin/quota", admin: true,
 			handler: s.handleAdminQuota},
+		{method: http.MethodGet, path: "/v1/admin/ledger", admin: true,
+			handler: s.handleAdminLedger},
 	}
 }
 

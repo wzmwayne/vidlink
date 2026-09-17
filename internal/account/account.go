@@ -92,12 +92,14 @@ type Account struct {
 //
 // 刻意**不保留原始长度**——长度本身就是可用于推断 Key 生成规则的信息。
 // 代价是掩码长度与原 Key 无关，但这比泄露长度更划算。
-func (a Account) Masked() string {
-	k := a.Key
-	if len(k) <= 10 {
-		return strings.Repeat("*", len(k))
+func (a Account) Masked() string { return Mask(a.Key) }
+
+// Mask 把 Key 掩码成可外发的形式（账号视图与配额流水共用）。
+func Mask(key string) string {
+	if len(key) <= 10 {
+		return strings.Repeat("*", len(key))
 	}
-	return k[:4] + strings.Repeat("*", 8) + k[len(k)-4:]
+	return key[:4] + strings.Repeat("*", 8) + key[len(key)-4:]
 }
 
 // Public 返回可安全外发的视图（掩码 Key + 公开句柄）。
@@ -144,6 +146,12 @@ type Store struct {
 	mu       sync.RWMutex
 	accounts map[string]*Account
 
+	// 配额流水：常驻内存只保留最近 ledgerKeep 条，汇总则是全量增量累计。
+	// 两者都在回放时重建，因此重启不丢。
+	entries     []Entry
+	totalsAll   map[EntryType]Totals
+	totalsByKey map[string]map[EntryType]Totals
+
 	path string // JSONL 落盘路径；空表示纯内存（测试用）
 	f    *os.File
 	fmu  sync.Mutex // 串行化 append，避免交错写坏行
@@ -166,9 +174,11 @@ func New(opts Options) (*Store, error) {
 		now = time.Now
 	}
 	s := &Store{
-		accounts: make(map[string]*Account, 64),
-		path:     opts.Path,
-		now:      now,
+		accounts:    make(map[string]*Account, 64),
+		totalsAll:   make(map[EntryType]Totals, 8),
+		totalsByKey: make(map[string]map[EntryType]Totals, 64),
+		path:        opts.Path,
+		now:         now,
 	}
 	if opts.Path == "" {
 		return s, nil
@@ -220,6 +230,15 @@ func (s *Store) replay() error {
 		if line == "" {
 			continue
 		}
+		// 先看是不是流水行：两类记录共用一个文件，判别必须无歧义
+		var wrapped struct {
+			Tx *Entry `json:"tx"`
+		}
+		if err := json.Unmarshal([]byte(line), &wrapped); err == nil && wrapped.Tx != nil {
+			s.replayEntry(*wrapped.Tx)
+			continue
+		}
+
 		var a Account
 		if err := json.Unmarshal([]byte(line), &a); err != nil || a.Key == "" {
 			bad++ // 跳过损坏行，不让它毁掉整个账本
@@ -242,19 +261,41 @@ func (s *Store) replay() error {
 }
 
 // persist 追加一条快照。调用方必须已持有写锁（或确认独占）。
-func (s *Store) persist(a *Account) error {
+func (s *Store) persist(a *Account) error { return s.appendAccount(a, nil) }
+
+// appendAccount 把账号快照与（可选的）流水**一次写入、一次 fsync**。
+//
+// 为什么要合并：树莓派上是 SD 卡，每次 fsync 都有实打实的代价；
+// 而快照与流水本来就是同一次业务动作的两面，分两次写只会引入
+// "一个成功一个失败"的中间态——那时账本与流水就对不上了。
+func (s *Store) appendAccount(a *Account, e *Entry) error {
 	if s.f == nil {
 		return nil
 	}
-	b, err := json.Marshal(a)
-	if err != nil {
-		return err
+	var buf []byte
+	if a != nil {
+		b, err := json.Marshal(a)
+		if err != nil {
+			return err
+		}
+		buf = append(buf, b...)
+		buf = append(buf, '\n')
 	}
-	b = append(b, '\n')
+	if e != nil {
+		b, err := json.Marshal(ledgerLine{Tx: *e})
+		if err != nil {
+			return err
+		}
+		buf = append(buf, b...)
+		buf = append(buf, '\n')
+	}
+	if len(buf) == 0 {
+		return nil
+	}
 
 	s.fmu.Lock()
 	defer s.fmu.Unlock()
-	if _, err := s.f.Write(b); err != nil {
+	if _, err := s.f.Write(buf); err != nil {
 		return err
 	}
 	// 账本必须真正落盘：配额数据丢了就是真金白银的争议。
@@ -348,8 +389,15 @@ func (s *Store) Create(a Account) (Account, error) {
 	}
 	cp := a
 	s.accounts[a.Key] = &cp
-	if err := s.persist(&cp); err != nil {
+	e := Entry{
+		Time: now, Type: EntryCreate, Key: a.Key, ID: a.ID, Name: a.Name,
+		Units: a.Quota, Balance: a.Quota, Used: a.Used, Calls: a.Calls,
+		Detail: fmt.Sprintf("创建账号（初始配额 %.4g）", a.Quota),
+	}
+	s.ledgerAdd(e)
+	if err := s.appendAccount(&cp, &e); err != nil {
 		delete(s.accounts, a.Key) // 落盘失败就回滚，避免内存与磁盘不一致
+		s.ledgerDrop()
 		return Account{}, err
 	}
 	return cp, nil
@@ -411,8 +459,55 @@ func (s *Store) Update(key string, p Patch) (Account, error) {
 	}
 	a.UpdatedAt = s.now()
 
-	if err := s.persist(a); err != nil {
+	// 流水：把这次改了什么写成一句人能读的话。类型上只分四类业务含义，
+	// 具体改了什么放进 detail——枚举越细，客户端的分支就越多。
+	etype, units, parts := EntrySet, 0.0, make([]string, 0, 4)
+	if p.Name != nil && *p.Name != before.Name {
+		parts = append(parts, "名称 → "+*p.Name)
+	}
+	if p.Note != nil && *p.Note != before.Note {
+		parts = append(parts, "备注已更新")
+	}
+	if p.Multiplier != nil && *p.Multiplier != before.Multiplier {
+		parts = append(parts, fmt.Sprintf("账号倍率 %g → %g", before.Multiplier, *p.Multiplier))
+	}
+	if p.Disabled != nil && *p.Disabled != before.Disabled {
+		if *p.Disabled {
+			parts = append(parts, "停用账号")
+		} else {
+			parts = append(parts, "启用账号")
+		}
+	}
+	if p.Quota != nil && *p.Quota != before.Quota {
+		units = *p.Quota - before.Quota
+		parts = append(parts, fmt.Sprintf("配额设为 %.4g（%+.4g）", *p.Quota, units))
+	}
+	if p.AddQuota != nil && *p.AddQuota != 0 {
+		units += *p.AddQuota
+		if *p.AddQuota > 0 {
+			etype = EntryAdd
+			parts = append(parts, fmt.Sprintf("管理员增加 %.4g 配额", *p.AddQuota))
+		} else {
+			etype = EntryReduce
+			parts = append(parts, fmt.Sprintf("管理员减少 %.4g 配额", -*p.AddQuota))
+		}
+	}
+
+	var e *Entry
+	if len(parts) > 0 {
+		entry := Entry{
+			Time: a.UpdatedAt, Type: etype, Key: a.Key, ID: a.ID, Name: a.Name,
+			Units: units, Balance: a.Quota, Used: a.Used, Calls: a.Calls,
+			Detail: strings.Join(parts, "；"),
+		}
+		e = &entry
+		s.ledgerAdd(entry)
+	}
+	if err := s.appendAccount(a, e); err != nil {
 		*a = before // 落盘失败回滚内存
+		if e != nil {
+			s.ledgerDrop()
+		}
 		return Account{}, err
 	}
 	return *a, nil
@@ -425,13 +520,26 @@ func (s *Store) Delete(key string) error {
 	if _, ok := s.accounts[key]; !ok {
 		return ErrNotFound
 	}
+	a := s.accounts[key]
 	delete(s.accounts, key)
 	// 追加一条墓碑记录，回放时据此移除。保留原账号的 Used/Calls
 	// 之外的信息没有意义，但把它标成 Deleted 就足以让回放跳过它。
-	return s.persist(&Account{
+	now := s.now()
+	e := Entry{
+		Time: now, Type: EntryDelete, Key: key, ID: a.ID, Name: a.Name,
+		Units: 0, Balance: 0, Used: a.Used, Calls: a.Calls,
+		Detail: fmt.Sprintf("删除账号（删除时余额 %.4g，累计消耗 %.4g）", a.Quota, a.Used),
+	}
+	s.ledgerAdd(e)
+	if err := s.appendAccount(&Account{
 		Key: key, Deleted: true, Disabled: true,
-		CreatedAt: s.now(), UpdatedAt: s.now(),
-	})
+		CreatedAt: now, UpdatedAt: now,
+	}, &e); err != nil {
+		s.accounts[key] = a // 落盘失败回滚：账号不能"删了但文件里没有"
+		s.ledgerDrop()
+		return err
+	}
+	return nil
 }
 
 // --- 配额计量 ---
@@ -450,7 +558,7 @@ type Consumption struct {
 //
 // units<=0（例如账号倍率为 0 的免费账号）时不校验配额，
 // 但仍然累计 Used 与 Calls ——用量统计不该因为免费而缺失。
-func (s *Store) Consume(key string, units float64) (Consumption, error) {
+func (s *Store) Consume(key string, units float64, detail string) (Consumption, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -467,8 +575,14 @@ func (s *Store) Consume(key string, units float64) (Consumption, error) {
 	a.Calls++
 	a.UpdatedAt = s.now()
 
-	if err := s.persist(a); err != nil {
+	e := Entry{
+		Time: a.UpdatedAt, Type: EntryConsume, Key: a.Key, ID: a.ID, Name: a.Name,
+		Units: -units, Balance: a.Quota, Used: a.Used, Calls: a.Calls, Detail: detail,
+	}
+	s.ledgerAdd(e)
+	if err := s.appendAccount(a, &e); err != nil {
 		*a = before
+		s.ledgerDrop()
 		return Consumption{}, err
 	}
 	return Consumption{Units: units, Quota: a.Quota, Multiplier: a.Multiplier}, nil

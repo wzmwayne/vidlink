@@ -2074,3 +2074,190 @@ func TestAdminPanelShowsProxyPricing(t *testing.T) {
 		}
 	}
 }
+
+// --- 配额流水（账单）接口 ---
+
+// TestLedgerSelfService：用户读自己的流水，读不到别人的，也不该被计量。
+func TestLedgerSelfService(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	if w := do(h, http.MethodGet, "/v1/ledger", nil); w.Code != http.StatusForbidden {
+		t.Fatalf("不带 Key 读流水应 403，得到 %d", w.Code)
+	}
+	// 先用这个 Key 解析一次，制造一条"使用"流水
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("解析应 200，得到 %d", w.Code)
+	}
+	before, _ := env.store.Get(env.userKey)
+
+	w := do(h, http.MethodGet, "/v1/ledger", userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("读自己的流水应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "" {
+		t.Errorf("读流水不该消耗配额，却回写了 X-Quota-Consumed=%q", got)
+	}
+	var resp struct {
+		Scope   string           `json:"scope"`
+		Account map[string]any   `json:"account"`
+		Entries []map[string]any `json:"entries"`
+		Totals  map[string]struct {
+			Count int64   `json:"count"`
+			Units float64 `json:"units"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Scope != "self" {
+		t.Errorf("scope = %q，想要 self", resp.Scope)
+	}
+	if strings.Contains(w.Body.String(), env.userKey) {
+		t.Error("流水里不该出现明文 Key")
+	}
+	if len(resp.Entries) < 2 { // create + consume
+		t.Fatalf("流水至少应有建号与一次使用，得到 %d 条", len(resp.Entries))
+	}
+	newest := resp.Entries[0]
+	if newest["type"] != "consume" {
+		t.Errorf("最新一条应为 consume，得到 %v", newest["type"])
+	}
+	if got, _ := newest["detail"].(string); !strings.Contains(got, "links/bilibili") {
+		t.Errorf("消耗流水的说明应写明端点与平台，得到 %q", got)
+	}
+	if tot := resp.Totals["consume"]; tot.Count != 1 || tot.Units != -1 {
+		t.Errorf("consume 汇总 = %+v，想要 1 次 / -1", tot)
+	}
+
+	// 筛选与参数校验
+	w = do(h, http.MethodGet, "/v1/ledger?type=consume&limit=1", userHdr(env.userKey))
+	var one struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &one); err != nil {
+		t.Fatal(err)
+	}
+	if len(one.Entries) != 1 || one.Entries[0]["type"] != "consume" {
+		t.Errorf("type/limit 筛选没生效：%v", one.Entries)
+	}
+	for _, bad := range []string{"?limit=abc", "?limit=0", "?type=bogus"} {
+		if w := do(h, http.MethodGet, "/v1/ledger"+bad, userHdr(env.userKey)); w.Code != http.StatusBadRequest {
+			t.Errorf("%s 应 400，得到 %d", bad, w.Code)
+		}
+	}
+	after, _ := env.store.Get(env.userKey)
+	if after.Quota != before.Quota || after.Used != before.Used {
+		t.Errorf("读流水不该动账本：before=%v/%v after=%v/%v", before.Quota, before.Used, after.Quota, after.Used)
+	}
+}
+
+// TestAdminLedgerTotalAndScoped：管理员能读总账单，也能按句柄/明文 Key 读单个账号。
+func TestAdminLedgerTotalAndScoped(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	if w := do(h, http.MethodGet, "/v1/admin/ledger", userHdr(env.userKey)); w.Code != http.StatusForbidden {
+		t.Fatalf("普通账号读管理流水应 403，得到 %d", w.Code)
+	}
+	// 制造一条使用记录（用户账号）
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("解析应 200，得到 %d", w.Code)
+	}
+
+	w := do(h, http.MethodGet, "/v1/admin/ledger", userHdr(env.adminKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("总账单应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	var all struct {
+		Scope   string           `json:"scope"`
+		Entries []map[string]any `json:"entries"`
+		Totals  map[string]struct {
+			Count int64   `json:"count"`
+			Units float64 `json:"units"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &all); err != nil {
+		t.Fatal(err)
+	}
+	if all.Scope != "all" {
+		t.Errorf("scope = %q，想要 all", all.Scope)
+	}
+	if all.Totals["consume"].Count != 1 {
+		t.Errorf("总账单应含 1 次使用，得到 %+v", all.Totals["consume"])
+	}
+	if len(all.Entries) < 2 {
+		t.Fatalf("总账单流水太少：%d", len(all.Entries))
+	}
+
+	// 按句柄读单个账号
+	user, _ := env.store.Get(env.userKey)
+	w = do(h, http.MethodGet, "/v1/admin/ledger?id="+user.ID, userHdr(env.adminKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("按句柄读应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	var scoped struct {
+		Scope   string           `json:"scope"`
+		Account map[string]any   `json:"account"`
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &scoped); err != nil {
+		t.Fatal(err)
+	}
+	if scoped.Scope != "account" {
+		t.Errorf("scope = %q，想要 account", scoped.Scope)
+	}
+	if scoped.Account["id"] != user.ID {
+		t.Errorf("account.id = %v，想要 %v", scoped.Account["id"], user.ID)
+	}
+	for _, e := range scoped.Entries {
+		if e["id"] != user.ID {
+			t.Errorf("按账号筛选后混进了别的账号：%v", e["id"])
+		}
+	}
+	// 明文 Key 也能寻址（运维手上通常就是 Key）
+	if w := do(h, http.MethodGet, "/v1/admin/ledger?key="+env.userKey, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Errorf("按明文 Key 读应 200，得到 %d", w.Code)
+	}
+	// 不存在的账号 → 404；类型筛选照旧生效
+	if w := do(h, http.MethodGet, "/v1/admin/ledger?id=acc_不存在", userHdr(env.adminKey)); w.Code != http.StatusNotFound {
+		t.Errorf("不存在的句柄应 404，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/ledger?type=create", userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Errorf("按类型筛选应 200，得到 %d", w.Code)
+	}
+}
+
+// TestEaseModeHidesLedger：免校验模式没有账户，流水接口也不存在。
+func TestEaseModeHidesLedger(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	for _, path := range []string{"/v1/ledger", "/v1/admin/ledger"} {
+		if w := do(env.handler(), http.MethodGet, path, nil); w.Code != http.StatusNotFound {
+			t.Errorf("免校验模式 %s 应 404，得到 %d", path, w.Code)
+		}
+	}
+}
+
+// TestLedgerUIWiring：两个页面都要有流水入口，且调用的是真实存在的路由。
+func TestLedgerUIWiring(t *testing.T) {
+	ui := string(uiHTML)
+	for _, want := range []string{
+		`id="ledgersec"`, `id="ledgerType"`, `id="ledgerRefresh"`, `loadLedger`,
+		`"/v1/ledger" + qs`,
+		// 各端点系数表里必须有代理那一行（口径与平台系数不同）
+		`媒体代理`, `1 配额/MiB`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Errorf("解析页缺少 %q", want)
+		}
+	}
+	admin := string(adminHTML)
+	for _, want := range []string{
+		`id="ledgersec"`, `id="ledgerWho"`, `id="ledgerLoad"`, `loadLedger`,
+		`"/v1/admin/ledger" + qs`,
+	} {
+		if !strings.Contains(admin, want) {
+			t.Errorf("管理面板缺少 %q", want)
+		}
+	}
+}

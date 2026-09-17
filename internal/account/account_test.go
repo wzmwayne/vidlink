@@ -65,7 +65,7 @@ func TestConsumeIsAtomicUnderConcurrency(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer wg.Done()
-			_, err := s.Consume("k", 1.0)
+			_, err := s.Consume("k", 1.0, "test")
 			mu.Lock()
 			switch {
 			case err == nil:
@@ -102,7 +102,7 @@ func TestZeroQuotaAccountStillCountsUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := s.Consume("free", 0); err != nil {
+		if _, err := s.Consume("free", 0, "test"); err != nil {
 			t.Fatalf("免费账号扣 0 不应失败: %v", err)
 		}
 	}
@@ -120,7 +120,7 @@ func TestConsumeQuotaExhausted(t *testing.T) {
 	if _, err := s.Create(Account{Key: "k", Quota: 0.5, Multiplier: 1}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.Consume("k", 1.0)
+	_, err := s.Consume("k", 1.0, "test")
 	var e ErrQuotaExhausted
 	if !errors.As(err, &e) {
 		t.Fatalf("应报 ErrQuotaExhausted，得到 %v", err)
@@ -137,7 +137,7 @@ func TestConsumeQuotaExhausted(t *testing.T) {
 
 func TestConsumeUnknownKey(t *testing.T) {
 	s := newStore(t)
-	if _, err := s.Consume("nope", 1); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Consume("nope", 1, "test"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("应报 ErrNotFound，得到 %v", err)
 	}
 }
@@ -205,7 +205,7 @@ func TestPersistenceReplay(t *testing.T) {
 	if _, err := s.Create(Account{Key: "b", Quota: 50, Multiplier: 0.5}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Consume("a", 1.2); err != nil {
+	if _, err := s.Consume("a", 1.2, "test"); err != nil {
 		t.Fatal(err)
 	}
 	hundred := 200.0
@@ -327,7 +327,7 @@ func TestStats(t *testing.T) {
 	if _, err := s.Create(Account{Key: "b", Quota: 50, Multiplier: 1, Disabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Consume("a", 10); err != nil {
+	if _, err := s.Consume("a", 10, "test"); err != nil {
 		t.Fatal(err)
 	}
 	st := s.Stats()
@@ -352,7 +352,7 @@ func TestMemoryOnlyStore(t *testing.T) {
 	if _, err := s.Create(Account{Key: "x", Quota: 5, Multiplier: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Consume("x", 5); err != nil {
+	if _, err := s.Consume("x", 5, "test"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.Get("x")

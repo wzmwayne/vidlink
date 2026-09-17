@@ -415,6 +415,46 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 - `cost` 已包含账号倍率，与响应头 `X-Quota-Consumed` 一致；
 - 抖音在**解析前**就被挡掉（纯本地平台判定），不浪费上游请求与 IP 风控额度。
 
+### 3.8b 配额流水 `GET /v1/ledger` · 需 Key · 不消耗配额
+
+返回**自己账号**的流水（新的在前）：使用、管理员增加/减少/设置、建号/删号。
+接口里没有任何"读别人"的入口——服务端直接按当前 Key 限定。
+
+```json
+{
+  "scope": "self",
+  "account": {"id": "acc_1f2e…", "name": "示例账号", "key": "vl_a********3f7c"},
+  "unit": "配额",
+  "entries": [{
+    "time": "2026-01-02T03:04:05Z", "type": "consume", "key": "vl_a********3f7c",
+    "id": "acc_1f2e…", "name": "示例账号",
+    "units": -1.2, "balance": 98.8, "used": 12.7, "calls": 14,
+    "detail": "detail/bilibili ×1"
+  }],
+  "totals": {"consume": {"count": 9, "units": -12.7}, "add": {"count": 2, "units": 200}},
+  "types": {"consume": "使用：解析或代理消耗配额（units 为负）", "...": "..."},
+  "limit_max": 500,
+  "note": "流水只保留最近若干条，汇总为全量口径；本接口不消耗配额"
+}
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `limit` | 条数上限，默认 50、最大 500；非正整数 → `400` |
+| `type` | `consume` / `add` / `reduce` / `set` / `create` / `delete`；不认识 → `400` |
+
+字段含义：
+
+| 字段 | 说明 |
+| --- | --- |
+| `units` | **带符号**的变化量：消耗为负，管理员增加为正 |
+| `balance` | 这条流水之后的剩余配额 |
+| `detail` | 人能读的说明：`links/bilibili ×1`、`proxy 66.53 MiB（按体积）`、`管理员增加 100 配额`、`账号倍率 1 → 0.5` |
+| `totals` | 按类型汇总（**全量**口径，不受 `entries` 条数上限影响）；"累计消耗" = `-totals.consume.units` |
+
+> 流水与账号快照共用一个账本文件、共用一次 `fsync`，重启一起回放，所以历史不会丢。
+> 接口只承诺"最近 N 条 + 全量汇总"，更早的逐条记录可以直接读账本文件。
+
 ### 3.9 管理端点 `/v1/admin/*` · 需固定管理 Key · 免校验模式下不存在
 
 > `VL_EASE=true` 时管理面整体不注册，所有 `/v1/admin/*` 返回 `404`。
@@ -514,6 +554,33 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
   "traffic": {"requests": 10422, "errors": 37, "uptime_sec": 3821}
 }
 ```
+
+#### `GET /v1/admin/ledger` · 不消耗配额
+
+配额流水：**不带条件就是总账单**（全部账号的汇总 + 最近流水），
+带 `id=`（句柄）或 `key=`（明文 Key）则只读那个账号。
+
+```bash
+curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?limit=100'
+curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980&type=set'
+```
+
+```json
+{
+  "scope": "account",
+  "account": {"id": "acc_1f2e…", "name": "示例账号", "key": "vl_a********3f7c",
+              "quota": 98.8, "used": 12.7, "calls": 14, "multiplier": 1, "disabled": false},
+  "entries": [{"time": "…", "type": "add", "name": "示例账号", "units": 100,
+               "balance": 198.8, "detail": "管理员增加 100 配额"}],
+  "totals": {"add": {"count": 1, "units": 100}},
+  "unit": "配额", "types": {"…": "…"}, "limit_max": 500,
+  "note": "流水只保留最近若干条，汇总为全量口径；本接口不消耗配额。不带 id/key 即总账单"
+}
+```
+
+- `scope` 为 `all`（总账单）或 `account`；不带 `id`/`key` 时是前者；
+- 参数与用户接口一致（`limit` / `type`），另加 `id`（句柄 `acc_…`）或 `key`（明文 Key）；
+- 账号不存在 → `404`；不是管理 Key → `403`；免校验模式下整条路由不存在 → `404`。
 
 #### `GET /v1/admin/quota` · 不消耗配额
 
@@ -814,6 +881,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/healthz` | 公开 | — |
 | GET | `/readyz` | 公开 | — |
 | GET | `/v1/usage` | Key | — |
+| GET | `/v1/ledger` | Key | —（自己的流水） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 |
@@ -827,6 +895,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
 | GET | `/v1/admin/stats` | 管理 Key | — |
 | GET | `/v1/admin/quota` | 管理 Key | — |
+| GET | `/v1/admin/ledger` | 管理 Key | —（总账单 / 指定账号） |
 
 其他文档：
 

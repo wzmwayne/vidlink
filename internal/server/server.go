@@ -186,9 +186,10 @@ func (s *Server) routes() []routeSpec {
 	// 不注册（而不是注册后返回 403/空数据）意味着它们确实返回 404，
 	// 外界探测不到"这里本该有个管理接口"。
 	if !s.cfg.IsEase() {
-		// ---- 免配额但需要身份：用量查询要知道"你是谁" ----
+		// ---- 免配额但需要身份：用量查询与自己的流水都要知道"你是谁" ----
 		specs = append(specs,
-			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage})
+			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage},
+			routeSpec{method: http.MethodGet, path: "/v1/ledger", handler: s.handleLedger})
 		// ---- 管理面：用固定管理 Key（未配置时每条都恒 403）----
 		specs = append(specs, s.adminRoutes()...)
 	}

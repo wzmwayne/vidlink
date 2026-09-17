@@ -264,7 +264,9 @@ func (s *Server) consumeQuota(w http.ResponseWriter, r *http.Request, v *core.Vi
 			"endpoint", string(ep), "platform", string(v.Platform), "err", err)
 		return
 	}
-	rc, err := s.accounts.Consume(acct.Key, units)
+	// 流水里的说明要能让人看懂"这一笔花在哪"：端点 + 平台 + 条数
+	rc, err := s.accounts.Consume(acct.Key, units,
+		fmt.Sprintf("%s/%s ×%d", ep, v.Platform, items))
 	if err != nil {
 		s.log.Error("配额计量失败：扣减未成功", "request_id", requestID(r.Context()),
 			"key", acct.Masked(), "units", units, "err", err)
@@ -502,7 +504,8 @@ func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
 	resp.Cost = total
 
 	if !ease && total > 0 {
-		if rc, err := s.accounts.Consume(acct.Key, total); err == nil {
+		if rc, err := s.accounts.Consume(acct.Key, total,
+			fmt.Sprintf("batch_links ×%d", resp.Success)); err == nil {
 			setQuotaHeaders(w, rc.Units, rc.Quota)
 		} else {
 			s.log.Error("批量配额计量失败", "request_id", requestID(r.Context()),

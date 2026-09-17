@@ -230,6 +230,61 @@ paths:
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
+  /v1/ledger:
+    get:
+      tags: [账号]
+      summary: 自己的配额流水（账单）：使用 / 管理员增加 / 减少 / 设置
+      description: |
+        只能读自己的（服务端按 Key 限定）。**不消耗配额**。
+        units 带符号（消耗为负）；totals 为全量口径，entries 只保留最近若干条。
+      operationId: getLedger
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: type
+          in: query
+          schema: { type: string, enum: [consume, add, reduce, set, create, delete] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ledger" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/admin/ledger:
+    get:
+      tags: [管理]
+      summary: 配额流水：总账单，或指定账号（id 句柄 / key 明文）
+      description: 不带 id/key 即总账单。**不消耗配额**。
+      operationId: adminLedger
+      parameters:
+        - name: id
+          in: query
+          description: 账号公开句柄 acc_…
+          schema: { type: string }
+        - name: key
+          in: query
+          description: 账号明文 Key（与 id 二选一）
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 500 }
+        - name: type
+          in: query
+          schema: { type: string, enum: [consume, add, reduce, set, create, delete] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ledger" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /v1/admin/accounts:
     get:
       tags: [管理]
@@ -731,6 +786,47 @@ components:
         disabled: { type: boolean }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    Ledger:
+      type: object
+      description: 配额流水（账单）。不消耗配额；totals 为全量口径
+      properties:
+        scope: { type: string, enum: [self, all, account] }
+        account:
+          type: object
+          additionalProperties: true
+          description: scope=self/account 时带上该账号的摘要
+        unit: { type: string, example: 配额 }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/LedgerEntry" }
+        totals:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              count: { type: integer, format: int64 }
+              units: { type: number, description: 带符号净变化；累计消耗 = -totals.consume.units }
+        types:
+          type: object
+          additionalProperties: { type: string }
+          description: 各类型的中文含义（由服务端给出，避免前端各写一份）
+        limit_max: { type: integer }
+        note: { type: string }
+
+    LedgerEntry:
+      type: object
+      properties:
+        time: { type: string, format: date-time }
+        type: { type: string, enum: [consume, add, reduce, set, create, delete] }
+        key: { type: string, description: 掩码后的 Key }
+        id: { type: string, description: 账号公开句柄 }
+        name: { type: string }
+        units: { type: number, description: 带符号变化量：消耗为负、管理员增加为正 }
+        balance: { type: number, description: 这条流水之后的剩余配额 }
+        used: { type: number }
+        calls: { type: integer, format: int64 }
+        detail: { type: string, description: "人能读的说明，例如 links/bilibili ×1、proxy 66.53 MiB（按体积）" }
 
     AccountStats:
       type: object

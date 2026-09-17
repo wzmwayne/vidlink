@@ -202,6 +202,43 @@
     </div>
   </section>
 
+  <!-- 配额流水（账单）：总账单或指定账号 -->
+  <section id="ledgersec" class="hidden">
+    <h2>配额流水（账单）</h2>
+    <div class="row">
+      <div class="col">
+        <label for="ledgerWho">账号句柄 acc_… 或明文 Key（留空 = 总账单）</label>
+        <input id="ledgerWho" placeholder="留空读总账单" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="col narrow">
+        <label for="ledgerType">类型</label>
+        <select id="ledgerType">
+          <option value="">全部</option>
+          <option value="consume">使用</option>
+          <option value="add">管理员增加</option>
+          <option value="reduce">管理员减少</option>
+          <option value="set">管理员设置</option>
+          <option value="create">创建账号</option>
+          <option value="delete">删除账号</option>
+        </select>
+      </div>
+      <div class="col narrow">
+        <label for="ledgerLimit">条数（上限 500）</label>
+        <input id="ledgerLimit" value="50" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button class="primary" id="ledgerLoad" style="width:100%">读取流水</button>
+      </div>
+    </div>
+    <div id="ledgerTotals" style="margin-top:10px"></div>
+    <div id="ledger"></div>
+    <div class="hint">
+      留空读**总账单**（全部账号的汇总 + 最近流水）；填句柄则只读那个账号。
+      账号列表里每行的「流水」按钮会直接带句柄过来。本接口不消耗配额。
+    </div>
+  </section>
+
   <!-- 配额系数 -->
   <section id="quotasec" class="hidden">
     <h2>配额系数（只读）</h2>
@@ -423,6 +460,7 @@
     btns.appendChild(mk("应用倍率", "mult"));
     btns.appendChild(mk(a.disabled ? "启用" : "停用", "toggle"));
     btns.appendChild(mk("详情", "get"));
+    btns.appendChild(mk("流水", "ledger"));
     const del = mk("删除", "del", "danger");
     del.style.marginLeft = "auto";
     btns.appendChild(del);
@@ -521,6 +559,11 @@
           show(r);
           return;
         }
+        case "ledger": {
+          $("#ledgerWho").value = id;
+          await loadLedger();
+          return;
+        }
         case "del": {
           if (!confirm("删除账号 " + (a.name || a.id) + "？\n\n" +
                        "该账号的 Key 会立即失效；已消耗的用量仍留在账本汇总里。")) return;
@@ -585,6 +628,89 @@
     } finally {
       btn.disabled = false;
     }
+  }
+
+  // ---------- 配额流水（账单） ----------
+
+  const LEDGER_TYPE_CN = {
+    consume: "使用", add: "管理员增加", reduce: "管理员减少",
+    set: "管理员设置", create: "创建账号", delete: "删除账号",
+  };
+
+  function fmtNum(v) {
+    if (v === undefined || v === null || v === "") return "0";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    return String(Math.round(n * 10000) / 10000);
+  }
+
+  // GET /v1/admin/ledger —— 不带 who 即总账单，带了就是那个账号的
+  async function loadLedger() {
+    const box = $("#ledger");
+    const tot = $("#ledgerTotals");
+    const who = $("#ledgerWho").value.trim();
+    const limit = ($("#ledgerLimit").value || "50").trim();
+    const type = $("#ledgerType").value;
+    let qs = "?limit=" + encodeURIComponent(limit);
+    if (type) qs += "&type=" + encodeURIComponent(type);
+    if (who) qs += "&id=" + encodeURIComponent(who);
+    box.textContent = "加载中…";
+    tot.textContent = "";
+    const r = await api("/v1/admin/ledger" + qs);
+    setStatus($("#listStatus"), r);
+    box.textContent = "";
+    if (r.status !== 200) {
+      show(r);
+      box.appendChild(el("div", "errbox", "读不到流水：" + errText(r)));
+      return;
+    }
+    const d = r.body || {};
+    const T = d.totals || {};
+    const dl = el("dl", "kv");
+    const put = (k, v) => { dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, String(v))); };
+    put("范围", d.scope === "all" ? "总账单（全部账号）" : ("账号 " + ((d.account && (d.account.name || d.account.id)) || "")));
+    if (d.account) {
+      put("句柄 / 掩码 Key", (d.account.id || "") + "  " + (d.account.key || ""));
+      put("剩余配额 / 倍率", fmtNum(d.account.quota) + "  /  ×" + d.account.multiplier);
+    }
+    put("累计使用", fmtNum(T.consume ? -T.consume.units : 0) + " （" + ((T.consume && T.consume.count) || 0) + " 次）");
+    put("管理员增加", fmtNum(T.add ? T.add.units : 0) + " （" + ((T.add && T.add.count) || 0) + " 次）");
+    put("管理员减少", fmtNum(T.reduce ? -T.reduce.units : 0) + " （" + ((T.reduce && T.reduce.count) || 0) + " 次）");
+    put("管理员设置", ((T.set && T.set.count) || 0) + " 次");
+    put("建号 / 删号", ((T.create && T.create.count) || 0) + " / " + ((T.delete && T.delete.count) || 0));
+    tot.appendChild(dl);
+
+    const list = d.entries || [];
+    if (!list.length) {
+      box.appendChild(el("div", "hint", "没有符合条件的流水。"));
+      return;
+    }
+    const t = el("table");
+    const tr = el("tr");
+    ["时间", "账号", "类型", "变化", "余额", "说明"].forEach((h) => tr.appendChild(el("th", null, h)));
+    t.appendChild(tr);
+    list.forEach((e) => {
+      const row = el("tr");
+      row.appendChild(el("td", "mono", (e.time || "").replace("T", " ").slice(0, 19)));
+      const acc = el("td");
+      acc.appendChild(el("div", null, e.name || "(未命名)"));
+      acc.appendChild(el("div", "mono", (e.id || "") + " " + (e.key || "")));
+      row.appendChild(acc);
+      const td = el("td");
+      const cn = LEDGER_TYPE_CN[e.type] || e.type;
+      const cls = e.type === "consume" ? "pill" : e.type === "add" ? "pill ok"
+        : e.type === "reduce" ? "pill bad" : "pill warn";
+      td.appendChild(el("span", cls, cn));
+      row.appendChild(td);
+      const delta = el("td", "mono", e.units > 0 ? "+" + fmtNum(e.units) : fmtNum(e.units));
+      if (e.units < 0) delta.style.color = "var(--err)";
+      else if (e.units > 0) delta.style.color = "var(--ok)";
+      row.appendChild(delta);
+      row.appendChild(el("td", "mono", fmtNum(e.balance)));
+      row.appendChild(el("td", null, e.detail || ""));
+      t.appendChild(row);
+    });
+    box.appendChild(t);
   }
 
   // ---------- 配额系数 ----------
@@ -714,10 +840,11 @@
     }
     setKeyState("已保存（仅存于本机浏览器），下面的数据都是用这个 Key 取的。", false);
     $("#hdr").textContent = "管理 Key：有效";
-    ["#statsec", "#createsec", "#listsec", "#quotasec", "#apisec"].forEach((s) => $(s).classList.remove("hidden"));
+    ["#statsec", "#createsec", "#listsec", "#ledgersec", "#quotasec", "#apisec"].forEach((s) => $(s).classList.remove("hidden"));
     renderApiLinks();
     await loadStats();
     await loadAccounts();
+    await loadLedger();
     await loadQuota();
     return true;
   }
@@ -764,6 +891,8 @@
   });
   $("#createBtn").addEventListener("click", createAccount);
   $("#statRefresh").addEventListener("click", loadStats);
+  $("#ledgerLoad").addEventListener("click", loadLedger);
+  $("#ledgerType").addEventListener("change", loadLedger);
   $("#listRefresh").addEventListener("click", loadAccounts);
   $("#filter").addEventListener("input", renderAccounts);
 
