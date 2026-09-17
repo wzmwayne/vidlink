@@ -3,12 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -1226,10 +1230,11 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`id="muxStart"`,
 		`id="muxVideo"`,
 		`id="muxSave"`,
-		`id="muxVq"`,    // 混流区直接选视频清晰度
-		`id="muxAq"`,    // 与音频清晰度
-		`id="muxLoad"`,  // 取清晰度列表（一次 /v1/detail）
-		`id="muxProxy"`, // 是否经服务端代理下载（由使用者决定，不自动兜底）
+		`id="muxVq"`,         // 混流区直接选视频清晰度
+		`id="muxAq"`,         // 与音频清晰度
+		`id="muxTrackState"`, // 档位状态（没有"取清晰度列表"按钮）
+		`id="muxProxy"`,      // 是否经服务端代理下载（由使用者决定，不自动兜底）
+		`applyDetail`,        // 「全部详情」的结果直接喂给混流区
 		`/v1/detail`,
 		`navigator.storage.getDirectory`,
 		`canPlayType`, // 无 H.264 解码器的浏览器要给出解释，而不是静默失败
@@ -1723,9 +1728,15 @@ func TestAdminPanelStaysSelfContained(t *testing.T) {
 func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
 	body := string(uiHTML)
 	for _, want := range []string{
-		`id="muxVq"`, `id="muxAq"`, `id="muxProxy"`, `id="muxLoad"`,
+		`id="muxVq"`, `id="muxAq"`, `id="muxProxy"`,
 		// 档位来自 /v1/detail（links 只给最优的一条，选不了）
 		`"/v1/detail?" + t.q`,
+		// 「全部详情」拿到结果后自动填档位：一次请求两个消费者
+		`window.VL.applyDetail(res.body, key)`,
+		`window.VL.applyDetail = applyTracks`,
+		// 代理可用性来自异步的 /v1/health：必须在拿到之后再同步复选框，
+		// 否则"服务端开了代理，复选框却灰着点不动"
+		`function syncProxyBox()`, `syncProxyBox();`,
 		// 选项文本用 textContent，value 只放下标，不把 URL 塞进 DOM
 		`el("option", null,`, `o.value = String(i)`,
 		// 代理通道：必须把 Key 拼进 URL，否则账户模式下 /v1/proxy 直接 403
@@ -1736,6 +1747,10 @@ func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("混流区块缺少 %q", want)
 		}
+	}
+	// 页面上不该再有"取清晰度列表"这个按钮/文案：档位改为取完整信息时自动解析
+	if strings.Contains(body, `id="muxLoad"`) || strings.Contains(body, "取清晰度列表") {
+		t.Error("不该再有独立的「取清晰度列表」按钮")
 	}
 	// 真的不再自动兜底：downloadTrack 里不该再出现"直连失败就自己上代理"的调用
 	if strings.Contains(body, "return await once(proxyURL()") {
@@ -1822,5 +1837,35 @@ func TestProxyAcceptsBareHostSuffix(t *testing.T) {
 	if w := do(env.handler(), http.MethodGet,
 		"/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey)); w.Code != http.StatusOK {
 		t.Fatalf("白名单命中应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+}
+
+// TestUIScriptsParse：页面里的每个 <script> 块必须能被 JS 引擎解析。
+//
+// 这条来自一次真实的静默故障：混流脚本里出现了两个同作用域的
+// `const a`，浏览器直接放弃**整块脚本**（控制台只有一行
+// "Identifier 'a' has already been declared"），症状是混流功能整个消失，
+// 而页面其余部分看起来完全正常。字符串断言查不出这种错，只有真解析一次才行。
+//
+// 用 node --check（只解析、不执行，不需要 DOM）。环境里没有 node 就跳过：
+// 单测不该因为缺一个可选的开发工具而失败，CI 的 ubuntu 镜像自带 node。
+func TestUIScriptsParse(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过 JS 语法检查")
+	}
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(string(uiHTML), -1)
+	if len(blocks) == 0 {
+		t.Fatal("页面里没有 script 块")
+	}
+	dir := t.TempDir()
+	for i, b := range blocks {
+		path := filepath.Join(dir, fmt.Sprintf("block%d.js", i))
+		if err := os.WriteFile(path, []byte(b[1]), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
+			t.Errorf("第 %d 个 script 块语法错误：%v\n%s", i+1, err, out)
+		}
 	}
 }

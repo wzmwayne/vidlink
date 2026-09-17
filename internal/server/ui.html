@@ -208,11 +208,11 @@
     <div class="row">
       <div class="col narrow">
         <label for="muxVq">视频清晰度</label>
-        <select id="muxVq"><option value="">先取清晰度列表</option></select>
+        <select id="muxVq"><option value="">先取一次完整信息</option></select>
       </div>
       <div class="col narrow">
         <label for="muxAq">音频清晰度</label>
-        <select id="muxAq"><option value="">先取清晰度列表</option></select>
+        <select id="muxAq"><option value="">先取一次完整信息</option></select>
       </div>
       <div class="col">
         <label>下载通道</label>
@@ -220,14 +220,11 @@
           <input type="checkbox" id="muxProxy"> 使用服务端代理下载
         </label>
       </div>
-      <div class="col narrow">
-        <label>&nbsp;</label>
-        <button id="muxLoad" style="width:100%">取清晰度列表</button>
-      </div>
     </div>
     <div class="hint" id="muxTrackState">
-      先点「取清晰度列表」（调用一次 <code>/v1/detail</code>，会消耗对应配额），
-      再选视频与音频档位。勾上代理表示两轨都经服务端拉取（CDN 要求 Referer 时必须勾）。
+      在上面的「<b>全部详情</b>」里取一次完整信息，档位会自动填到这里（<code>/v1/detail</code>，
+      消耗对应配额）；直接点下面的「下载并混流」也会自动取一次。勾上代理表示两轨都经服务端拉取
+      （CDN 要求 Referer 时必须勾）。
     </div>
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
@@ -757,7 +754,7 @@
     let path = "/v1/" + act + "?" + t.q;
     if (q && (act === "links")) path += "&quality=" + encodeURIComponent(q);
     if (act === "info" && q) path += "&quality=" + encodeURIComponent(q);
-    await go(path, act);
+    await go(path, act, null, t.q);
   }
 
   async function runBatch() {
@@ -773,7 +770,9 @@
     });
   }
 
-  async function go(path, act, opts) {
+  // key 是这次请求对应的目标（url/platform+id 那段查询串）：混流区据此判断
+  // "这份档位列表是不是当前这条视频的"，换了链接就必须重取。
+  async function go(path, act, opts, key) {
     const btns = document.querySelectorAll("button[data-act]");
     btns.forEach((b) => b.disabled = true);
     try {
@@ -784,6 +783,9 @@
       if (res.body && res.body.title) rememberTitle(res.body);
       if (act === "links") v.appendChild(renderLinks(res.body));
       else if (act === "detail") {
+        // 一次「全部详情」同时喂两个地方：结果区 + 混流区的档位下拉。
+        // 让用户为了混流再单独取一次档位是白花一次配额。
+        if (window.VL && window.VL.applyDetail) window.VL.applyDetail(res.body, key);
         if (res.body.needs_mux && !res.body.audio_url) {
           const w = el("div", "warnbox", "DASH 分离流：视频与音频分开，需自行混流。");
           w.style.cssText = "border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:10px";
@@ -911,7 +913,7 @@
       if (webuiMode === "ease") {
         $("#easeNote").classList.remove("hidden");
       } else {
-        $("#muxCostNote").textContent = "注意：本模式下「取清晰度列表」与代理下载都会消耗账号配额。";
+        $("#muxCostNote").textContent = "注意：本模式下取完整信息（/v1/detail）与代理下载都会消耗账号配额。";
         $("#authsec").classList.remove("hidden");
         $("#usagesec").classList.remove("hidden");
         const stored = loadStoredKey();
@@ -1462,36 +1464,42 @@
     n.style.color = bad ? "var(--err)" : "var(--dim)";
   }
 
+  // applyTracks 把一份 /v1/detail 结果填进两个下拉。
+  //
+  // 两个入口共用它：① 上面「全部详情」成功后由主脚本回调（不再需要用户
+  // 为混流多点一次）；② 直接点「下载并混流」时按需自动取一次。
+  function applyTracks(d, key) {
+    if (!d || !key) return;
+    syncProxyBox();   // 这时健康检查早回来了，代理是否可用是确定的
+    tracks = d;
+    muxKey = key;
+    fillSelect($("#muxVq"), d.videos, "video");
+    fillSelect($("#muxAq"), d.audios, "audio");
+    const nv = (d.videos || []).length, na = (d.audios || []).length;
+    if (!d.needs_mux || !na) {
+      setTrackState("这一条返回的是单文件直链，不需要混流（视频 " + nv + " 档、音频 " + na +
+        " 档）：直接在「取直链」里下载即可。", true);
+    } else {
+      setTrackState("档位已按「全部详情」的结果填好：视频 " + nv + " 档、音频 " + na +
+        " 档。换链接后重新取一次完整信息即可刷新。", false);
+    }
+  }
+  // 主脚本在 detail 成功时回调（脚本块顺序：主脚本在前，所以挂在 window.VL 上）
+  window.VL.applyDetail = applyTracks;
+
+  // loadTracks 是"没取过就自己取一次"的兜底路径，供「下载并混流」使用。
   async function loadTracks() {
     const t = target();
     if (t.err) { setTrackState(t.err, true); return null; }
-    const btn = $("#muxLoad");
-    btn.disabled = true;
-    setTrackState("正在取清晰度列表…", false);
-    try {
-      const r = await api("/v1/detail?" + t.q);
-      if (r.status !== 200) {
-        const e = (r.body && r.body.error) || {};
-        setTrackState("取清晰度列表失败：HTTP " + r.status + " " + (e.message || ""), true);
-        return null;
-      }
-      const d = r.body || {};
-      tracks = d;
-      muxKey = t.q;
-      fillSelect($("#muxVq"), d.videos, "video");
-      fillSelect($("#muxAq"), d.audios, "audio");
-      const nv = (d.videos || []).length, na = (d.audios || []).length;
-      if (!d.needs_mux || !na) {
-        setTrackState("这一条返回的是单文件直链，不需要混流（视频 " + nv + " 档、音频 " + na +
-          " 档）：直接在「取直链」里下载即可。", true);
-      } else {
-        setTrackState("已取到 " + nv + " 个视频档位、" + na + " 个音频档位（HTTP " + r.status +
-          "，" + r.ms + " ms）。换链接后需要重新取一次。", false);
-      }
-      return d;
-    } finally {
-      btn.disabled = false;
+    setTrackState("正在取完整信息（/v1/detail）…", false);
+    const r = await api("/v1/detail?" + t.q);
+    if (r.status !== 200) {
+      const e = (r.body && r.body.error) || {};
+      setTrackState("取完整信息失败：HTTP " + r.status + " " + (e.message || ""), true);
+      return null;
     }
+    applyTracks(r.body || {}, t.q);
+    return tracks;
   }
 
   // ---------- 主流程 ----------
@@ -1536,19 +1544,23 @@
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
 
     try {
+      syncProxyBox();
+
       // 清晰度列表按需拉取：换了链接（t.q 变了）就必须重取，否则两轨
       // 可能属于上一个视频——那会合出一个时长对不上的文件。
-      phase("① 取清晰度列表…");
+      phase("① 取完整信息（/v1/detail）…");
       if (!tracks || muxKey !== t.q) {
         const got = await loadTracks();
-        if (!got) throw new Error("取清晰度列表失败，看「浏览器内混流」里的提示");
+        if (!got) throw new Error("取完整信息失败，看「浏览器内混流」里的提示");
       }
       const d = tracks;
-      const v = (d.videos || [])[Number($("#muxVq").value) || 0];
-      const a = (d.audios || [])[Number($("#muxAq").value) || 0];
-      if (!v) throw new Error("这一条没有可用的视频档位");
-      if (!a) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
-      const useProxy = $("#muxProxy").checked;
+      // 名字避开 v/a：下面还有 `const a = $("#muxSave")`，
+      // 同一个函数作用域里重名 const 会让**整块脚本**解析失败（功能静默消失）。
+      const vTrack = (d.videos || [])[Number($("#muxVq").value) || 0];
+      const aTrack = (d.audios || [])[Number($("#muxAq").value) || 0];
+      if (!vTrack) throw new Error("这一条没有可用的视频档位");
+      if (!aTrack) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
+      const useProxy = $("#muxProxy").checked && proxyOn();
 
       await cleanStorage();
       const onTick = (base, span) => (got, total, speed) => {
@@ -1557,11 +1569,11 @@
                (speed ? "   " + prettySize(speed) + "/s" : ""));
       };
       phase("② 流式下载视频轨（写入浏览器存储，不占内存）…");
-      const vStore = await downloadTrack(v, useProxy, "video", "② 视频轨", onTick(0, 0.45));
+      const vStore = await downloadTrack(vTrack, useProxy, "video", "② 视频轨", onTick(0, 0.45));
       const vsize = await vStore.size();
 
       phase("③ 流式下载音频轨…");
-      const aStore = await downloadTrack(a, useProxy, "audio", "③ 音频轨", onTick(0.45, 0.15));
+      const aStore = await downloadTrack(aTrack, useProxy, "audio", "③ 音频轨", onTick(0.45, 0.15));
       const asize = await aStore.size();
 
       phase("④ 解析分片结构…");
@@ -1620,7 +1632,7 @@
       // 命名用**实际合成的那个档位**，而不是上面输入框里的值：
       // 下拉里选了 720P 却命名成 1080P 会让人以为合错了文件。
       const name = dlName(await ensureTitle(), DL.MUX,
-        qualityLabel(v.quality || (v.height ? String(v.height) : "")), "mp4");
+        qualityLabel(vTrack.quality || (vTrack.height ? String(vTrack.height) : "")), "mp4");
       if (h264OK) {
         $("#muxVideo").classList.remove("hidden");
         $("#muxNoPreview").classList.add("hidden");
@@ -1648,6 +1660,19 @@
     }
   }
 
+  // 链接变了就把"档位属于上一条"这件事说出来。
+  //
+  // 档位列表只在下一次「全部详情」或点混流时才会重取；沉默地留着上一条的
+  // 档位，会让人以为它们属于新链接（真合出来才发现时长不对）。
+  $("#url").addEventListener("input", () => {
+    if (!tracks) return;
+    const t = target();
+    if (!t.err && t.q !== muxKey) {
+      setTrackState("链接已改变：下面列出的档位还是上一条视频的。" +
+        "点「全部详情」重新取，或直接点「下载并混流」（会自动重取）。", true);
+    }
+  });
+
   $("#muxVideo").addEventListener("error", () => {
     const w = $("#muxNoPreview");
     w.classList.remove("hidden");
@@ -1656,17 +1681,29 @@
   });
 
   $("#muxStart").addEventListener("click", start);
-  $("#muxLoad").addEventListener("click", () => { muxKey = ""; loadTracks(); });
 
-  // 代理开关默认跟随服务端是否开了代理；用户改过就记住（存本机浏览器）。
+  // 代理开关：默认跟随服务端是否开了代理，用户改过就记住（存本机浏览器）。
+  //
+  // 注意时序：这个脚本块执行时 /v1/health 还没回来，proxyOn() 仍是默认的
+  // false。所以初始化只负责"恢复用户的选择"，真正的启用/禁用交给
+  // syncProxyBox()，在拿到健康检查之后（applyTracks / start）再同步——
+  // 否则会出现"服务端明明开了代理，复选框却灰着点不动"。
   const PROXY_STORE = "vidlink_mux_proxy";
+  let proxyTouched = false;   // 用户是否亲手改过
+
+  function syncProxyBox() {
+    const box = $("#muxProxy");
+    box.disabled = !proxyOn();
+    if (!proxyTouched) box.checked = proxyOn();
+  }
+
   (function initProxyBox() {
     const box = $("#muxProxy");
     let saved = null;
     try { saved = localStorage.getItem(PROXY_STORE); } catch (_) {}
-    box.checked = saved === null ? proxyOn() : saved === "1";
-    if (!proxyOn()) box.disabled = true;   // 服务端没开，勾了也没用，直接禁掉
+    if (saved !== null) { proxyTouched = true; box.checked = saved === "1"; }
     box.addEventListener("change", () => {
+      proxyTouched = true;
       try { localStorage.setItem(PROXY_STORE, box.checked ? "1" : "0"); } catch (_) {}
     });
   })();
