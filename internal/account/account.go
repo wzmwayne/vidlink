@@ -390,10 +390,20 @@ func (s *Store) Update(key string, p Patch) (Account, error) {
 		}
 		a.Multiplier = *p.Multiplier
 	}
+	// 配额不允许为负：Consume 的检查只保证"扣不穿"，但管理面的
+	// "设为 X" 与 "在现值上加减" 同样能把它写成负数（实测减配额减出过 -99），
+	// 而负余额意味着这个账号此后连一次调用都发不出去，只能靠管理员再改回来。
 	if p.Quota != nil {
+		if *p.Quota < 0 {
+			return Account{}, errors.New("配额不能为负")
+		}
 		a.Quota = *p.Quota
 	}
 	if p.AddQuota != nil {
+		if a.Quota+*p.AddQuota < 0 {
+			return Account{}, fmt.Errorf("当前配额 %.2f，减去 %.2f 会变成负数；"+
+				"要把余额清零就用 quota:0", a.Quota, -*p.AddQuota)
+		}
 		a.Quota += *p.AddQuota
 	}
 	if p.Disabled != nil {

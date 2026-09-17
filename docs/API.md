@@ -580,6 +580,22 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
   白名单"悄悄只生效一半"是最坑人的状态；
 - 补充校验：`url` 必须是 http/https 绝对地址且**不能带用户名密码**（≤4096 字节）；
   `referer` 必须是 http/https 绝对地址；`ua` 会去掉控制字符并限长。
+
+**配额**：代理是唯一不按"端点 × 平台"计费的出口，它按**传输体积**算：
+
+```
+实扣 = 传输体积(MiB) × 1 × 账号倍率          # 不乘平台系数
+```
+
+- 上游声明了长度（`Content-Length`；Range 请求时它就是这一段的长度）→ **先扣后传**：
+  配额不足直接 `429 quota_exhausted`，一个字节都不发，`X-Quota-*` 如实回写；
+- 长度未知（chunked）→ 按账户余额折算字节上限，边传边限，传完按实际字节补扣
+  （这条路径来不及回写 `X-Quota-*`）；
+- `HEAD` 不产生响应体，**不计费**；
+- 提前中断**不退**（按声明长度计费是"这次占用了多少出口带宽"的度量）；
+- 计费精度 0.0001 配额（约 105 字节）；
+- `GET /v1/usage` 的 `proxy` 字段与 `GET /v1/admin/quota` 的 `proxy` 字段都会给出这条口径；
+- 倍率为 `0` 的账号（免费账号）依然是 0 配额，但调用次数照常累计。
 - **默认值跟随运行模式**：免校验模式默认开启（浏览器内混流遇到要求 Referer/UA 的
   CDN 节点时要靠它），账户模式默认关闭；显式写 `VIDLINK_PROXY_ENDPOINT=false` 一律关掉；
 - 账户模式下它需要 Key；免校验模式下它是公开的——**这时它就是一个开放代理，
@@ -802,7 +818,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 |
 | POST | `/v1/batch/links` | Key | 0.75/条，5~20 条，无抖音 |
-| GET | `/v1/proxy?url=` | Key | —（默认关闭） |
+| GET | `/v1/proxy?url=` | Key | 1/MiB × 账号倍率（默认关闭） |
 | GET | `/admin` | 公开（页面壳，数据要管理 Key） | —（需 `VL_WEBUI` 且非 ease） |
 | GET | `/v1/admin/accounts` | 管理 Key | — |
 | POST | `/v1/admin/accounts` | 管理 Key | — |

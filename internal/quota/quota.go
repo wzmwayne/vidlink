@@ -52,6 +52,34 @@ var AllEndpoints = []Endpoint{
 // defaultPlatformKey 是"通用"档的键。表里没列出的平台都走它。
 const defaultPlatformKey core.Platform = ""
 
+// ProxyUnitBytes 是媒体代理的计费单位：1 个配额对应 1 MiB 传输量。
+//
+// 代理**刻意不乘**端点系数与平台系数（docs/配额倍率表.md 有完整说明）：
+//
+//   - 端点系数回答"这个接口提供多少内容"，而代理提供的是字节搬运，
+//     与 info/links/detail 那种"给一份解析结果"不是一回事；
+//   - 平台系数回答"哪家上游更贵"（抖音要签名 + IP 维度限流），
+//     而代理的目标是任意 CDN，平台系数在这里没有对应物。
+//
+// 它的成本只与体积线性相关，所以公式单独一条：
+//
+//	实扣 = 传输体积(MiB) × 1 × 账号倍率
+//
+// 为什么按体积而不是按次：按次会让"下 4K 原片"和"下 10 秒预览"同价，
+// 前者的出口带宽是后者的几百倍。按体积是唯一与真实成本同向的计法。
+const ProxyUnitBytes = 1 << 20
+
+// ProxyCost 计算媒体代理一次传输的配额消耗。
+//
+// 倍率为 0 的账号（免费账号）仍然是 0，与该账号在其他端点上的语义一致：
+// 不扣配额，但调用次数照样累计。
+func ProxyCost(bytes int64, accountMultiplier float64) float64 {
+	if bytes <= 0 || accountMultiplier <= 0 {
+		return 0
+	}
+	return round4(float64(bytes) / float64(ProxyUnitBytes) * accountMultiplier)
+}
+
 // Table 是倍率表。
 //
 // 结构是 map[端点][平台] → 倍率；平台键为 defaultPlatformKey 表示通用档。

@@ -360,3 +360,40 @@ func TestMemoryOnlyStore(t *testing.T) {
 		t.Fatalf("配额 = %v, want 0", got.Quota)
 	}
 }
+
+// TestUpdateRejectsNegativeQuota：配额不能被管理面写成负数。
+//
+// Consume 的检查只保证"扣不穿"，而 `{"add_quota":-200}` 或 `{"quota":-1}`
+// 同样能把余额压到零以下——实测真的减出过 -99，症状是那个账号此后
+// 连一次调用都发不出去（预授权直接 429），只能等管理员再改回来。
+func TestUpdateRejectsNegativeQuota(t *testing.T) {
+	s, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if _, err := s.Create(Account{Key: "vl_t", Quota: 10, Multiplier: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	minus := -20.0
+	if _, err := s.Update("vl_t", Patch{AddQuota: &minus}); err == nil {
+		t.Error("减配额减成负数应报错")
+	}
+	neg := -1.0
+	if _, err := s.Update("vl_t", Patch{Quota: &neg}); err == nil {
+		t.Error("直接把配额设成负数应报错")
+	}
+	if got, _ := s.Get("vl_t"); got.Quota != 10 {
+		t.Errorf("失败的修改不该动账本，得到 %v", got.Quota)
+	}
+
+	// 恰好减到 0 是允许的（那是有含义的状态：配额用完）
+	exact := -10.0
+	if _, err := s.Update("vl_t", Patch{AddQuota: &exact}); err != nil {
+		t.Fatalf("恰好减到 0 应允许：%v", err)
+	}
+	if got, _ := s.Get("vl_t"); got.Quota != 0 {
+		t.Errorf("配额应为 0，得到 %v", got.Quota)
+	}
+}

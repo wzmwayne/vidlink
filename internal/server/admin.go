@@ -74,6 +74,17 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		// 客户端据此可以预判"最少要留多少配额才能调这个端点"。
 		"preauth_max": preauth,
 		"platforms":   s.allRates(),
+		// 代理是唯一不按"端点 × 平台"计费的配额出口，必须单独说明，
+		// 否则管理员核对用量时会以为它漏记了。
+		"proxy": map[string]any{
+			"rate":            "1 配额/MiB",
+			"unit_bytes":      quota.ProxyUnitBytes,
+			"platform_factor": false,
+			"formula":         "实扣 = 传输体积(MiB) × 1 × 账号倍率",
+			"note": "媒体代理按传输体积计费，不乘平台系数（它与上游解析成本无关）。" +
+				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；" +
+				"提前中断不退。",
+		},
 		"note": "系数只影响后续调用，已发生的用量不重算；" +
 			"单个账号的调整请改该账号的 multiplier",
 	})

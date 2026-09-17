@@ -194,6 +194,10 @@ func (s *Server) routes() []routeSpec {
 	}
 
 	if s.cfg.ProxySrv.Enabled {
+		// 注意 endpoint 刻意留空：代理的配额是**按传输体积**在 handler 里
+		// 结算的（quota.ProxyCost），不走"端点 × 平台"系数表。
+		// 留空还有第二个作用——让它避开按 Key 的解析闸门：一次下载会长时间
+		// 占着槽位，串行化会把该账号的解析请求一起堵死。
 		specs = append(specs,
 			routeSpec{method: http.MethodGet, path: "/v1/proxy", handler: s.handleProxy},
 			routeSpec{method: http.MethodHead, path: "/v1/proxy", handler: s.handleProxy})

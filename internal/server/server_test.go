@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1869,3 +1870,191 @@ func TestUIScriptsParse(t *testing.T) {
 		}
 	}
 }
+
+// --- 媒体代理的按体积配额 ---
+
+// TestProxyChargesBySize：代理按传输体积扣配额（1 配额/MiB × 账号倍率）。
+//
+// 这是代理与其它端点的根本区别：解析端点按"端点 × 平台"定价，
+// 而代理搬的是任意 CDN 的字节，成本只与体积线性相关。
+func TestProxyChargesBySize(t *testing.T) {
+	const size = 3 << 20 // 3 MiB
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, size))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	h := env.handler()
+
+	// ① 倍率 1.0：3 MiB → 3 配额
+	w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("代理应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "3" {
+		t.Errorf("X-Quota-Consumed = %q，想要 3", got)
+	}
+	if got := w.Header().Get("X-Quota-Remaining"); got != "97" {
+		t.Errorf("X-Quota-Remaining = %q，想要 97", got)
+	}
+	if got, _ := env.store.Get(env.userKey); got.Quota != 97 || got.Used != 3 || got.Calls != 1 {
+		t.Errorf("账本 = quota %v / used %v / calls %v，想要 97 / 3 / 1", got.Quota, got.Used, got.Calls)
+	}
+
+	// ② 倍率 0.5：同样的 3 MiB → 1.5 配额（账号倍率生效）
+	half := 0.5
+	if _, err := env.store.Update(env.userKey, account.Patch{Multiplier: &half}); err != nil {
+		t.Fatal(err)
+	}
+	w = do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1.5" {
+		t.Errorf("半倍率下 X-Quota-Consumed = %q，想要 1.5", got)
+	}
+	if got, _ := env.store.Get(env.userKey); got.Quota != 95.5 {
+		t.Errorf("配额 = %v，想要 95.5", got.Quota)
+	}
+
+	// ③ 平台系数不参与：换一个"平台"（这里用抖音的解析端点系数 1.1）
+	//    作对照，代理的计价必须与它无关 —— 3 MiB 仍是 1.5（倍率 0.5）。
+	if got := quota.ProxyCost(size, 0.5); got != 1.5 {
+		t.Errorf("quota.ProxyCost(3MiB, 0.5) = %v，想要 1.5", got)
+	}
+	if got := quota.ProxyCost(size, 1.1); got != 3.3 {
+		t.Errorf("quota.ProxyCost 只该乘账号倍率：%v", got)
+	}
+}
+
+// TestProxyRangeChargesOnlyTheRange：Range 请求只按这一段计费。
+//
+// 若拿 Content-Range 里的**总长**去扣，播放器每拖一次进度条就会被按
+// 整部片子收费（实测 1KB 的 seek 会被扣 67 配额）。
+func TestProxyRangeChargesOnlyTheRange(t *testing.T) {
+	const total, chunk = 64 << 20, 1024
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			t.Errorf("Range 没有被透传")
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", chunk-1, total))
+		w.Header().Set("Content-Length", strconv.Itoa(chunk))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, chunk))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	r := httptest.NewRequest(http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), nil)
+	r.Header.Set("X-API-Key", env.userKey)
+	r.Header.Set("Range", "bytes=0-1023")
+	w := httptest.NewRecorder()
+	env.handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("应透传 206，得到 %d", w.Code)
+	}
+	// 1024 字节 ≈ 0.00098 MiB → round4 到 0.001（计费精度到万分之一配额）
+	if got := w.Header().Get("X-Quota-Consumed"); got != "0.001" {
+		t.Errorf("X-Quota-Consumed = %q，想要 0.001（按 1KB 而不是 64MB）", got)
+	}
+	if got, _ := env.store.Get(env.userKey); got.Quota < 99.99 {
+		t.Errorf("配额 = %v，不该按整部片子扣", got.Quota)
+	}
+}
+
+// TestProxyQuotaExhaustedIsRejected：配额不够时**一个字节都不发**。
+func TestProxyQuotaExhaustedIsRejected(t *testing.T) {
+	const size = 4 << 20 // 4 MiB → 4 配额，而账户只剩 1
+	served := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served = true
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, size))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	if _, err := env.store.Update(env.userKey, account.Patch{Quota: floatPtr(1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := do(env.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("配额不足应 429，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if kind, msg, _ := errBody(t, w); kind != "quota_exhausted" || !strings.Contains(msg, "配额不足") {
+		t.Errorf("kind=%q msg=%q", kind, msg)
+	}
+	if strings.Contains(w.Body.String(), "\x00") || w.Body.Len() >= size {
+		t.Error("配额不足时不该发出任何媒体字节")
+	}
+	if got, _ := env.store.Get(env.userKey); got.Quota != 1 {
+		t.Errorf("配额不足时不该扣减，得到 %v", got.Quota)
+	}
+	_ = served
+}
+
+// TestProxyHeadIsNotCharged：HEAD 没有响应体，不计费也不回配额头。
+func TestProxyHeadIsNotCharged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(8<<20))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	w := do(env.handler(), http.MethodHead, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD 应 200，得到 %d", w.Code)
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "" {
+		t.Errorf("HEAD 不该计费，得到 X-Quota-Consumed=%q", got)
+	}
+	if got, _ := env.store.Get(env.userKey); got.Quota != 100 {
+		t.Errorf("HEAD 不该扣配额，得到 %v", got.Quota)
+	}
+}
+
+// TestProxyUnknownLengthChargesActual：上游不给长度（chunked）时，
+// 按实际发出的字节补扣——这是兜底路径，但也不能白送。
+func TestProxyUnknownLengthChargesActual(t *testing.T) {
+	const size = 2 << 20
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 不设 Content-Length：Go 会自动改用 chunked，代理侧拿到 ContentLength=-1
+		buf := make([]byte, 64<<10)
+		for sent := 0; sent < size; sent += len(buf) {
+			if _, err := w.Write(buf); err != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d", w.Code)
+	}
+	if got, _ := env.store.Get(env.userKey); got.Used != 2 {
+		t.Errorf("未知长度时按实际字节扣：used=%v，想要 2", got.Used)
+	}
+}
+
+// TestProxyEaseModeChargesNothing：免校验模式没有账户，代理照常但不计费。
+func TestProxyEaseModeChargesNothing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer upstream.Close()
+
+	env := newEaseEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d", w.Code)
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "" {
+		t.Errorf("免校验模式不该回写配额头，得到 %q", got)
+	}
+}
+
+func floatPtr(f float64) *float64 { return &f }

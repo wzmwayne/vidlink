@@ -568,6 +568,13 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		"calls":      acct.Calls,
 		"multiplier": acct.Multiplier,
 		"rates":      s.allRates(),
+		// 代理按体积计费，与上面的平台系数表不同源，单独给一条
+		"proxy": map[string]any{
+			"rate":            "1 配额/MiB",
+			"unit_bytes":      quota.ProxyUnitBytes,
+			"platform_factor": false,
+			"note":            "媒体代理按传输体积计费：实扣 = 体积(MiB) × 1 × 你的账号倍率",
+		},
 		"limits": map[string]any{
 			"per_key_concurrency": s.gate.Options().PerKey,
 			"global_concurrency":  s.gate.Options().Global,

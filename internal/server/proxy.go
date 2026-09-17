@@ -1,6 +1,8 @@
 package server
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -9,7 +11,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"vidlink/internal/account"
 	"vidlink/internal/core"
+	"vidlink/internal/quota"
 	"vidlink/internal/urlx"
 )
 
@@ -124,6 +128,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// 配额结算**必须在写任何响应头之前**：一来配额不足要在发出字节前就拒绝，
+	// 二来一旦先把上游的 Content-Length 写进响应头，再改写成错误体就会
+	// 让客户端按错误的长度等待（连接被挂住直到超时）。
+	declared := proxyDeclaredBytes(resp)
+	if !s.chargeProxyDeclared(w, r, declared) {
+		return
+	}
+
 	// 透传与播放相关的响应头
 	for _, h := range []string{
 		"Content-Type", "Content-Length", "Content-Range",
@@ -158,20 +170,146 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 上游没声明长度时（chunked）才需要限流：声明了长度的那条路径
+	// 已经按声明值扣过费，多传就等于多送。
 	var src io.Reader = resp.Body
-	// 限制单次代理字节数（防止被用来刷流量）
-	if s.cfg.ProxySrv.MaxBytes > 0 && resp.ContentLength < 0 {
-		src = io.LimitReader(resp.Body, s.cfg.ProxySrv.MaxBytes)
+	if declared <= 0 {
+		limit := s.proxyBudgetBytes(r)
+		if s.cfg.ProxySrv.MaxBytes > 0 {
+			limit = minInt64(limit, s.cfg.ProxySrv.MaxBytes)
+		}
+		src = io.LimitReader(resp.Body, limit)
 	}
 
 	// 32KB 缓冲区：流式转发的吞吐与内存占用的平衡点
 	buf := make([]byte, 32<<10)
-	if _, err := io.CopyBuffer(w, src, buf); err != nil {
+	written, err := io.CopyBuffer(w, src, buf)
+	if err != nil {
 		// 客户端中断是常态（用户拖进度条），不值得记为错误
 		if !isClientGone(err) {
 			s.log.Debug("代理传输中断", "url", target.String(), "err", err)
 		}
 	}
+	// 长度未知的那条路径只能事后按实结算（此时响应体已经发出，
+	// X-Quota-* 来不及写，失败也只能记日志——所以它只是兜底路径）
+	if declared <= 0 {
+		s.chargeProxyActual(r, written)
+	}
+}
+
+// --- 媒体代理的配额计量 ---
+//
+// 公式：实扣 = 传输体积(MiB) × 1 × 账号倍率（quota.ProxyCost）。
+// **不乘平台系数**：代理搬的是任意 CDN 的字节，与"哪家平台解析更贵"无关。
+//
+// 计费时机分两条路径：
+//
+//   - **上游声明了长度**（Content-Length，Range 请求时它就是这一段的长度）：
+//     先扣后传。配额不足时一个字节都不发就回 429，且 X-Quota-* 能如实写进响应。
+//   - **长度未知**（chunked）：按账户余额折算出一个字节上限边传边限，
+//     传完再按实际字节扣。这是兜底，不是主路径。
+//
+// 提前中断（用户拖进度条、客户端断开）**不退**：按声明长度计费是"这次
+// 请求占用了多少出口带宽"的度量，且退配额需要往账本里写补偿记录，
+// 复杂度远大于它解决的问题。
+
+// proxyDeclaredBytes 返回上游声明的本次传输字节数；-1 表示未知。
+func proxyDeclaredBytes(resp *http.Response) int64 {
+	if resp.ContentLength > 0 {
+		// Range 请求时上游回 206，Content-Length 就是这一段的长度，
+		// 正是我们要计费的口径（不能拿 Content-Range 里的**总长**去扣，
+		// 那样一次 1KB 的 seek 会被按整部片子收费）。
+		return resp.ContentLength
+	}
+	return -1
+}
+
+// chargeProxyDeclared 按声明长度结算。返回 false 表示已经写了错误响应。
+func (s *Server) chargeProxyDeclared(w http.ResponseWriter, r *http.Request, declared int64) bool {
+	if declared <= 0 || r.Method == http.MethodHead {
+		return true // 未知长度走到传完再扣；HEAD 没有响应体，不计费
+	}
+	acct, ok := s.proxyAccount(r)
+	if !ok {
+		return true // 免校验模式：没有账户，也就没有配额
+	}
+	units := quota.ProxyCost(declared, acct.Multiplier)
+	rc, err := s.accounts.Consume(acct.Key, units)
+	if err != nil {
+		var insuf account.ErrQuotaExhausted
+		if errors.As(err, &insuf) {
+			writeErrorStatus(w, http.StatusTooManyRequests, "quota_exhausted",
+				fmt.Sprintf("配额不足：本次代理需要 %.2f（%.1f MiB，按 1 配额/MiB × 账号倍率 %.2f），"+
+					"当前剩余 %.2f；配额由管理员分配，请联系管理员调整",
+					insuf.Need, float64(declared)/float64(quota.ProxyUnitBytes),
+					acct.Multiplier, insuf.Have))
+			return false
+		}
+		s.log.Error("代理配额扣减失败", "request_id", requestID(r.Context()),
+			"key", acct.Masked(), "units", units, "err", err)
+		writeError(w, core.E(core.KindInternal, "", "quota", "配额处理失败", err))
+		return false
+	}
+	setQuotaHeaders(w, rc.Units, rc.Quota)
+	return true
+}
+
+// chargeProxyActual 是长度未知时的兜底结算：按实际发出的字节补扣。
+func (s *Server) chargeProxyActual(r *http.Request, written int64) {
+	if written <= 0 {
+		return
+	}
+	acct, ok := s.proxyAccount(r)
+	if !ok {
+		return
+	}
+	units := quota.ProxyCost(written, acct.Multiplier)
+	if units <= 0 {
+		return
+	}
+	if _, err := s.accounts.Consume(acct.Key, units); err != nil {
+		// 字节已经发出去了，只能记账：这是"上游不给长度"这条兜底路径的已知代价
+		s.log.Warn("代理按实际字节补扣未成功（流量已发出）",
+			"request_id", requestID(r.Context()), "key", acct.Masked(),
+			"bytes", written, "units", units, "err", err)
+	}
+}
+
+// proxyAccount 取当前请求的账号；免校验模式或没有账号时返回 false。
+func (s *Server) proxyAccount(r *http.Request) (account.Account, bool) {
+	if s.cfg.IsEase() {
+		return account.Account{}, false
+	}
+	return accountFrom(r.Context())
+}
+
+// proxyBudgetBytes 按账户剩余配额折算出本次最多能传的字节数。
+//
+// 上限存在的意义是防止"上游不给长度 + 配额不足"变成无限免费流量：
+// 余额能付多少就传多少，传完就断。倍率为 0 的免费账号与免校验模式
+// 返回一个足够大的值（它们本来就不计费）。
+func (s *Server) proxyBudgetBytes(r *http.Request) int64 {
+	const noLimit = int64(1) << 62
+	acct, ok := s.proxyAccount(r)
+	if !ok || acct.Multiplier <= 0 {
+		return noLimit
+	}
+	affordable := int64(acct.Quota / acct.Multiplier * float64(quota.ProxyUnitBytes))
+	if affordable < 0 {
+		return 0
+	}
+	// 多给 1 MiB 余量：否则"刚好付得起"的那一次会在最后一字节前被截断
+	if affordable > noLimit-quota.ProxyUnitBytes {
+		return noLimit
+	}
+	return affordable + quota.ProxyUnitBytes
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // proxyHostAllowed 判断目标域名是否放行。
