@@ -51,5 +51,22 @@ ssh user@host 'curl -s http://127.0.0.1:18080/v1/health'
   取消注释并填 token；Cloudflare 后台的 Public Hostname 里
   **Service 填 `http://vidlink:8080`**（同一 compose 网络里的容器名，
   不要填 `127.0.0.1:18080`——那在容器里指向它自己）。
+
+  token 是凭据，两种放法都行：内联进 `compose.yaml` 后 `chmod 600 compose.yaml`
+  （与 vaultwarden 那份写法一致），或写进 `.env` 再用 `${CLOUDFLARED_TOKEN}` 插值。
+  起起来之后看日志确认隧道真的注册上了：
+
+  ```bash
+  docker logs -f <容器名> | grep -E "Registered tunnel connection|Updated to new configuration"
+  ```
+
+  **验证容器间连通性不用装 curl**：镜像自带探针，让一次性容器去拨目标地址即可
+  （`-healthcheck=auto` 会用 `VIDLINK_ADDR` 推导出 URL）：
+
+  ```bash
+  docker run --rm --network <项目名>_default \
+    -e VIDLINK_ADDR=vidlink:8080 vidlink:latest -healthcheck=auto; echo $?
+  ```
+
 - **升级**：本地重新编译 → `scp` 覆盖 `vidlink` → 目标机
   `docker compose up -d --build`。
