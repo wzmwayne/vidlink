@@ -94,7 +94,9 @@ func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 	t.Helper()
 	cfg := &config.Config{
 		AdminKey:          "vl_admin_test", // 管理凭据是配置项，不是账本里的账号
-		RateLimitRPM:      0,               // 默认不限流；测限流的用例自己打开
+		PublicKey:         "vl_public",     // 公共入口：Key 公开、按 IP 每日限额
+		PublicDailyQuota:  100,
+		RateLimitRPM:      0, // 默认不限流；测限流的用例自己打开
 		CORSOrigins:       []string{"*"},
 		Service:           service.DefaultOptions(),
 		Net:               config.NetOptions{Timeout: 5 * time.Second},
@@ -130,6 +132,12 @@ func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 		Key: userKey, Name: "普通用户", Quota: 100, Multiplier: 1,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	// 公共账号：与 main.go 的启动引导一致（服务端不会自己建，由启动流程建）
+	if cfg.PublicKey != "" {
+		if _, _, err := store.EnsurePublic(cfg.PublicKey, "公共账号"); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	g := gate.New(gate.Options{
@@ -2259,5 +2267,209 @@ func TestLedgerUIWiring(t *testing.T) {
 		if !strings.Contains(admin, want) {
 			t.Errorf("管理面板缺少 %q", want)
 		}
+	}
+}
+
+// --- 公共 Key（免费试用） ---
+
+// TestEmptyKeyHintsPublicKey：没带 Key 时要直接告诉对方可以用公共 Key。
+//
+// "缺少 API Key" 会让人以为必须先注册；而这里本来就有一个免注册入口，
+// 把 Key 写进错误信息里是最省事的一次转化。
+func TestEmptyKeyHintsPublicKey(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("无 Key 应 403，得到 %d", w.Code)
+	}
+	_, msg, _ := errBody(t, w)
+	if !strings.Contains(msg, "vl_public") || !strings.Contains(msg, "免费") {
+		t.Errorf("提示里应给出公共 Key 与免费字样，得到 %q", msg)
+	}
+
+	// 关掉公共入口（PublicKey 为空）时，提示回到通用版本
+	off := newTestEnv(t, func(c *config.Config) { c.PublicKey = "" }, defaultStub())
+	w = do(off.handler(), http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	if _, msg, _ := errBody(t, w); strings.Contains(msg, "vl_public") {
+		t.Errorf("未开启公共入口时不该提它：%q", msg)
+	}
+}
+
+// TestPublicKeyUsesPerIPDailyQuota：公共 Key 的额度是"每 IP 每天 100"，
+// 与账本余额无关，且不同 IP 各记各的。
+func TestPublicKeyUsesPerIPDailyQuota(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	// ① 公共 Key 能用：扣的是每 IP 额度，账本余额（0）不参与
+	w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.srv.cfg.PublicKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("公共 Key 应可用，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1" {
+		t.Errorf("X-Quota-Consumed = %q，想要 1", got)
+	}
+	if got := w.Header().Get("X-Quota-Remaining"); got != "99" {
+		t.Errorf("X-Quota-Remaining = %q，想要 99（每 IP 每日 100 扣掉 1）", got)
+	}
+	pub, ok := env.store.Get(env.srv.cfg.PublicKey)
+	if !ok || !pub.PublicAccount {
+		t.Fatal("公共账号应存在且带 public 标记")
+	}
+	if pub.Quota != 0 {
+		t.Errorf("公共账号不该用账本余额，得到 %v", pub.Quota)
+	}
+	if pub.Used != 1 || pub.Calls != 1 {
+		t.Errorf("公共账号的用量与调用次数仍应累计：used=%v calls=%v", pub.Used, pub.Calls)
+	}
+
+	// ② 换一个 IP：额度独立
+	r := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	r.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+	r.RemoteAddr = "203.0.113.9:5555"
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("另一个 IP 应可用，得到 %d", w2.Code)
+	}
+	if got := w2.Header().Get("X-Quota-Remaining"); got != "99" {
+		t.Errorf("新 IP 的剩余额度应重新从 100 开始，得到 %q", got)
+	}
+
+	// ③ 额度用尽 → 429 public_quota_exhausted（同一个 IP 连续调用）
+	r3 := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	r3.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+	r3.RemoteAddr = "198.51.100.7:1111"
+	h.ServeHTTP(httptest.NewRecorder(), r3) // 先花掉 1
+	// 直接把额度打满
+	for i := 0; i < 99; i++ {
+		rr := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+		rr.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+		rr.RemoteAddr = "198.51.100.7:1111"
+		h.ServeHTTP(httptest.NewRecorder(), rr)
+	}
+	rr := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	rr.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+	rr.RemoteAddr = "198.51.100.7:1111"
+	wr := httptest.NewRecorder()
+	h.ServeHTTP(wr, rr)
+	if wr.Code != http.StatusTooManyRequests {
+		t.Fatalf("额度用尽应 429，得到 %d（%s）", wr.Code, wr.Body.String())
+	}
+	if kind, msg, _ := errBody(t, wr); kind != "public_quota_exhausted" ||
+		!strings.Contains(msg, "免费额度") || !strings.Contains(msg, "独立 Key") {
+		t.Errorf("kind=%q msg=%q", kind, msg)
+	}
+}
+
+// TestPublicUsageAndNoLedger：公共 Key 的用量是"本 IP 今天"的口径，且不给账单。
+func TestPublicUsageAndNoLedger(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	w := do(h, http.MethodGet, "/v1/usage", userHdr(env.srv.cfg.PublicKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("公共 Key 查用量应 200，得到 %d", w.Code)
+	}
+	var u map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &u); err != nil {
+		t.Fatal(err)
+	}
+	if u["public"] != true {
+		t.Errorf("usage 应标明 public=true：%v", u["public"])
+	}
+	if _, ok := u["daily"]; !ok {
+		t.Error("usage 应带 daily（本 IP 今日额度）")
+	}
+	if strings.Contains(w.Body.String(), "bill") {
+		t.Error("公共账号不该出现账单字样")
+	}
+
+	// 公共 Key 读账单：403 且说明原因
+	wt := do(h, http.MethodGet, "/v1/ledger", userHdr(env.srv.cfg.PublicKey))
+	if wt.Code != http.StatusForbidden {
+		t.Fatalf("公共 Key 读账单应 403，得到 %d（%s）", wt.Code, wt.Body.String())
+	}
+	if _, msg, _ := errBody(t, wt); !strings.Contains(msg, "独立 Key") {
+		t.Errorf("应提示去申请独立 Key，得到 %q", msg)
+	}
+	// 普通账号照旧能读自己的账单（这条是上一轮做的功能，别被公共 Key 的规则带偏）
+	if wp := do(h, http.MethodGet, "/v1/ledger", userHdr(env.userKey)); wp.Code != http.StatusOK {
+		t.Errorf("普通账号读自己的账单应 200，得到 %d", wp.Code)
+	}
+}
+
+// TestPublicKeyCanUseProxyFromDailyQuota：公共 Key 允许走代理，按体积从每日额度里扣。
+func TestPublicKeyCanUseProxyFromDailyQuota(t *testing.T) {
+	const size = 2 << 20 // 2 MiB → 2 配额
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, size))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL),
+		userHdr(env.srv.cfg.PublicKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("公共 Key 代理应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "2" {
+		t.Errorf("X-Quota-Consumed = %q，想要 2", got)
+	}
+	if got := w.Header().Get("X-Quota-Remaining"); got != "98" {
+		t.Errorf("X-Quota-Remaining = %q，想要 98", got)
+	}
+	if pub, _ := env.store.Get(env.srv.cfg.PublicKey); pub.Used != 2 {
+		t.Errorf("公共账号用量应累计为 2，得到 %v", pub.Used)
+	}
+}
+
+// TestHealthExposesPublicKey：健康检查要告诉页面公共入口怎么用。
+func TestHealthExposesPublicKey(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodGet, "/v1/health", nil)
+	var h map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &h); err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := h["public"].(map[string]any)
+	if !ok {
+		t.Fatalf("health 应带 public 段：%s", w.Body.String())
+	}
+	if pub["key"] != env.srv.cfg.PublicKey || pub["daily_per_ip"] != float64(100) {
+		t.Errorf("public 段内容不对：%v", pub)
+	}
+	// 免校验模式没有账户体系，不该报公共入口
+	ease := newEaseEnv(t, nil, defaultStub())
+	we := do(ease.handler(), http.MethodGet, "/v1/health", nil)
+	if strings.Contains(we.Body.String(), `"public"`) {
+		t.Error("免校验模式不该出现 public 段")
+	}
+}
+
+// TestTipImageIsPublicAndEmbedded：赞赏码是公开静态资源，且页面引用它。
+func TestTipImageIsPublicAndEmbedded(t *testing.T) {
+	if len(tipPNG) == 0 || len(tipPNG) > 200*1024 {
+		t.Fatalf("内嵌的赞赏码大小不合适：%d 字节", len(tipPNG))
+	}
+	env := newTestEnv(t, func(c *config.Config) { c.WebUI = true }, defaultStub())
+	w := do(env.handler(), http.MethodGet, tipPath, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("%s 应公开可访问，得到 %d", tipPath, w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "image/png" {
+		t.Errorf("Content-Type = %q，想要 image/png", ct)
+	}
+	if w.Body.Len() != len(tipPNG) {
+		t.Errorf("返回字节数 = %d，想要 %d", w.Body.Len(), len(tipPNG))
+	}
+	// 页面里要有折叠的赞赏码区块，且不是外链
+	page := string(uiHTML)
+	if !strings.Contains(page, `src="/tip.png"`) || !strings.Contains(page, "赞赏") {
+		t.Error("解析页应有赞赏码区块并引用 /tip.png")
+	}
+	if !strings.Contains(page, `id="tipsec"`) {
+		t.Error("赞赏码应放在默认折叠的 details 里")
 	}
 }

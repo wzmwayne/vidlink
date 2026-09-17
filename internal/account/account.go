@@ -43,6 +43,16 @@ type Account struct {
 	Key  string `json:"key"`
 	Name string `json:"name,omitempty"`
 
+	// PublicAccount 标记这是**公共账号**：Key 是公开的（如 vl_public），谁都能用。
+	//
+	// 因此它的配额不来自账本余额，而是"每 IP 每日限额"（见 internal/publicq）：
+	// 共享余额会被一个人或所有人瞬间用光，对谁都不公平；而"每个 IP 每天
+	// 100 配额"让单点滥用只影响自己。账本只累计它的用量与调用次数用于统计。
+	//
+	// 它**不在 Patch 里**：公共账号由服务启动时按配置创建，
+	// 不允许把已经发出去的普通 Key 改成公共入口——那等于把客户凭据公开。
+	PublicAccount bool `json:"public,omitempty"`
+
 	// 注意：账号**没有**任何权限位。
 	//
 	// 管理面（/v1/admin/*）的凭据是一个独立于账本的固定 Key
@@ -106,6 +116,11 @@ func Mask(key string) string {
 func (a Account) Public() Account {
 	c := a
 	c.ID = Handle(a.Key)
+	// 公共账号的 Key 是**公开信息**（页面与错误提示里都会写出来），
+	// 掩码成 ********* 既不必要，也让管理员认不出这是哪个入口。
+	if a.PublicAccount {
+		return c
+	}
 	c.Key = a.Masked()
 	return c
 }
@@ -313,6 +328,62 @@ func (s *Store) Get(key string) (Account, bool) {
 		return Account{}, false
 	}
 	return *a, true
+}
+
+// EnsurePublic 确保公共账号存在，并返回它。
+//
+// 已存在时**什么都不改**（含 Disabled）：管理员把公共账号停用就是
+// "关闭公共入口"的开关，启动时重新启用会让这个开关形同虚设。
+func (s *Store) EnsurePublic(key, name string) (Account, bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return Account{}, false, errors.New("公共 Key 不能为空")
+	}
+	if a, ok := s.Get(key); ok {
+		return a, false, nil
+	}
+	a, err := s.Create(Account{
+		Key: key, Name: name, PublicAccount: true, Quota: 0, Multiplier: 1,
+		Note: "公共账号：Key 公开，配额按「每 IP 每日限额」，不使用账本余额",
+	})
+	if err != nil {
+		if errors.Is(err, ErrDuplicate) { // 并发下别人刚建好
+			if got, ok := s.Get(key); ok {
+				return got, false, nil
+			}
+		}
+		return Account{}, false, err
+	}
+	return a, true, nil
+}
+
+// RecordUsage 只记账、不扣配额。
+//
+// 公共账号需要它：配额由每 IP 每日限额控制（publicq），但用量与调用次数
+// 仍要累计，否则管理面完全看不到公共入口被用了多少。
+func (s *Store) RecordUsage(key string, units float64, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.accounts[key]
+	if !ok {
+		return ErrNotFound
+	}
+	before := *a
+	a.Used += units
+	a.Calls++
+	a.UpdatedAt = s.now()
+
+	e := Entry{
+		Time: a.UpdatedAt, Type: EntryConsume, Key: a.Key, ID: a.ID, Name: a.Name,
+		Units: -units, Balance: a.Quota, Used: a.Used, Calls: a.Calls, Detail: detail,
+	}
+	s.ledgerAdd(e)
+	if err := s.appendAccount(a, &e); err != nil {
+		*a = before
+		s.ledgerDrop()
+		return err
+	}
+	return nil
 }
 
 // Resolve 按"账号 Key 或公开句柄"取账号，供管理面使用。

@@ -13,7 +13,11 @@ services:
     user: "1000:1000"          # = wayne；./vl-data 属于他，scratch 里没法 chown
     volumes:
       - ./vl-data:/app/data
+      # scratch 镜像里没有时区数据库；把宿主机的挂进来，TZ 才会生效
+      # （Go 用 TZ 找 zoneinfo，找不到就退回 UTC，"每天"会按 UTC 零点切）
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
     environment:
+      - TZ=Asia/Shanghai                                  # 决定"每天"的分界（每日额度按本地零点重置）
       - VL_EASE=false                                     # 账户模式：Key + 配额 + 管理面板
       - VL_WEBUI=true                                     # / 解析页，/admin 管理面板
       - VIDLINK_PROXY_ENDPOINT=true                       # 媒体代理（前端混流/代理下载要用）

@@ -103,6 +103,14 @@ func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
 		writeError(w, core.Errf(core.KindForbidden, "", "auth", "缺少 API Key"))
 		return
 	}
+	// 公共账号没有"自己的账单"：Key 是共享的，流水混着所有 IP 的调用，
+	// 给出去既是隐私问题也没有对账意义。要账单就申请独立 Key。
+	if acct.PublicAccount {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth",
+			"公共 Key 不提供账单（它是共享账号，流水混有所有访客的调用）；"+
+				"需要账单请向管理员申请独立 Key"))
+		return
+	}
 	q, err := ledgerParseQuery(r)
 	if err != nil {
 		writeError(w, core.BadInput("", "%v", err))

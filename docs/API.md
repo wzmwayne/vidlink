@@ -415,6 +415,24 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 - `cost` 已包含账号倍率，与响应头 `X-Quota-Consumed` 一致；
 - 抖音在**解析前**就被挡掉（纯本地平台判定），不浪费上游请求与 IP 风控额度。
 
+### 3.8a 公共 Key（`vl_public`）· 免注册试用
+
+账户模式下服务会自动准备一个**公共账号**（`VIDLINK_PUBLIC_KEY`，默认 `vl_public`）：
+
+| 项 | 行为 |
+| --- | --- |
+| 额度 | **每 IP 每日 100 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），与其它端点同一套系数；代理按 1 配额/MiB |
+| 响应头 | `X-Quota-Consumed` 是本次消耗，`X-Quota-Remaining` 是**本 IP 今天**的剩余 |
+| 超限 | `429 public_quota_exhausted`，message 提示申请独立 Key；额度按本地时区零点重置 |
+| 没带 Key | `403` 的 message 里直接给出公共 Key 与每日额度 |
+| `/v1/usage` | 返回 `public: true` + `daily: {daily_limit, used_today, remaining, resets_at}`；`quota` 字段是"本 IP 今日剩余"（兼容） |
+| `/v1/ledger` | **403**（共享账号，流水混有所有访客）；普通账号不受影响，仍能读自己的账单 |
+| 并发 | 按 IP 串行（不是按 Key） |
+| 记账 | 用量与调用次数累计到公共账号，管理面可见；`/v1/admin/stats` 的 `public.ips_today` 是今天用过的 IP 数 |
+| 关闭 | 管理面板停用公共账号，或把 `VIDLINK_PUBLIC_KEY` 留空 |
+
+> 每 IP 的日计数**只在内存里**，重启清零——持久化要每次计费写一次 SD 卡，对这个量级不值得。
+
 ### 3.8b 配额流水 `GET /v1/ledger` · 需 Key · 不消耗配额
 
 返回**自己账号**的流水（新的在前）：使用、管理员增加/减少/设置、建号/删号。
@@ -877,6 +895,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | --- | --- | --- | --- |
 | GET | `/v1/version` | 公开 | — |
 | GET | `/v1/health` | 公开 | — |
+| GET | `/tip.png` | 公开 | —（赞赏码静态图） |
 | GET | `/v1/platforms` | 公开 | — |
 | GET | `/healthz` | 公开 | — |
 | GET | `/readyz` | 公开 | — |

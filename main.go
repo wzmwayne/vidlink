@@ -135,6 +135,25 @@ func run() error {
 		// 固定的服务级 Key（VIDLINK_ADMIN_KEY，可写在 .vl 里），与账本无关。
 		// 因此这里只剩一件事：没配就说清楚管理接口不可用，
 		// 而不是留一个看起来能用、实际每次都 403 的管理面让人自己猜。
+		// 公共账号：Key 是公开的（默认 vl_public），配额按每 IP 每日限额。
+		// 已存在时不动它，所以"停用公共账号"是管理员手里的开关。
+		if cfg.PublicKey != "" {
+			pa, created, err := accounts.EnsurePublic(cfg.PublicKey, "公共账号")
+			if err != nil {
+				return fmt.Errorf("创建公共账号失败: %w", err)
+			}
+			if created {
+				logger.Info("已创建公共账号（Key 公开，按 IP 每日限额）",
+					"key", pa.Key, "daily_quota_per_ip", cfg.PublicDailyQuota)
+			} else if pa.Disabled {
+				logger.Warn("公共账号已存在但处于停用状态：公共入口当前关闭",
+					"key", pa.Key)
+			} else {
+				logger.Info("公共账号已存在", "key", pa.Key,
+					"daily_quota_per_ip", cfg.PublicDailyQuota)
+			}
+		}
+
 		if strings.TrimSpace(cfg.AdminKey) == "" {
 			logger.Warn("未配置管理 Key（VIDLINK_ADMIN_KEY）：/v1/admin/* 将始终返回 403；" +
 				"账号只能通过账本文件直接维护")

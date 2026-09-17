@@ -15,6 +15,16 @@ info:
 
     鉴权三选一：`X-API-Key` 头 / `Authorization: Bearer` / `?key=`。失败一律 403 且不区分原因。
 
+    ## 公共 Key（vl_public）
+
+    账户模式下服务会准备一个公共账号（`VIDLINK_PUBLIC_KEY`，默认 `vl_public`）：
+    Key 公开、免注册，额度是**每 IP 每日 100 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），
+    与其他端点同一套系数（代理按 1 配额/MiB）。超限返回 `429 public_quota_exhausted`，
+    额度按本地时区零点重置。没带 Key 时 `403` 的 message 里会直接给出这个 Key。
+    公共 Key 调 `/v1/ledger` 一律 `403`（共享账号，流水混有所有访客）；
+    `/v1/usage` 对公共 Key 返回的是"本 IP 今天"的额度（`public: true` + `daily`）。
+    每 IP 的日计数只在内存里，重启清零。并发闸门对公共 Key 按 **IP** 生效。
+
     ## 媒体代理的配额
 
     `/v1/proxy` 是唯一**按传输体积**计费的出口：`实扣 = 体积(MiB) × 1 × 账号倍率`，
@@ -624,6 +634,10 @@ components:
 
     Usage:
       type: object
+      description: |
+        普通账号：quota/used/calls 是自己的账本数据。
+        公共 Key（vl_public）：public=true，quota 是"本 IP 今日剩余"，
+        daily 给出每日额度与重置时间，且不提供账单。
       properties:
         name: { type: string }
         unit: { type: string, example: 配额 }

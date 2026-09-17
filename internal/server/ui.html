@@ -96,6 +96,12 @@
   .pill.ok { color: var(--ok); border-color: #1d3d24; }
   .pill.bad { color: var(--err); border-color: #4a1f1f; }
   footer { color: var(--dim); font-size: 12px; text-align: center; padding: 8px 0 28px; }
+  details.tip { margin: 0 0 14px; }
+  details.tip > summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  .tipbox { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .tipbox img { width: 240px; max-width: 60vw; border-radius: 10px; border: 1px solid var(--line); }
+  .tipbox .grow { flex: 1 1 240px; }
+  .pubnote { border-color: #1d3d24; background: #16211a; color: #86d99a; }
   footer code { font-family: var(--mono); }
   @media (max-width: 560px) { .kv { grid-template-columns: 84px 1fr; } }
 </style>
@@ -137,6 +143,14 @@
       </div>
     </div>
     <div class="hint" id="keyState">未填写 Key，解析与用量查询都会被拒（403）。</div>
+    <div class="row hidden" id="pubrow" style="margin-top:8px">
+      <div class="col">
+        <div class="hint" id="pubHint" style="margin:0"></div>
+      </div>
+      <div class="col narrow">
+        <button id="pubUse" style="width:100%">使用公共 Key</button>
+      </div>
+    </div>
   </section>
 
   <!-- 账户与用量 -->
@@ -299,6 +313,17 @@
     <div id="plats"></div>
   </section>
 
+  <details class="tip" id="tipsec">
+    <summary>赞赏支持（完全自愿，不影响任何功能与配额）</summary>
+    <div class="tipbox">
+      <img src="/tip.png" alt="赞赏码" loading="lazy" width="240" height="240">
+      <div class="grow hint" style="margin:0">
+        如果这个应用帮到了你，可以请我喝杯奶茶。<br>
+        它是自愿的：<b>不解锁任何功能，也不改变配额</b>——公共入口与配额规则对所有人都一样。
+      </div>
+    </div>
+  </details>
+
   <footer>
     接口文档 <code>docs/API.md</code> · 服务端 <code>vidlink</code> ·
     本页由服务端内嵌，无任何外部资源
@@ -322,6 +347,7 @@
   let myMultiplier = null;
   const KEY_STORE = "vidlink_key";
   let APIKEY = "";               // 账户模式下的 Key；免校验模式恒为空
+  let PUBLIC = null;             // /v1/health 告知的公共 Key（没有公共入口时为 null）
 
   // ---------- 基础设施 ----------
 
@@ -918,8 +944,28 @@
       add("累计调用", d.calls + " 次");
       add("账号倍率", d.multiplier);
       if (typeof d.multiplier === "number") myMultiplier = d.multiplier;
+
       add("单位", d.unit);
       box.appendChild(dl);
+
+      // 公共账号：额度是"本 IP 今天"的，也没有个人账单。
+      // 说明放在常规字段之后，别把"账号/配额"那几行挤到下面去。
+      if (d.public === true) {
+        $("#ledgersec").classList.add("hidden");
+        if (d.daily) {
+          const dl2 = el("dl", "kv");
+          dl2.appendChild(el("dt", null, "本 IP 今日剩余"));
+          dl2.appendChild(el("dd", null, fmtNum(d.daily.remaining) + " / " + fmtNum(d.daily.daily_limit)));
+          dl2.appendChild(el("dt", null, "本 IP 今日已用"));
+          dl2.appendChild(el("dd", null, fmtNum(d.daily.used)));
+          dl2.appendChild(el("dt", null, "重置时间"));
+          dl2.appendChild(el("dd", null, String(d.daily.resets_at || "").replace("T", " ").slice(0, 19)));
+          box.appendChild(dl2);
+        }
+        const note = el("div", "warnbox pubnote", d.note || "公共账号不提供账单。");
+        note.style.marginTop = "8px";
+        box.appendChild(note);
+      }
       if (d.limits) {
         const L = d.limits;
         box.appendChild(el("h2", null, "限制"));
@@ -1097,6 +1143,13 @@
         }
       }
       if (h.body && h.body.version) $("#verTag").textContent = "v" + h.body.version;
+      // 公共入口：Key 为空时最有用——不注册也能试
+      if (h.body && h.body.public && h.body.public.key) {
+        PUBLIC = h.body.public;
+        $("#pubHint").textContent = "没有 Key？用公共 Key " + PUBLIC.key +
+          " 免费试用（每 IP 每日 " + PUBLIC.daily_per_ip + " 配额）。";
+        if (webuiMode === "account") $("#pubrow").classList.remove("hidden");
+      }
       // 媒体代理是否开启由健康检查直接告知，避免额外发一次注定 404 的探测请求
       proxyEnabled = !!(h.body && h.body.proxy);
       $("#hdr").textContent = proxyEnabled ? "媒体代理：开启" : "媒体代理：关闭";
@@ -1157,6 +1210,11 @@
   });
 
   $("#keySave").addEventListener("click", () => applyKey($("#apikey").value, { save: true }));
+  $("#pubUse").addEventListener("click", () => {
+    if (!PUBLIC) return;
+    $("#apikey").value = PUBLIC.key;
+    applyKey(PUBLIC.key, { save: true });
+  });
   $("#apikey").addEventListener("keydown", (e) => {
     if (e.key === "Enter") applyKey($("#apikey").value, { save: true });
   });

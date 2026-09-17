@@ -16,6 +16,7 @@ import (
 
 	"vidlink/internal/core"
 	"vidlink/internal/deps"
+	"vidlink/internal/publicq"
 	"vidlink/internal/service"
 )
 
@@ -69,6 +70,23 @@ type Config struct {
 	//
 	// 轮换就是改这个值再重启，账本里不需要同步任何东西。
 	AdminKey string
+
+	// PublicKey 是**公共账号**的 Key（默认 vl_public），留空表示不提供公共入口。
+	//
+	// 公共账号的 Key 是公开的，谁都能用，所以它的配额不来自账本余额，
+	// 而是"每 IP 每日限额"（见 PublicDailyQuota）。它是引流/试用的入口：
+	// 不注册也能跑通一次完整解析，用完了要么等明天，要么找管理员要独立 Key。
+	//
+	// 服务启动时按这个值确保账号存在；已存在时**不动它**——管理员把公共账号
+	// 停用就是"关闭公共入口"的开关（见 account.EnsurePublic）。
+	PublicKey string
+
+	// PublicDailyQuota 是公共账号每个 IP 每天的配额（默认 100）。
+	//
+	// 口径与其他端点一致：info 0.5 / links 1.0 / detail 1.2 /
+	// batch 0.75 每条 / 代理 1 配额每 MiB。也就是默认每天能取约 100 条直链，
+	// 或约 100 MB 代理流量。
+	PublicDailyQuota float64
 
 	// RateLimitRPM 是每 IP 每分钟请求上限；<=0 表示不限。
 	RateLimitRPM int
@@ -273,6 +291,8 @@ func Load() (*Config, error) {
 		// 与媒体代理同样的思路：默认值跟随模式，显式设置优先。
 		WebUI:              envBool("VL_WEBUI", ease),
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
+		PublicKey:          env("VIDLINK_PUBLIC_KEY", "vl_public"),
+		PublicDailyQuota:   envFloat("VIDLINK_PUBLIC_DAILY_QUOTA", publicq.DefaultDaily),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
 		Proxy:              env("VIDLINK_PROXY", ""),

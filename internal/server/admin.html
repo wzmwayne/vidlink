@@ -400,6 +400,10 @@
       rejected_key_busy: "因同 Key 并发被拒", rejected_queue_full: "因队列满被拒",
       timed_out: "排队超时",
     });
+    if (d.public) {
+      box.appendChild(el("h3", null, "公共入口（每 IP 每日限额）"));
+      kvInto(box, d.public, { daily_limit: "每 IP 每日配额", ips_today: "今天用过的 IP 数" });
+    }
     box.appendChild(el("h3", null, "流量"));
     kvInto(box, d.traffic, { requests: "累计请求", errors: "累计错误", uptime_sec: "运行秒数" });
     box.appendChild(el("h3", null, "缓存"));
@@ -425,7 +429,8 @@
     const hd = el("div", "acct-hd");
     hd.appendChild(el("b", null, a.name || "(未命名)"));
     hd.appendChild(el("span", "pill " + (a.disabled ? "bad" : "ok"), a.disabled ? "已停用" : "启用中"));
-    if (a.multiplier === 0) hd.appendChild(el("span", "pill warn", "不扣配额"));
+    if (a.public) hd.appendChild(el("span", "pill warn", "公共账号"));
+    if (a.multiplier === 0 && !a.public) hd.appendChild(el("span", "pill warn", "不扣配额"));
     hd.appendChild(el("span", "mono", a.id || ""));
     hd.appendChild(el("span", "mono", a.key || ""));
     card.appendChild(hd);
@@ -438,6 +443,29 @@
       dl.appendChild(el("dd", null, String(v)));
     });
     card.appendChild(dl);
+
+    // 公共账号的额度来自"每 IP 每日限额"，改它的余额/倍率没有意义——
+    // 与其给出无效的控件，不如直接说明它的口径。
+    if (a.public) {
+      const note = el("div", "warnbox");
+      note.style.cssText = "border:1px solid #4a3a12;border-radius:8px;padding:8px;margin-top:8px";
+      note.textContent = "公共账号：Key 公开（" + (a.key || "") + "），配额按「每 IP 每日限额」计算，" +
+        "不使用这里的余额；停用它即关闭公共入口。用量与调用次数照常累计，供你观察免费流量。";
+      card.appendChild(note);
+      const only = el("div", "btns");
+      const mk2 = (label, act, cls) => {
+        const b = el("button", cls, label);
+        b.dataset.act = act; b.dataset.id = a.id; return b;
+      };
+      only.appendChild(mk2(a.disabled ? "启用" : "停用", "toggle"));
+      only.appendChild(mk2("详情", "get"));
+      only.appendChild(mk2("流水", "ledger"));
+      const del = mk2("删除", "del", "danger");
+      del.style.marginLeft = "auto";
+      only.appendChild(del);
+      card.appendChild(only);
+      return card;
+    }
 
     const btns = el("div", "btns");
     const amount = el("input", "numin");
@@ -769,6 +797,24 @@
       prow("计算式", P.formula);
       prow("说明", P.note);
       box.appendChild(pdl);
+    }
+
+    if (d.public) {
+      box.appendChild(el("h3", null, "公共入口"));
+      const qdl = el("dl", "kv");
+      const P = d.public;
+      const qrow = (k, v) => {
+        if (v === undefined || v === null || v === "") return;
+        qdl.appendChild(el("dt", null, k));
+        qdl.appendChild(el("dd", null, String(v)));
+      };
+      qrow("是否开启", P.enabled ? "是" : "否");
+      qrow("Key", P.key);
+      qrow("每 IP 每日配额", P.daily_per_ip);
+      qrow("账本口径", P.accounting);
+      qrow("提供账单", P.ledger_available === false ? "否（共享账号）" : String(P.ledger_available));
+      qrow("说明", P.note);
+      box.appendChild(qdl);
     }
 
     if (d.platforms) {

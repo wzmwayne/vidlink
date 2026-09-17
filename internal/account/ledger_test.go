@@ -208,3 +208,57 @@ func TestLedgerDeleteKeepsHistory(t *testing.T) {
 		t.Error("删号流水应有说明")
 	}
 }
+
+// TestPublicAccount：公共账号的创建与"只记账不扣配额"。
+func TestPublicAccount(t *testing.T) {
+	s, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// 创建：带 public 标记、余额为 0（配额由每 IP 日限额管，与余额无关）
+	a, created, err := s.EnsurePublic("vl_public", "公共账号")
+	if err != nil || !created {
+		t.Fatalf("应新建公共账号：created=%v err=%v", created, err)
+	}
+	if !a.PublicAccount || a.Quota != 0 {
+		t.Errorf("公共账号应 public 且余额 0：%+v", a)
+	}
+	// 幂等：再次调用不改动任何东西
+	a2, created2, err := s.EnsurePublic("vl_public", "公共账号")
+	if err != nil || created2 || a2.Key != a.Key {
+		t.Errorf("重复调用应无副作用：created=%v err=%v", created2, err)
+	}
+	// 管理员停用后，启动流程不能再把它悄悄启用（那是关闭公共入口的开关）
+	off := true
+	if _, err := s.Update("vl_public", Patch{Disabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	a3, _, err := s.EnsurePublic("vl_public", "公共账号")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a3.Disabled {
+		t.Error("EnsurePublic 不该重新启用被停用的公共账号")
+	}
+
+	// RecordUsage：只加用量与次数，不动余额；流水照记
+	if err := s.RecordUsage("vl_public", 1.5, "public@1.2.3.4 links/bilibili ×1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get("vl_public")
+	if got.Used != 1.5 || got.Calls != 1 || got.Quota != 0 {
+		t.Errorf("用量/次数/余额 = %v/%v/%v，想要 1.5/1/0", got.Used, got.Calls, got.Quota)
+	}
+	entries, totals := s.Ledger(LedgerQuery{Key: "vl_public", Limit: 10})
+	if len(entries) != 3 || entries[0].Type != EntryConsume || entries[0].Units != -1.5 {
+		t.Fatalf("流水应有一条 consume：%+v", entries)
+	}
+	if !strings.Contains(entries[0].Detail, "public@1.2.3.4") {
+		t.Errorf("公共账号的流水说明应带来源 IP：%q", entries[0].Detail)
+	}
+	if totals[EntryConsume].Count != 1 {
+		t.Errorf("汇总计数 = %d", totals[EntryConsume].Count)
+	}
+}

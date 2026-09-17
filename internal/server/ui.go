@@ -3,6 +3,7 @@ package server
 import (
 	_ "embed"
 	"net/http"
+	"strconv"
 )
 
 // adminUIPath 是管理面板的路径。
@@ -25,6 +26,34 @@ const adminUIPath = "/admin"
 //
 //go:embed ui.html
 var uiHTML []byte
+
+// tipPNG 是解析页底部的赞赏码。
+//
+// 内嵌而不是外链：页面承诺"零外部资源"，而赞赏码外链到图床既泄露
+// 访问者行为，图床挂了还会变成裂图。17 KB（420×420、64 色调色板）
+// 对二进制体积的影响可以忽略。
+//
+//go:embed tip.png
+var tipPNG []byte
+
+// tipPath 是赞赏码的路由。
+const tipPath = "/tip.png"
+
+// handleTip 返回内嵌的赞赏码图片。
+//
+// 与两个页面一样是公开资源：它是静态图片，不含任何数据。缓存一天——
+// 页面本身不缓存（会随二进制更新），但图片内容基本不变。
+func (s *Server) handleTip(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", "image/png")
+	h.Set("Cache-Control", "public, max-age=86400")
+	h.Set("Content-Length", strconv.Itoa(len(tipPNG)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = w.Write(tipPNG)
+}
 
 // adminHTML 是管理面板（/admin）。
 //

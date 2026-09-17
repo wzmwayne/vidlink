@@ -14,6 +14,7 @@ import (
 	"vidlink/internal/account"
 	"vidlink/internal/core"
 	"vidlink/internal/gate"
+	"vidlink/internal/publicq"
 	"vidlink/internal/quota"
 	"vidlink/internal/tier"
 	"vidlink/internal/urlx"
@@ -88,9 +89,15 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 		key := resolveKey(r)
 		if key == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vidlink"`)
-			writeError(w, core.Errf(core.KindForbidden, "", "auth",
-				"缺少 API Key：请通过 X-API-Key 头、Authorization: Bearer 头，"+
-					"或 ?key= 查询参数提供"))
+			// 没带 Key 的人最可能就是想试一下：直接把公共 Key 告诉他。
+			// 这比"缺少 API Key"有用得多——后者会让人以为必须先注册。
+			msg := "缺少 API Key：请通过 X-API-Key 头、Authorization: Bearer 头，" +
+				"或 ?key= 查询参数提供"
+			if k := strings.TrimSpace(s.cfg.PublicKey); k != "" {
+				msg += fmt.Sprintf("；也可以直接用公共 Key「%s」免费试用（每 IP 每日 %.4g 配额）",
+					k, s.publicQ.Limit())
+			}
+			writeError(w, core.Errf(core.KindForbidden, "", "auth", "%s", msg))
 			return
 		}
 		acct, ok := s.accounts.Get(key)
@@ -113,7 +120,13 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 		// 媒体代理同理：一次下载会长时间占着这个槽位。
 		ep, metered := s.endpointOf(specs, r.Method, r.URL.Path)
 		if metered {
-			release, err := s.gate.AcquireKey(acct.Key)
+			// 公共账号的闸门必须按 **IP** 而不是按 Key：Key 是共享的，
+			// 按 Key 串行会让"同时只有一个免费用户能解析"——那显然不对。
+			gateKey := acct.Key
+			if acct.PublicAccount {
+				gateKey = "pub:" + s.clientIP(r)
+			}
+			release, err := s.gate.AcquireKey(gateKey)
 			if err != nil {
 				w.Header().Set("Retry-After", "1")
 				writeErrorStatus(w, http.StatusTooManyRequests, "concurrency_limited",
@@ -129,7 +142,14 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 		// 真正扣减配额按实际平台结算，所以这里只是上限检查，不会多扣。
 		if metered {
 			if need := s.quotaTable.MaxCoefficient(ep); need > 0 {
-				if err := s.accounts.Check(acct.Key, need); err != nil {
+				var err error
+				if acct.PublicAccount {
+					// 公共账号的额度在每 IP 的日限额里，与账本余额无关
+					err = s.publicQ.Check(s.clientIP(r), need)
+				} else {
+					err = s.accounts.Check(acct.Key, need)
+				}
+				if err != nil {
 					s.writeQuotaError(w, err)
 					return
 				}
@@ -226,9 +246,38 @@ func (s *Server) endpointOf(specs []routeSpec, method, path string) (quota.Endpo
 // 刻意**不用 402 Payment Required**：那个状态码字面上就是"需要付款"，
 // 会把一个"配额用完"的内部状态描述成商业交易。配额是一种用量上限，
 // 与金额无关，用 429 语义准确得多（配额只是用量额度）。
+// consumePublicQuota 结算一次公共账号的消耗：扣每 IP 日额度 + 只记账不扣余额。
+//
+// 记账（RecordUsage）是为了让管理面能看到"公共入口被用了多少"；
+// 不扣账本余额是因为公共 Key 共享，余额对它没有意义。
+func (s *Server) consumePublicQuota(w http.ResponseWriter, r *http.Request,
+	acct account.Account, units float64, detail string) {
+	ip := s.clientIP(r)
+	snap, err := s.publicQ.Charge(ip, units)
+	if err != nil {
+		// 预授权已经查过额度，这里是并发下的兜底
+		s.log.Warn("公共账号额度扣减失败", "request_id", requestID(r.Context()),
+			"ip", ip, "units", units, "err", err)
+		s.writeQuotaError(w, err)
+		return
+	}
+	if err := s.accounts.RecordUsage(acct.Key, units, "public@"+ip+" "+detail); err != nil {
+		// 记账失败不影响已经成功的解析：额度已经扣了，用户不该因此拿不到结果
+		s.log.Error("公共账号用量记账失败", "request_id", requestID(r.Context()),
+			"key", acct.Masked(), "units", units, "err", err)
+	}
+	setQuotaHeaders(w, units, snap.Remaining)
+}
+
 func (s *Server) writeQuotaError(w http.ResponseWriter, err error) {
 	var insuf account.ErrQuotaExhausted
+	var pub publicq.ErrDailyExhausted
 	switch {
+	case errors.As(err, &pub):
+		writeErrorStatus(w, http.StatusTooManyRequests, "public_quota_exhausted",
+			fmt.Sprintf("今日免费额度已用完（每 IP 每日 %.4g）：本次需要 %.2f，剩余 %.2f；"+
+				"额度过期后自动重置。需要更多配额请向管理员申请独立 Key。",
+				s.publicQ.Limit(), pub.Need, pub.Have))
 	case errors.As(err, &insuf):
 		writeErrorStatus(w, http.StatusTooManyRequests, "quota_exhausted",
 			fmt.Sprintf("配额已用尽：本次最多需要 %.2f，当前剩余 %.2f；"+
@@ -265,8 +314,14 @@ func (s *Server) consumeQuota(w http.ResponseWriter, r *http.Request, v *core.Vi
 		return
 	}
 	// 流水里的说明要能让人看懂"这一笔花在哪"：端点 + 平台 + 条数
-	rc, err := s.accounts.Consume(acct.Key, units,
-		fmt.Sprintf("%s/%s ×%d", ep, v.Platform, items))
+	detail := fmt.Sprintf("%s/%s ×%d", ep, v.Platform, items)
+
+	if acct.PublicAccount {
+		s.consumePublicQuota(w, r, acct, units, detail)
+		return
+	}
+
+	rc, err := s.accounts.Consume(acct.Key, units, detail)
 	if err != nil {
 		s.log.Error("配额计量失败：扣减未成功", "request_id", requestID(r.Context()),
 			"key", acct.Masked(), "units", units, "err", err)
@@ -504,7 +559,10 @@ func (s *Server) handleBatchLinks(w http.ResponseWriter, r *http.Request) {
 	resp.Cost = total
 
 	if !ease && total > 0 {
-		if rc, err := s.accounts.Consume(acct.Key, total,
+		if acct.PublicAccount {
+			s.consumePublicQuota(w, r, acct, total,
+				fmt.Sprintf("batch_links ×%d", resp.Success))
+		} else if rc, err := s.accounts.Consume(acct.Key, total,
 			fmt.Sprintf("batch_links ×%d", resp.Success)); err == nil {
 			setQuotaHeaders(w, rc.Units, rc.Quota)
 		} else {
@@ -563,6 +621,39 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, core.Errf(core.KindForbidden, "", "auth", "缺少 API Key"))
 		return
 	}
+	// 公共账号：没有"我的余额"这回事，返回的是**这个 IP 今天**的额度。
+	// 形状保持兼容（quota/used 仍在），客户端不必为它写特例；
+	// 另外给一个 public 段说明口径。
+	if acct.PublicAccount {
+		snap := s.publicQ.Snapshot(s.clientIP(r))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"name":       acct.Name,
+			"public":     true,
+			"unit":       unitName,
+			"quota":      snap.Remaining, // 兼容字段：本 IP 今日剩余
+			"used":       snap.Used,
+			"calls":      acct.Calls, // 公共账号的累计调用（所有人合计）
+			"multiplier": acct.Multiplier,
+			"daily":      snap,
+			"rates":      s.allRates(),
+			"proxy": map[string]any{
+				"rate":            "1 配额/MiB",
+				"unit_bytes":      quota.ProxyUnitBytes,
+				"platform_factor": false,
+				"note":            "媒体代理按传输体积计费：实扣 = 体积(MiB) × 1 × 账号倍率",
+			},
+			"limits": map[string]any{
+				"per_key_concurrency": s.gate.Options().PerKey,
+				"global_concurrency":  s.gate.Options().Global,
+				"batch_min":           s.cfg.BatchMin,
+				"batch_max":           s.cfg.BatchMax,
+			},
+			"note": "公共账号：Key 公开，额度按「每 IP 每日」计算，不使用账本余额；" +
+				"不提供账单，需要账单请申请独立 Key",
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":       acct.Name,
 		"unit":       unitName,

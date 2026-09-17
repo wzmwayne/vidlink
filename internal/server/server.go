@@ -24,6 +24,7 @@ import (
 	"vidlink/internal/config"
 	"vidlink/internal/core"
 	"vidlink/internal/gate"
+	"vidlink/internal/publicq"
 	"vidlink/internal/quota"
 	"vidlink/internal/service"
 )
@@ -70,6 +71,10 @@ type Server struct {
 	// 系数是**数据**而不是散落的常量——调整运营策略时只改这一处。
 	quotaTable *quota.Table
 
+	// publicQ 是公共账号（Key 公开）的"每 IP 每日配额"。
+	// 公共 Key 是共享的，账本余额对它没有意义，所以单独一套口径。
+	publicQ *publicq.Limiter
+
 	startedAt time.Time
 	reqCount  atomic.Int64
 	errCount  atomic.Int64
@@ -84,7 +89,9 @@ type Deps struct {
 	Accounts   *account.Store
 	Gate       *gate.Gate
 	QuotaTable *quota.Table
-	Logger     *slog.Logger
+	// PublicQ 可注入（测试用它固定"今天"）；nil 时按配置新建。
+	PublicQ *publicq.Limiter
+	Logger  *slog.Logger
 }
 
 // New 构造服务器。
@@ -98,6 +105,9 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	}
 	if d.Gate == nil {
 		d.Gate = gate.New(gate.DefaultOptions())
+	}
+	if d.PublicQ == nil {
+		d.PublicQ = publicq.New(cfg.PublicDailyQuota, nil)
 	}
 	if cfg.IsEase() && d.Accounts != nil {
 		// 免校验模式下账户体系不存在；传进来也用不到，直接忽略以免误用。
@@ -130,6 +140,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		accounts:   d.Accounts,
 		gate:       d.Gate,
 		quotaTable: d.QuotaTable,
+		publicQ:    d.PublicQ,
 		startedAt:  time.Now(),
 	}, nil
 }
@@ -192,6 +203,12 @@ func (s *Server) routes() []routeSpec {
 			routeSpec{method: http.MethodGet, path: "/v1/ledger", handler: s.handleLedger})
 		// ---- 管理面：用固定管理 Key（未配置时每条都恒 403）----
 		specs = append(specs, s.adminRoutes()...)
+	}
+
+	// 赞赏码：页面在用，所以只在 WebUI 打开时注册；公开（静态图片，无数据）。
+	if s.cfg.WebUI {
+		specs = append(specs, routeSpec{method: http.MethodGet, path: tipPath, public: true,
+			handler: s.handleTip})
 	}
 
 	if s.cfg.ProxySrv.Enabled {
@@ -600,7 +617,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"status":      "ok",
 		"version":     Version,
 		"api_version": apiVersion,
@@ -611,7 +628,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"proxy":       s.cfg.ProxySrv.Enabled,
 		"webui":       s.cfg.WebUI,
 		"cache":       s.svc.CacheStats(),
-	})
+	}
+	// 公共入口：Key 是公开信息，页面据此给出"免注册试用"的入口；
+	// 免校验模式下整条概念不存在，不报。
+	if !s.cfg.IsEase() && strings.TrimSpace(s.cfg.PublicKey) != "" {
+		body["public"] = map[string]any{
+			"key":          s.cfg.PublicKey,
+			"daily_per_ip": s.publicQ.Limit(),
+			"ledger":       false,
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleParse 解析单个链接：GET /api/v1/parse?url=<分享文案或链接>

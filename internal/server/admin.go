@@ -87,6 +87,16 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；" +
 				"提前中断不退。",
 		},
+		// 公共入口：Key 公开，配额按每 IP 每日限额，与账本余额无关
+		"public": map[string]any{
+			"enabled":          s.cfg.PublicKey != "",
+			"key":              s.cfg.PublicKey,
+			"daily_per_ip":     s.publicQ.Limit(),
+			"accounting":       "不使用账本余额；用量与调用次数仍累计到公共账号上",
+			"ledger_available": false,
+			"note": "公共 Key 是共享的，额度按「每 IP 每日」计算，过期自动重置；" +
+				"停用公共账号即可关闭公共入口",
+		},
 		"note": "系数只影响后续调用，已发生的用量不重算；" +
 			"单个账号的调整请改该账号的 multiplier",
 	})
@@ -273,6 +283,7 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": s.accounts.Stats(),
 		"gate":     s.gate.Stats(),
+		"public":   s.publicQ.Stats(),
 		"cache":    s.svc.CacheStats(),
 		"traffic": map[string]any{
 			"requests":   s.reqCount.Load(),

@@ -220,7 +220,8 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | 方法 | 路径 | 鉴权 | 配额 | 说明 |
 |---|---|---|---|---|
 | GET | `/v1/version` | 公开 | — | 服务与接口版本 |
-| GET | `/v1/health` | 公开 | — | 健康检查 + 缓存统计 |
+| GET | `/v1/health` | 公开 | — | 健康检查 + 缓存统计（含公共入口信息） |
+| GET | `/tip.png` | 公开 | — | 解析页底部的赞赏码（内嵌静态图，`VL_WEBUI` 开启时才有） |
 | GET | `/v1/platforms` | 公开 | — | 平台清单与各端点系数 |
 | GET | `/healthz` | 公开 | — | **存活**探针（进程活着即 200） |
 | GET | `/readyz` | 公开 | — | **就绪**探针（无可用平台时 503） |
@@ -351,6 +352,29 @@ SHA-256 截断，不可反推、重启不变、只能用来定位账号。它的
 账本是 **append-only JSONL**（每次写一条完整快照 + `fsync`），重启自动回放，
 损坏的行会被跳过而不是让服务起不来。默认路径 `data/accounts.jsonl`。
 
+### 公共入口（免费试用）
+
+服务在账户模式下会自动准备一个**公共账号**（默认 Key `vl_public`）：
+Key 是公开的，谁都能用，所以它的配额不来自账本余额，而是**每 IP 每日限额**（默认 100）：
+
+```bash
+# 不注册也能跑通一次完整解析
+curl -H "X-API-Key: vl_public" \
+  'http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1GJxx'
+# 响应头：X-Quota-Consumed: 1   X-Quota-Remaining: 99   ← 剩余是"本 IP 今天"的
+```
+
+| 行为 | 说明 |
+| --- | --- |
+| 额度口径 | **每 IP 每日 100 配额**，与其他端点同一套系数（info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条 / 代理 1 配额每 MiB）；即每天约 100 条直链或 100 MB 代理流量 |
+| 用完了 | `429 public_quota_exhausted`，提示去申请独立 Key；额度跨天自动重置（本地时区零点） |
+| 没带 Key | `403` 的 message 里**直接给出公共 Key**，而不是一句"缺少 API Key" |
+| 账单 | 公共 Key **读不了** `/v1/ledger`（共享账号，流水混有所有访客），`/v1/usage` 返回的是"本 IP 今天"的额度 |
+| 并发 | 闸门按 **IP** 而不是按 Key（Key 共享，按 Key 串行会让同时只有一个免费用户能用） |
+| 统计 | 用量与调用次数仍累计到公共账号上，管理面板能看到免费流量；`/v1/admin/stats` 有 `public.ips_today` |
+| 关闭它 | 在管理面板把公共账号**停用**即可（`EnsurePublic` 不会重新启用）；`VIDLINK_PUBLIC_KEY=` 留空则完全不创建 |
+| 记账持久性 | 每 IP 的日计数**只在内存里**，重启即清零（持久化意味着每次计费写一次 SD 卡，不值得） |
+
 ### 配额流水（账单）
 
 余额与累计用量只能回答"现在剩多少"，回答不了"这笔是怎么来的"。流水补上后者：
@@ -463,6 +487,8 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VL_WEBUI` | 跟随模式（ease `true` / 账户 `false`） | 根路径是否返回**图形化页面**；显式设置两个方向都有效 |
 | `VIDLINK_ADDR` | `:8080` | 监听地址 |
 | `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
+| `VIDLINK_PUBLIC_KEY` | `vl_public` | 公共账号的 Key（公开、免注册试用）；**留空 = 不提供公共入口** |
+| `VIDLINK_PUBLIC_DAILY_QUOTA` | `100` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
 | `VIDLINK_RATE_LIMIT_RPM` | `120` | 每 IP 每分钟请求上限；`0` = 不限 |
 | `VIDLINK_PER_KEY_CONCURRENCY` | `1` | 同一个 Key 的同时请求数 |
