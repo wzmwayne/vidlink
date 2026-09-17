@@ -120,12 +120,31 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// accountView 是管理面的账号形状：账号本身 + 派生出来的可读字段。
+//
+// 派生字段（如 can_check_in）不入账本，只在这里算：写进结构体就得考虑
+// 它与 daily_grant 的一致性，而它本来就只是"从属性推出来的一个布尔"。
+type accountView struct {
+	account.Account
+	// CanCheckIn 表示这个账号当前是否开放每日签到。
+	CanCheckIn bool `json:"can_check_in"`
+}
+
+func accountViewOf(a account.Account) accountView {
+	return accountView{Account: a, CanCheckIn: a.DailyGrant > 0 && !a.Disabled}
+}
+
 func (s *Server) handleAdminListAccounts(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
+	list := s.accounts.List()
+	views := make([]accountView, 0, len(list))
+	for _, a := range list {
+		views = append(views, accountViewOf(a))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts": s.accounts.List(),
+		"accounts": views,
 		"stats":    s.accounts.Stats(),
 	})
 }
@@ -204,7 +223,7 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 
 	// 明文 Key 只在**创建这一次**返回。此后所有接口都只回掩码，
 	// 避免 Key 出现在日志、浏览器历史和运维截屏里。
-	resp := map[string]any{"account": a}
+	resp := map[string]any{"account": accountViewOf(a)}
 	if generated {
 		resp["key"] = a.Key
 		resp["notice"] = "请立即保存这个 Key，它只会出现这一次"
@@ -223,7 +242,9 @@ func (s *Server) handleAdminGetAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	// Public() 掩码 Key：明文只在创建时返回一次，
 	// 否则 Key 会出现在浏览器历史、代理日志、运维截屏里。
-	writeJSON(w, http.StatusOK, map[string]any{"account": a.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account": accountViewOf(a.Public()),
+	})
 }
 
 // patchAccountRequest 是局部修改。所有字段用指针以区分"没提"与"设为零"。
@@ -273,7 +294,9 @@ func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request)
 		writeError(w, core.BadInput("", "%v", err))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"account": a.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account": accountViewOf(a.Public()),
+	})
 }
 
 func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request) {

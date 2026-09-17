@@ -449,9 +449,16 @@
       dl.appendChild(el("dt", null, label));
       dl.appendChild(el("dd", null, String(v)));
     });
+    // 可否签到：接口直接给了 can_check_in，面板不必自己从 daily_grant 推
+    dl.appendChild(el("dt", null, "可否签到"));
+    const cd = el("dd");
+    cd.appendChild(el("span", "pill " + (a.can_check_in ? "ok" : ""),
+      a.can_check_in ? "可签到" : "未开放"));
+    if (a.disabled && a.daily_grant) cd.appendChild(el("span", null, "（账号已停用）"));
+    dl.appendChild(cd);
     const g = grantText(a);
     if (g) {
-      dl.appendChild(el("dt", null, "每日签到"));
+      dl.appendChild(el("dt", null, "签到规则"));
       dl.appendChild(el("dd", null, g));
     }
     card.appendChild(dl);

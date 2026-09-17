@@ -950,8 +950,8 @@
       add("单位", d.unit);
       box.appendChild(dl);
 
-      // 每日签到：显示额度、今天签没签，并按状态调整按钮
-      if (d.checkin) {
+      // 每日签到：接口始终给这一段，enabled 表示这个账号能不能签
+      if (d.checkin && d.checkin.enabled) {
         add("每日签到", "+" + d.checkin.daily + (d.checkin.cap ? "，上限 " + d.checkin.cap : "（不封顶）"));
         add("签到状态", d.checkin.checked_in_today
           ? ("今天已签到" + (d.checkin.last_checkin_day ? "（" + d.checkin.last_checkin_day + "）" : ""))
@@ -964,7 +964,10 @@
           : ("领取 +" + d.checkin.daily + " 配额（每天一次）");
         cb.textContent = d.checkin.checked_in_today ? "今日已签到" : "每日签到领配额";
       } else {
-        $("#checkinBtn").classList.add("hidden");
+        const cb = $("#checkinBtn");
+        cb.classList.add("hidden");
+        cb.disabled = false;
+        $("#checkinStatus").textContent = "";
       }
 
       // 公共账号：额度是"本 IP 今天"的，也没有个人账单。

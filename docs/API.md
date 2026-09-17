@@ -460,8 +460,16 @@ curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
 | 公共 Key | `403`（它的额度是每 IP 每日自动给的，与账本余额无关） |
 | 账号停用 | `403` |
 
-`GET /v1/usage` 的 `checkin` 段给出 `daily` / `cap` / `checked_in_today` /
-`last_checkin_day` / `endpoint` / `formula`，页面据此决定按钮状态。
+**签到是主动的**：服务不会在每天第一次调用时自动补额，也不会因为解析或
+读接口"顺手"加配额——加配额只发生在 `POST /v1/checkin`。
+
+`GET /v1/usage` 里 `checkin` 段**始终存在**（哪怕不能签），字段：
+`enabled`（**可否签到**，这是客户端该看的字段）、`daily`、`cap`、
+`checked_in_today`、`last_checkin_day`、`endpoint`、`formula`。
+用"字段不存在"表示不能签会让客户端只能猜，所以宁可多一个布尔。
+
+管理面的账号视图带派生的 `can_check_in`（= `daily_grant > 0` 且未停用），
+面板据此显示「可签到 / 未开放」。
 
 ### 3.8b 配额流水 `GET /v1/ledger` · 需 Key · 不消耗配额
 
@@ -545,7 +553,8 @@ curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
 #### `POST /v1/admin/accounts`
 
 ```json
-{"name": "新账号", "quota": 100, "multiplier": 1.0, "note": "备注"}
+{"name": "新账号", "quota": 100, "multiplier": 1.0,
+ "daily_grant": 25, "grant_cap": 200, "note": "备注"}
 ```
 
 请求体里出现未知字段（例如老接口的 `admin`）会返回 `400`，而不是被静默忽略。
@@ -584,6 +593,8 @@ curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
 | 给某账号减半 | `{"multiplier": 0.5}` |
 | 内部账号不扣配额 | `{"multiplier": 0}` |
 | 停用 | `{"disabled": true}` |
+| 开放每日签到（每天可领 25，余额上限 200） | `{"daily_grant": 25, "grant_cap": 200}` |
+| 关闭每日签到 | `{"daily_grant": 0}` |
 
 #### `DELETE /v1/admin/accounts/{key}`
 

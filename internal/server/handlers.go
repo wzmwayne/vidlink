@@ -680,17 +680,20 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			"batch_max":           s.cfg.BatchMax,
 		},
 	}
-	// 每日签到：把口径与"今天签没签"一并给出，页面据此决定按钮状态
-	if acct.DailyGrant > 0 {
-		usage["checkin"] = map[string]any{
-			"enabled":          true,
-			"daily":            acct.DailyGrant,
-			"cap":              acct.GrantCap, // 0 = 不封顶
-			"checked_in_today": acct.GrantDay == account.DayKey(time.Now()),
-			"last_checkin_day": acct.GrantDay,
-			"endpoint":         "POST /v1/checkin",
-			"formula":          "余额 = min(余额 + 每日签到额度, 停止增加界限)，每天一次",
-		}
+	// 每日签到：**始终**给出这一段，用 enabled 表明这个账号能不能签。
+	//
+	// 用"字段不存在"表示"不能签"会让客户端只能靠猜：拿到 0 也不知道是
+	// 没开放还是额度恰好为 0。宁可多一个布尔。
+	usage["checkin"] = map[string]any{
+		"enabled":          acct.DailyGrant > 0,
+		"daily":            acct.DailyGrant,
+		"cap":              acct.GrantCap, // 0 = 不封顶
+		"checked_in_today": acct.DailyGrant > 0 && acct.GrantDay == account.DayKey(time.Now()),
+		"last_checkin_day": acct.GrantDay,
+		"endpoint":         "POST /v1/checkin",
+		"formula":          "余额 = min(余额 + 每日签到额度, 停止增加界限)，每天一次",
+		"note": "签到是**主动**的：服务不会在每天第一次调用时自动补额，" +
+			"只有调 /v1/checkin 才会加",
 	}
 	writeJSON(w, http.StatusOK, usage)
 }

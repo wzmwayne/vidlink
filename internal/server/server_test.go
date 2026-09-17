@@ -2596,3 +2596,112 @@ func TestEaseModeHidesCheckIn(t *testing.T) {
 }
 
 func ptrStr(s string) *string { return &s }
+
+// TestCheckInIsNeverAutomatic：**只有签到会加配额**。
+//
+// 上一版曾做成"每天第一次调用时自动补额"，这条用例把它钉死：
+// 普通解析、代理、用量查询都不会动 GrantDay，也不会多给配额——
+// 加配额只发生在 POST /v1/checkin。
+func TestCheckInIsNeverAutomatic(t *testing.T) {
+	grant, cap := 25.0, 100.0
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	if _, err := env.store.Update(env.userKey, account.Patch{
+		Quota: floatPtr(0), DailyGrant: &grant, GrantCap: &cap,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 余额 0：普通解析应该 429（预授权拦下），而不是"先自动补额再放行"
+	w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("余额 0 且未签到时解析应 429，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if a, _ := env.store.Get(env.userKey); a.Quota != 0 || a.GrantDay != "" {
+		t.Fatalf("没签到就不该加配额：quota=%v grant_day=%q", a.Quota, a.GrantDay)
+	}
+
+	// 用量查询、账单、代理也不会触发补额
+	do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	do(h, http.MethodGet, "/v1/ledger", userHdr(env.userKey))
+	if a, _ := env.store.Get(env.userKey); a.Quota != 0 || a.GrantDay != "" {
+		t.Fatalf("读接口不该加配额：quota=%v grant_day=%q", a.Quota, a.GrantDay)
+	}
+
+	// 签到之后余额才有了，随后解析才走得通
+	if w := do(h, http.MethodPost, "/v1/checkin", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("签到应 200，得到 %d", w.Code)
+	}
+	if a, _ := env.store.Get(env.userKey); a.Quota != 25 || a.GrantDay == "" {
+		t.Fatalf("签到后应有 25 配额与签到日期：%+v", a)
+	}
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("签到后解析应 200，得到 %d", w.Code)
+	}
+	// 解析只扣 1，不会因为"今天第一次用"再多给
+	if a, _ := env.store.Get(env.userKey); a.Quota != 24 {
+		t.Errorf("解析后余额应为 24，得到 %v", a.Quota)
+	}
+}
+
+// TestUsageAlwaysReportsCheckInAvailability：账号信息接口必须明确"可否签到"。
+func TestUsageAlwaysReportsCheckInAvailability(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	// ① 未开放签到：checkin.enabled = false（而不是没有这个字段）
+	w := do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	var u map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &u); err != nil {
+		t.Fatal(err)
+	}
+	ci, ok := u["checkin"].(map[string]any)
+	if !ok {
+		t.Fatalf("无论如何都要有 checkin 段：%s", w.Body.String())
+	}
+	if ci["enabled"] != false {
+		t.Errorf("未开放签到时应 enabled=false，得到 %v", ci["enabled"])
+	}
+
+	// ② 开放签到：enabled=true，并带今天签没签
+	// 余额要低于界限，否则签到会正确地返回 at_cap（那是另一条用例）
+	grant, cap := 25.0, 100.0
+	if _, err := env.store.Update(env.userKey, account.Patch{
+		Quota: floatPtr(50), DailyGrant: &grant, GrantCap: &cap,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w = do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	if err := json.Unmarshal(w.Body.Bytes(), &u); err != nil {
+		t.Fatal(err)
+	}
+	ci, _ = u["checkin"].(map[string]any)
+	if ci["enabled"] != true || ci["daily"] != 25.0 || ci["cap"] != 100.0 {
+		t.Errorf("checkin 段内容不对：%v", ci)
+	}
+	if ci["checked_in_today"] != false {
+		t.Errorf("还没签到，checked_in_today 应为 false：%v", ci)
+	}
+	// 签一次之后 usage 要反映出来
+	do(h, http.MethodPost, "/v1/checkin", userHdr(env.userKey))
+	w = do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	_ = json.Unmarshal(w.Body.Bytes(), &u)
+	ci, _ = u["checkin"].(map[string]any)
+	if ci["checked_in_today"] != true {
+		t.Errorf("签到后 checked_in_today 应为 true：%v", ci)
+	}
+
+	// ③ 管理面：账号视图直接给 can_check_in
+	aw := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey))
+	if !strings.Contains(aw.Body.String(), `"can_check_in":true`) {
+		t.Errorf("管理账号视图应带 can_check_in：%s", aw.Body.String())
+	}
+	off := true
+	if _, err := env.store.Update(env.userKey, account.Patch{Disabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	aw = do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey))
+	if !strings.Contains(aw.Body.String(), `"can_check_in":false`) {
+		t.Errorf("停用账号的 can_check_in 应为 false：%s", aw.Body.String())
+	}
+}
