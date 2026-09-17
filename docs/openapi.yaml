@@ -2,7 +2,7 @@ openapi: 3.0.3
 
 info:
   title: vidlink API
-  version: "0.87.0"
+  version: "0.88.0"
   description: |
     多平台视频解析 API：输入分享链接或平台内容 ID，返回平台已发布的直链。
     支持抖音、哔哩哔哩、快手、小红书。人读版本见 API.md，系数见 配额倍率表.md。
@@ -14,6 +14,18 @@ info:
     浏览器直接 `<video src>` 可能 403：请带上 `Links.headers`，或启用 `/v1/proxy`（默认关闭）。
 
     鉴权三选一：`X-API-Key` 头 / `Authorization: Bearer` / `?key=`。失败一律 403 且不区分原因。
+
+    ## 管理面（/v1/admin/*）
+
+    管理凭据是**一个固定的 Key**（环境变量或 .vl 里的 `VIDLINK_ADMIN_KEY`），
+    不是账本里的账号、也不是账号上的权限位：账号 Key 一律进不了管理面（403），
+    管理 Key 也不能用来解析（它不在账本里）。**没有配置这个 Key 时，
+    每条 /v1/admin/* 都恒返回 403**（message 里会点名该配置项）。
+    账号路径参数 `{key}` 可以是明文 Key，也可以是账号的公开句柄 `id`（`acc_…`，
+    Key 的 SHA-256 截断），后者让管理面板不必接触明文 Key。
+
+    `VL_WEBUI=true` 时还提供两个自带页面：`/`（解析页）与 `/admin`（管理面板，
+    填管理 Key 后所有请求自动带上）。页面本身是公开的壳，数据一律要凭据。
 
     ## 免校验模式（VL_EASE=true）
 
@@ -32,7 +44,7 @@ tags:
   - { name: 元信息, description: 公开端点 }
   - { name: 账号, description: 账号自查（需 Key） }
   - { name: 计量, description: 按配额计量（需 Key） }
-  - { name: 管理, description: 管理面（需管理员 Key） }
+  - { name: 管理, description: 管理面（需固定管理 Key：VIDLINK_ADMIN_KEY） }
   - { name: 运维, description: 探针与可选代理 }
 
 paths:
@@ -256,7 +268,7 @@ paths:
       - name: key
         in: path
         required: true
-        description: 账号的明文 Key
+        description: 账号的明文 Key，或列表返回的公开句柄 id（acc_…）
         schema: { type: string }
     get:
       tags: [管理]
@@ -274,7 +286,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
     patch:
       tags: [管理]
-      summary: 修改账号（配额 / 倍率 / 停用 / 管理员）
+      summary: 修改账号（配额 / 倍率 / 停用）
       operationId: adminPatchAccount
       requestBody:
         required: true
@@ -294,7 +306,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
     delete:
       tags: [管理]
-      summary: 删除账号（不能删除自己）
+      summary: 删除账号（管理 Key 不在账本里，删谁都不影响管理面）
       operationId: adminDeleteAccount
       responses:
         "200":
@@ -699,11 +711,12 @@ components:
 
     Account:
       type: object
+      description: 账号**没有任何权限位**：管理权限属于固定的管理 Key，不属于账号
       properties:
+        id: { type: string, description: "公开句柄 acc_…（Key 的 SHA-256 截断，可用于路径参数）" }
         key: { type: string, description: 掩码后的 Key（仅创建时返回明文） }
         name: { type: string }
         note: { type: string }
-        admin: { type: boolean }
         quota: { type: number, description: 剩余可用配额 }
         used: { type: number }
         calls: { type: integer }
@@ -741,7 +754,6 @@ components:
         name: { type: string }
         quota: { type: number, description: 初始配额 }
         multiplier: { type: number, default: 1, description: "缺省 1.0；0 表示不扣配额，是有含义的取值" }
-        admin: { type: boolean, default: false }
         note: { type: string }
 
     PatchAccountRequest:
@@ -754,7 +766,6 @@ components:
         add_quota: { type: number, description: 在现有剩余配额上加减 }
         multiplier: { type: number }
         disabled: { type: boolean }
-        admin: { type: boolean }
 
     QuotaTable:
       type: object

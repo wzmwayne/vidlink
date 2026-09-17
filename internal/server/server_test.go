@@ -88,7 +88,8 @@ type testEnv struct {
 func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extractor) *testEnv {
 	t.Helper()
 	cfg := &config.Config{
-		RateLimitRPM:      0, // 默认不限流；测限流的用例自己打开
+		AdminKey:          "vl_admin_test", // 管理凭据是配置项，不是账本里的账号
+		RateLimitRPM:      0,               // 默认不限流；测限流的用例自己打开
 		CORSOrigins:       []string{"*"},
 		Service:           service.DefaultOptions(),
 		Net:               config.NetOptions{Timeout: 5 * time.Second},
@@ -116,11 +117,9 @@ func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	adminKey, userKey := "vl_admin_test", "vl_user_test"
-	if _, err := store.Create(account.Account{
-		Key: adminKey, Name: "管理员", Admin: true, Quota: 1e9, Multiplier: 1,
-	}); err != nil {
-		t.Fatal(err)
+	adminKey, userKey := cfg.AdminKey, "vl_user_test"
+	if userKey == adminKey {
+		t.Fatal("测试前提：管理 Key 与账号 Key 必须是两个不同的值")
 	}
 	if _, err := store.Create(account.Account{
 		Key: userKey, Name: "普通用户", Quota: 100, Multiplier: 1,
@@ -597,7 +596,7 @@ func TestPerKeyConcurrencyIsEnforced(t *testing.T) {
 	// 不同的 Key 不受影响
 	done2 := make(chan struct{})
 	go func() {
-		do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/3", userHdr(env.adminKey))
+		do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/3", userHdr(env.userKey))
 		close(done2)
 	}()
 	time.Sleep(80 * time.Millisecond)
@@ -628,7 +627,7 @@ func TestGlobalGateOverloadIsUnavailable(t *testing.T) {
 	}()
 	time.Sleep(80 * time.Millisecond) // 等它占住唯一的全局槽位
 
-	w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/2", userHdr(env.adminKey))
+	w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/2", userHdr(env.userKey))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("过载应 503，得到 %d（%s）", w.Code, w.Body.String())
 	}
@@ -738,19 +737,80 @@ func TestBatchChargesOnlySuccess(t *testing.T) {
 
 // --- 管理面 ---
 
-func TestAdminRequiresAdminFlag(t *testing.T) {
+// TestAdminKeyIsFixedAndSeparateFromAccounts 锁住"管理是一个固定 Key，
+// 不是账号也不是权限"这套语义：
+//
+//   - 配置了 VIDLINK_ADMIN_KEY → 只有这个 Key 能进管理面；
+//   - 没配置 → 管理接口恒失败（403），而不是退回"某个账号是管理员"；
+//   - 账号永远拿不到管理权（提升不了），管理 Key 也不是账号（不能解析）。
+func TestAdminKeyIsFixedAndSeparateFromAccounts(t *testing.T) {
 	env := newTestEnv(t, nil, defaultStub())
 	h := env.handler()
+
 	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.userKey)); w.Code != http.StatusForbidden {
 		t.Fatalf("普通账号访问管理端点应 403，得到 %d", w.Code)
 	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts", nil); w.Code != http.StatusForbidden {
+		t.Fatalf("不带 Key 访问管理端点应 403，得到 %d", w.Code)
+	}
 	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey)); w.Code != http.StatusOK {
-		t.Fatalf("管理员应 200，得到 %d（%s）", w.Code, w.Body.String())
+		t.Fatalf("管理 Key 应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+
+	// 管理 Key 不是账号：账本里查不到它，也调不动计量端点与用量查询。
+	if _, ok := env.store.Get(env.adminKey); ok {
+		t.Error("管理 Key 不应被当成账本里的账号")
+	}
+	for _, path := range []string{"/v1/usage", "/v1/links?url=stub.test/v/1"} {
+		if w := do(h, http.MethodGet, path, userHdr(env.adminKey)); w.Code != http.StatusForbidden {
+			t.Errorf("管理 Key 访问 %s 应 403（它不是账号），得到 %d", path, w.Code)
+		}
+	}
+
+	// 没配管理 Key：管理面整体恒失败，并明确告知原因（不是 404 装作不存在）。
+	off := newTestEnv(t, func(c *config.Config) { c.AdminKey = "" }, defaultStub())
+	wo := do(off.handler(), http.MethodGet, "/v1/admin/accounts", userHdr(off.userKey))
+	if wo.Code != http.StatusForbidden {
+		t.Fatalf("未配置管理 Key 时应 403，得到 %d", wo.Code)
+	}
+	if _, msg, _ := errBody(t, wo); !strings.Contains(msg, "VIDLINK_ADMIN_KEY") {
+		t.Errorf("错误信息应指出配置项，得到 %q", msg)
+	}
+	// 空白字符不算"配置了"
+	blank := newTestEnv(t, func(c *config.Config) { c.AdminKey = "   " }, defaultStub())
+	if w := do(blank.handler(), http.MethodGet, "/v1/admin/accounts", userHdr(blank.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("管理 Key 为空白时应 403，得到 %d", w.Code)
 	}
 }
 
-// TestAdminCanAdjustQuotaAndMultiplier 是本次需求的核心：
-// 管理员能调整**其他账号**的配额与折扣系数（促销、友情）。
+// TestAccountsHaveNoAdminField：账号结构里没有权限位。
+//
+// 老接口的 `{"admin":true}` 必须**报错**而不是静默忽略——静默忽略会让
+// 调用方以为"已经提升成管理员了"，然后对着一个永远 403 的 Key 排查半天。
+func TestAccountsHaveNoAdminField(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	for _, probe := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/admin/accounts", `{"name":"想当管理员的账号","admin":true}`},
+		{http.MethodPatch, "/v1/admin/accounts/" + env.userKey, `{"admin":true}`},
+	} {
+		w := doJSON(h, probe.method, probe.path, probe.body, userHdr(env.adminKey))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s %s 带 admin 字段应 400，得到 %d（%s）",
+				probe.method, probe.path, w.Code, w.Body.String())
+		}
+	}
+
+	// 列表里也不能出现 admin 字段
+	w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey))
+	if strings.Contains(w.Body.String(), `"admin"`) {
+		t.Errorf("账号视图里不该有 admin 字段：%s", w.Body.String())
+	}
+}
+
+// TestAdminCanAdjustQuotaAndMultiplier 是管理面的核心用例：
+// 管理 Key 能调整**其他账号**的配额与账号倍率。
 func TestAdminCanAdjustQuotaAndMultiplier(t *testing.T) {
 	env := newTestEnv(t, nil, defaultStub())
 	h := env.handler()
@@ -765,14 +825,14 @@ func TestAdminCanAdjustQuotaAndMultiplier(t *testing.T) {
 		t.Fatalf("配额应 100+500=600，得到 %v", got.Quota)
 	}
 
-	// 设折扣系数（促销五折）
+	// 设账号倍率（减半）
 	w = doJSON(h, http.MethodPatch, "/v1/admin/accounts/"+env.userKey,
 		`{"multiplier":0.5}`, userHdr(env.adminKey))
 	if w.Code != http.StatusOK {
-		t.Fatalf("调整系数应 200，得到 %d", w.Code)
+		t.Fatalf("调整倍率应 200，得到 %d", w.Code)
 	}
 	if got, _ := env.store.Get(env.userKey); got.Multiplier != 0.5 {
-		t.Fatalf("系数应为 0.5，得到 %v", got.Multiplier)
+		t.Fatalf("倍率应为 0.5，得到 %v", got.Multiplier)
 	}
 
 	// 直接设配额
@@ -786,18 +846,64 @@ func TestAdminCanAdjustQuotaAndMultiplier(t *testing.T) {
 	}
 }
 
-// TestAdminCanPromoteToAdmin：管理员能调整别人的管理员标记。
-func TestAdminCanPromoteToAdmin(t *testing.T) {
+// TestAdminCanAddressAccountByHandle：管理面用**句柄**寻址账号。
+//
+// 这是管理面板能工作的前提：列表只回掩码 Key（明文只在创建时出现一次），
+// 所以面板只能拿句柄去改配额/停用/删除。句柄由 Key 派生，
+// 拿不到 Key 也冒充不了账号。
+func TestAdminCanAddressAccountByHandle(t *testing.T) {
 	env := newTestEnv(t, nil, defaultStub())
 	h := env.handler()
 
-	w := doJSON(h, http.MethodPatch, "/v1/admin/accounts/"+env.userKey,
-		`{"admin":true}`, userHdr(env.adminKey))
-	if w.Code != http.StatusOK {
-		t.Fatalf("提升管理员应 200，得到 %d（%s）", w.Code, w.Body.String())
+	w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey))
+	var list struct {
+		Accounts []account.Account `json:"accounts"`
 	}
-	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.userKey)); w.Code != http.StatusOK {
-		t.Fatalf("提升后应能访问管理端点，得到 %d", w.Code)
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	var handle string
+	for _, a := range list.Accounts {
+		if a.Name == "普通用户" {
+			handle = a.ID
+		}
+	}
+	if handle == "" {
+		t.Fatalf("列表应包含账号句柄：%s", w.Body.String())
+	}
+	if handle != account.Handle(env.userKey) {
+		t.Errorf("句柄应由 Key 派生：得到 %q", handle)
+	}
+	if strings.Contains(handle, env.userKey) || !strings.HasPrefix(handle, "acc_") {
+		t.Errorf("句柄不能是可反推的 Key 片段：%q", handle)
+	}
+	// 掩码 Key 依旧出现（人要能认出是哪个账号），但明文不出现
+	if strings.Contains(w.Body.String(), env.userKey) {
+		t.Error("列表泄露了明文 Key")
+	}
+
+	// 用句柄查 / 改 / 删
+	if w := do(h, http.MethodGet, "/v1/admin/accounts/"+handle, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("按句柄查询应 200，得到 %d", w.Code)
+	}
+	if w := doJSON(h, http.MethodPatch, "/v1/admin/accounts/"+handle,
+		`{"note":"按句柄改的"}`, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("按句柄修改应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if got, _ := env.store.Get(env.userKey); got.Note != "按句柄改的" {
+		t.Fatalf("修改没落到目标账号上：%+v", got)
+	}
+	// 掩码 Key 不是句柄：拿它当路径参数必须 404，避免"看着像 Key 就能用"
+	masked := account.Account{Key: env.userKey}.Masked()
+	if w := doJSON(h, http.MethodPatch, "/v1/admin/accounts/"+masked,
+		`{"quota":1}`, userHdr(env.adminKey)); w.Code != http.StatusNotFound {
+		t.Errorf("掩码 Key 不该被当作句柄，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodDelete, "/v1/admin/accounts/"+handle, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("按句柄删除应 200，得到 %d", w.Code)
+	}
+	if _, ok := env.store.Get(env.userKey); ok {
+		t.Error("账号应已被删除")
 	}
 }
 
@@ -842,14 +948,25 @@ func TestAdminCreateReturnsPlainKeyOnce(t *testing.T) {
 	}
 }
 
-func TestAdminCannotDeleteSelf(t *testing.T) {
+// TestAdminKeyIsNeverAnAccount：管理 Key 既不能删自己，也不需要保护。
+//
+// 老实现里有"不能删除当前正在使用的管理员账号"，因为管理员就是一个账号；
+// 现在管理 Key 不在账本里，那条保护连同它的语义一起消失：
+// 拿管理 Key 当路径参数只会得到 404（账本里没有这个账号）。
+func TestAdminKeyIsNeverAnAccount(t *testing.T) {
 	env := newTestEnv(t, nil, defaultStub())
-	w := do(env.handler(), http.MethodDelete, "/v1/admin/accounts/"+env.adminKey, userHdr(env.adminKey))
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("删除自己应被拒绝，得到 %d", w.Code)
+	h := env.handler()
+
+	w := do(h, http.MethodDelete, "/v1/admin/accounts/"+env.adminKey, userHdr(env.adminKey))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("管理 Key 不是账号，删除应 404，得到 %d（%s）", w.Code, w.Body.String())
 	}
-	if _, ok := env.store.Get(env.adminKey); !ok {
-		t.Fatal("管理员账号不应被删除")
+	// 删掉账本里唯一的账号之后，管理面依旧可用（这正是把 admin 移出账本换来的）
+	if w := do(h, http.MethodDelete, "/v1/admin/accounts/"+env.userKey, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("删除账号应 200，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("账本空了也不该影响管理面，得到 %d", w.Code)
 	}
 }
 
@@ -1458,5 +1575,137 @@ func TestWebUIGating(t *testing.T) {
 	}
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
 		t.Errorf("ease + WebUI=false 时 Content-Type = %q，想要 text/plain", ct)
+	}
+}
+
+// --- 管理面板 ---
+
+// TestAdminPanelGating：管理面板与解析页同一个开关（VL_WEBUI），
+// 但只在账户模式下存在——免校验模式没有账号体系，也就没有可管理的东西。
+//
+// 页面本身是**公开的壳**：不公开的话浏览器连"填管理 Key 的输入框"都拿不到。
+// 壳里不能有任何账号数据或 Key，数据接口依旧要管理 Key。
+func TestAdminPanelGating(t *testing.T) {
+	const marker = `id="adminkey"`
+
+	// ① 账户模式 + WebUI 关：不是公开路径（没 Key 403），带 Key 也是 404
+	off := newTestEnv(t, nil, defaultStub())
+	if w := do(off.handler(), http.MethodGet, adminUIPath, nil); w.Code != http.StatusForbidden {
+		t.Errorf("WebUI 关时 /admin 无 Key 应 403，得到 %d", w.Code)
+	}
+	w := do(off.handler(), http.MethodGet, adminUIPath, userHdr(off.userKey))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("WebUI 关时 /admin 应 404，得到 %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), marker) {
+		t.Error("WebUI 关时不该返回管理面板")
+	}
+
+	// ② 账户模式 + WebUI 开：页面公开可拿，但不含任何 Key；数据仍要管理 Key
+	on := newTestEnv(t, func(c *config.Config) { c.WebUI = true }, defaultStub())
+	h := on.handler()
+	w = do(h, http.MethodGet, adminUIPath, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("WebUI 开时 /admin 应公开返回页面，得到 %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q，想要 text/html", ct)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("缺少 nosniff，得到 %q", got)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		marker,                        // 管理 Key 输入框
+		`id="keySave"`,                // 保存
+		`id="keyClear"`,               // 清除
+		"X-API-Key",                   // 内部请求自动带 Key
+		`"key=" + encodeURIComponent`, // 页面里的链接自动拼 ?key=…
+		"localStorage",                // 只存在本机浏览器
+		"/v1/admin/accounts",          // 调用的管理接口
+		"/v1/admin/stats",
+		"/v1/admin/quota",
+		"/v1/health", // 用于判断模式与版本
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("管理面板缺少 %q", want)
+		}
+	}
+	if strings.Contains(body, on.userKey) || strings.Contains(body, on.adminKey) {
+		t.Error("页面里不应出现任何 Key")
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts", nil); w.Code != http.StatusForbidden {
+		t.Errorf("面板公开不能让管理接口免鉴权，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(on.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("账号 Key 依然不能进管理面，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts", userHdr(on.adminKey)); w.Code != http.StatusOK {
+		t.Errorf("管理 Key 应 200，得到 %d", w.Code)
+	}
+	// HEAD 只回头不回体；POST 给 405 而不是 404
+	if w := do(h, http.MethodHead, adminUIPath, nil); w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Errorf("HEAD /admin 应 200 且无体，得到 %d / %d 字节", w.Code, w.Body.Len())
+	}
+	// 非 GET/HEAD 不享受"页面公开"待遇（与根路径一致）：先鉴权，再谈方法。
+	if w := do(h, http.MethodPost, adminUIPath, nil); w.Code != http.StatusForbidden {
+		t.Errorf("无 Key 的 POST /admin 应 403，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodPost, adminUIPath, userHdr(on.userKey)); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("带 Key 的 POST /admin 应 405，得到 %d", w.Code)
+	}
+
+	// ③ 免校验模式：管理面整体不存在，/admin 必须 404（哪怕 WebUI 开着）
+	ease := newEaseEnv(t, nil, defaultStub())
+	if w := do(ease.handler(), http.MethodGet, adminUIPath, nil); w.Code != http.StatusNotFound {
+		t.Errorf("免校验模式下 /admin 应 404，得到 %d", w.Code)
+	}
+	if strings.Contains(do(ease.handler(), http.MethodGet, adminUIPath, nil).Body.String(), marker) {
+		t.Error("免校验模式下不该返回管理面板")
+	}
+}
+
+// TestAdminPanelStaysSelfContained：管理面板不能引用外部资源，
+// 且它引用的每个接口路径都必须真实注册。
+//
+// 后半条是防"文档与实现漂移"的：面板里写了一个不存在的路径，
+// 症状是运行到那一步才 404，而静态检查能在构建期挡住。
+func TestAdminPanelStaysSelfContained(t *testing.T) {
+	body := string(adminHTML)
+	low := strings.ToLower(body)
+	for _, forbidden := range []string{
+		"<script src", "<link ", "@import", "url(http", `src="http`, "src='http",
+		`href="http`, "href='http", "googleapis", "unpkg", "jsdelivr",
+	} {
+		if strings.Contains(low, forbidden) {
+			t.Errorf("管理面板引用了外部资源: %q", forbidden)
+		}
+	}
+	if len(body) > 60*1024 {
+		t.Errorf("管理面板过大（%d 字节），内嵌资源应保持精简", len(body))
+	}
+
+	specs := newTestEnv(t, func(c *config.Config) { c.WebUI = true }, defaultStub()).srv.routes()
+	re := regexp.MustCompile(`/v1/[A-Za-z0-9_/]*`)
+	seen := map[string]bool{}
+	for _, m := range re.FindAllString(body, -1) {
+		m = strings.TrimRight(m, "/")
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		ok := false
+		for _, rt := range specs {
+			if rt.path == m || matchPath(rt.path, m) || strings.HasPrefix(rt.path, m+"/") {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			t.Errorf("管理面板引用了不存在的路由 %q", m)
+		}
+	}
+	if len(seen) < 4 {
+		t.Fatalf("只扫到 %d 个接口路径，正则可能失效：%v", len(seen), seen)
 	}
 }

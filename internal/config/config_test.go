@@ -289,3 +289,53 @@ func TestWebUIFollowsMode(t *testing.T) {
 		})
 	}
 }
+
+// TestAdminKeyComesFromEnvOrDotVL：管理 Key 是固定配置项，两种来源都支持。
+//
+// 这条同时锁住语义：**配置里没有它时管理接口就是不可用的**（空串），
+// 不存在"回退到某个账号"或"自动生成一个管理员账号"的路径。
+func TestAdminKeyComesFromEnvOrDotVL(t *testing.T) {
+	// ① 环境变量优先
+	t.Setenv("VIDLINK_ADMIN_KEY", "vl_admin_from_env")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.AdminKey != "vl_admin_from_env" {
+		t.Errorf("AdminKey = %q，想要环境变量里的值", cfg.AdminKey)
+	}
+
+	// ② 环境变量没设 → 用 .vl 里的值
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/.vl", []byte("VIDLINK_ADMIN_KEY=vl_admin_from_file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	t.Setenv("VIDLINK_ADMIN_KEY", "")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.AdminKey != "vl_admin_from_file" {
+		t.Errorf("AdminKey = %q，想要 .vl 文件里的值", cfg.AdminKey)
+	}
+
+	// ③ 两处都没有 → 空串（管理接口不可用），且不报错
+	if err := os.Remove(dir + "/.vl"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("没有管理 Key 不该导致启动失败: %v", err)
+	}
+	if cfg.AdminKey != "" {
+		t.Errorf("AdminKey = %q，想要空串", cfg.AdminKey)
+	}
+}

@@ -155,7 +155,7 @@ type routeSpec struct {
 	method  string // HTTP 方法，用于 405 的 Allow 头
 	path    string // 路径模板，{name} 表示单段通配
 	public  bool   // 豁免鉴权（探针与前端初始化需要）
-	admin   bool   // 需要管理员账号
+	admin   bool   // 用固定管理 Key 鉴权（VIDLINK_ADMIN_KEY），不是账号
 	handler http.HandlerFunc
 	// endpoint 非空表示这是一条**配额计量**路由。鉴权中间件据此做预授权，
 	// handler 据此结算。空串表示不计配额或运维路由。
@@ -189,7 +189,7 @@ func (s *Server) routes() []routeSpec {
 		// ---- 免配额但需要身份：用量查询要知道"你是谁" ----
 		specs = append(specs,
 			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage})
-		// ---- 管理面：需要管理员账号 ----
+		// ---- 管理面：用固定管理 Key（未配置时每条都恒 403）----
 		specs = append(specs, s.adminRoutes()...)
 	}
 
@@ -266,6 +266,23 @@ func (s *Server) fallback(specs []routeSpec) http.HandlerFunc {
 			return
 		}
 
+		// 管理面板：与图形化解析页同一个开关（VL_WEBUI）。
+		//
+		// 页面本身是**公开的壳**（不含任何账号数据），数据全靠页面里
+		// 填的管理 Key 去请求——不公开的话，浏览器连填 Key 的地方都拿不到。
+		// 免校验模式下整个管理面不存在，所以这里必须是 404，
+		// 不能返回一个"看起来能用但一定失败"的页面。
+		if r.URL.Path == adminUIPath && s.cfg.WebUI && !s.cfg.IsEase() {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				s.handleAdminUI(w, r)
+				return
+			}
+			w.Header().Set("Allow", "GET, HEAD")
+			writeErrorStatus(w, http.StatusMethodNotAllowed, "method_not_allowed",
+				fmt.Sprintf("%s 不允许用于 %s", r.Method, adminUIPath))
+			return
+		}
+
 		var allow []string
 		for _, rt := range specs {
 			if matchPath(rt.path, r.URL.Path) {
@@ -283,6 +300,19 @@ func (s *Server) fallback(specs []routeSpec) http.HandlerFunc {
 		writeErrorStatus(w, http.StatusNotFound, "not_found",
 			fmt.Sprintf("未知路径: %s", r.URL.Path))
 	}
+}
+
+// matchAnyPath 判断请求路径是否匹配给定模板中的任意一条。
+//
+// 用线性扫描而不是 map：路由只有十几条，而 map 只能做精确匹配，
+// 无法表达 {name} 通配——那正是需要在这里判对的场景。
+func matchAnyPath(templates []string, path string) bool {
+	for _, t := range templates {
+		if matchPath(t, path) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchPath 判断请求路径是否匹配一条路由模板（**忽略方法**）。
@@ -632,10 +662,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
   GET  /v1/version  /v1/health   版本与状态
   GET  /healthz  /readyz         存活 / 就绪探针
 
-管理端点（需管理员 Key）：/v1/admin/*
+管理端点（需固定管理 Key：配置项 VIDLINK_ADMIN_KEY）：/v1/admin/*
 接口文档：docs/API.md     机器可读规格：docs/openapi.yaml
 配额倍率说明：docs/配额倍率表.md
 `, Version, unitName, s.cfg.BatchMin, s.cfg.BatchMax)
+		if s.cfg.WebUI {
+			fmt.Fprintf(w, "\n图形界面\n  %s  解析页\n  %s       管理面板（填管理 Key 后可用）\n", "/", adminUIPath)
+		}
 	}
 	if s.cfg.ProxySrv.Enabled {
 		fmt.Fprint(w, "\nGET /v1/proxy?url=<媒体地址>   （流式代理，支持 Range）\n")

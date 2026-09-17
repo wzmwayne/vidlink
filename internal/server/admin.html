@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>vidlink · 管理面板</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --panel2: #23262e; --line: #31353f;
+    --fg: #e6e8ec; --dim: #9aa1ad; --accent: #4c9aff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  .tag {
+    font: 12px/1 var(--mono); padding: 3px 7px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; margin-bottom: 14px;
+  }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--dim); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .6px; }
+  h3 { font-size: 12px; margin: 14px 0 6px; color: var(--dim); font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 0 0 4px; }
+  input, textarea, select, button {
+    font: 13px/1.5 var(--mono); color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; width: 100%;
+  }
+  input:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  button { cursor: pointer; width: auto; transition: .12s; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: progress; }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; font-weight: 600; }
+  button.primary:hover { background: #2563eb; }
+  button.danger { border-color: #4a1f1f; color: var(--err); }
+  button.danger:hover { border-color: var(--err); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > .col { flex: 1 1 200px; min-width: 150px; }
+  .row > .col.narrow { flex: 0 1 130px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  .hidden { display: none !important; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td.mono, .mono { font-family: var(--mono); }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .status { font-size: 12px; font-family: var(--mono); color: var(--dim); }
+  .status .code-2 { color: var(--ok); }
+  .status .code-4, .status .code-5 { color: var(--err); }
+  .warnbox { border: 1px solid #4a3a12; background: #241f11; color: #e3c46a;
+             font-size: 12px; border-radius: 8px; padding: 10px; margin-top: 10px; }
+  .errbox { border: 1px solid #5a1e1e; background: #241417; color: #f0a0a0;
+            font-size: 12px; border-radius: 8px; padding: 10px; margin-top: 10px; }
+  .acct { border: 1px solid var(--line); border-radius: 9px; padding: 10px; margin-top: 10px; }
+  .acct-hd { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .acct-hd b { font-size: 14px; }
+  .acct .kv { grid-template-columns: 84px 1fr; margin-top: 6px; }
+  .pill { font: 11px/1 var(--mono); padding: 2px 6px; border-radius: 999px;
+          border: 1px solid var(--line); color: var(--dim); }
+  .pill.ok { color: var(--ok); border-color: #1d3d24; }
+  .pill.bad { color: var(--err); border-color: #4a1f1f; }
+  .pill.warn { color: var(--warn); border-color: #4a3a12; }
+  .numin { width: 96px; }
+  .multin { width: 76px; }
+  pre {
+    background: #0f1115; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; overflow: auto; max-height: 420px;
+    font: 12px/1.5 var(--mono); margin: 8px 0 0;
+  }
+  a.btn {
+    display: inline-block; text-decoration: none; cursor: pointer;
+    font: 13px/1.5 var(--mono); color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; transition: .12s;
+  }
+  a.btn:hover { border-color: var(--accent); }
+  footer { color: var(--dim); font-size: 12px; text-align: center; padding: 8px 0 28px; }
+  @media (max-width: 560px) { .kv { grid-template-columns: 92px 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>vidlink · 管理面板</h1>
+  <span class="tag" id="modeTag">…</span>
+  <span class="tag" id="verTag">…</span>
+  <span class="status" id="hdr" style="margin-left:auto"></span>
+  <a class="btn" href="/">解析页</a>
+</header>
+
+<main>
+  <div class="warnbox hidden" id="easeNote">
+    当前服务运行在免校验模式（VL_EASE=true）：没有账号、没有配额、
+    <b>没有管理接口</b>。本页面需要账户模式 + 已配置管理 Key 才有内容。
+  </div>
+
+  <!-- 管理 Key：页面本身是公开的壳，数据全靠这个 Key -->
+  <section id="authsec">
+    <h2>管理 Key</h2>
+    <div class="row">
+      <div class="col" style="flex:3 1 320px">
+        <label for="adminkey">服务端 VIDLINK_ADMIN_KEY 配置的那个 Key（只存在本机浏览器里）</label>
+        <input id="adminkey" type="password" placeholder="管理 Key" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button class="primary" id="keySave" style="width:100%">保存并进入</button>
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button id="keyClear" style="width:100%">清除</button>
+      </div>
+    </div>
+    <div class="hint" id="keyState">未填写管理 Key。</div>
+    <div class="hint">
+      管理 Key 是<b>服务级固定凭据</b>，不是账号 Key：它不消耗配额、也不能用来解析视频；
+      反过来，任何账号都拿不到管理权限。填好之后本页所有请求都会自动带上它
+      （内部请求走 <span class="mono">X-API-Key</span> 头，页面里的链接自动拼
+      <span class="mono">?key=</span>）。
+    </div>
+  </section>
+
+  <!-- 概览 -->
+  <section id="statsec" class="hidden">
+    <h2>概览</h2>
+    <div id="overview"></div>
+    <div class="btns">
+      <button id="statRefresh">刷新概览</button>
+      <span class="status" id="statStatus"></span>
+    </div>
+  </section>
+
+  <!-- 新建账号 -->
+  <section id="createsec" class="hidden">
+    <h2>新建账号</h2>
+    <div class="row">
+      <div class="col">
+        <label for="cname">名称</label>
+        <input id="cname" placeholder="例如：客厅电视" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label for="cquota">初始配额</label>
+        <input id="cquota" value="100" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label for="cmult">账号倍率</label>
+        <input id="cmult" value="1.0" autocomplete="off">
+      </div>
+      <div class="col">
+        <label for="ckey">Key（留空由服务端随机生成）</label>
+        <input id="ckey" placeholder="留空即可" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="col">
+        <label for="cnote">备注</label>
+        <input id="cnote" placeholder="可选" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button class="primary" id="createBtn" style="width:100%">创建账号</button>
+      </div>
+    </div>
+    <div class="warnbox hidden" id="newKeyBox"></div>
+    <div class="hint">
+      倍率含义：<span class="mono">1.0</span> 标准、<span class="mono">0.5</span> 减半、
+      <span class="mono">0</span> 不扣配额（仍记用量）、<span class="mono">2.0</span> 加倍。
+    </div>
+  </section>
+
+  <!-- 账号列表 -->
+  <section id="listsec" class="hidden">
+    <h2>账号列表</h2>
+    <div class="row">
+      <div class="col">
+        <label for="filter">筛选（名称 / 句柄 / 掩码 Key）</label>
+        <input id="filter" placeholder="输入即筛选" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label>&nbsp;</label>
+        <button id="listRefresh" style="width:100%">刷新</button>
+      </div>
+      <span class="status" id="listStatus" style="align-self:center"></span>
+    </div>
+    <div id="accounts"></div>
+    <div class="hint">
+      所有修改都用账号<b>句柄</b>（<span class="mono">acc_…</span>）寻址，不需要明文 Key；
+      句柄由 Key 哈希派生，无法反推出 Key。明文 Key 只在创建那一次返回。
+    </div>
+  </section>
+
+  <!-- 配额系数 -->
+  <section id="quotasec" class="hidden">
+    <h2>配额系数（只读）</h2>
+    <div id="quota"></div>
+  </section>
+
+  <!-- 管理接口直连 -->
+  <section id="apisec" class="hidden">
+    <h2>管理接口</h2>
+    <div class="btns" id="apiLinks"></div>
+    <div class="hint">
+      点这些链接等于用浏览器直接发一次 GET，Key 由页面自动拼在 URL 上；
+      结果会显示在下面的响应框里（也可以右键在新标签页打开，用于给别的工具取数）。
+    </div>
+  </section>
+
+  <!-- 响应 -->
+  <section id="detailsec" class="hidden">
+    <h2>响应 <span class="status" id="detailStatus"></span></h2>
+    <pre id="detail"></pre>
+  </section>
+</main>
+
+<footer>
+  vidlink 管理面板 · 只调用本服务的 <span class="mono">/v1/admin/*</span> ·
+  配置项 <span class="mono">VIDLINK_ADMIN_KEY</span>
+</footer>
+
+<script>
+/*
+ * 管理面板。
+ *
+ * 三条约束与解析页一致：
+ *   1. 零外部资源（离线/内网也要能用）；
+ *   2. 只调用本服务的接口，没有任何隐藏能力；
+ *   3. 所有来自服务端的文本都用 textContent 写入，不拼接 HTML。
+ *
+ * 为什么页面本身是公开的壳：不公开的话浏览器连"填管理 Key 的输入框"
+ * 都拿不到。页面里没有一行账号数据，数据全部要 Key 才能取。
+ *
+ * Key 的两种传递方式都在这里用到：
+ *   - 页面发起的 fetch 统一走 X-API-Key 头（api()）；
+ *   - 页面里的链接（新标签页打开/右键复制）只能拼查询参数（withKey()）。
+ */
+(() => {
+  "use strict";
+
+  const $ = (s) => document.querySelector(s);
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function num(v, def) {
+    const n = Number(String(v).trim());
+    return Number.isFinite(n) ? n : def;
+  }
+
+  const KEY_STORE = "vidlink_admin_key";
+  let ADMINKEY = "";
+  let mode = "account";
+  let accounts = [];       // 最近一次列表结果（供筛选与行操作复用）
+
+  // ---------- 基础设施 ----------
+
+  // withKey 把管理 Key 拼进 URL：只有 <a> 这类浏览器原生导航才需要它
+  // （不能给原生导航加自定义请求头），fetch 一律走 api()。
+  function withKey(url) {
+    if (!ADMINKEY) return url;
+    return url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(ADMINKEY);
+  }
+
+  // api 自动带上管理 Key —— 页面上每一个请求都经过它，
+  // 因此不存在"某个接口忘了带 Key"这种漏网情况。
+  async function api(path, opts) {
+    const t0 = performance.now();
+    const o = Object.assign({}, opts);
+    o.headers = Object.assign({}, o.headers);
+    if (ADMINKEY) o.headers["X-API-Key"] = ADMINKEY;
+    const res = await fetch(path, o);
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) { body = { raw: text }; }
+    return { status: res.status, ms: Math.round(performance.now() - t0), body };
+  }
+
+  function setStatus(node, res, extra) {
+    node.textContent = "";
+    if (!res) { if (extra) node.textContent = extra; return; }
+    node.appendChild(el("span", "code-" + String(res.status)[0], "HTTP " + res.status));
+    node.appendChild(document.createTextNode("  " + res.ms + " ms"));
+    if (extra) node.appendChild(document.createTextNode("  " + extra));
+  }
+
+  function errText(res) {
+    const e = (res.body && res.body.error) || {};
+    return (e.kind ? e.kind + ": " : "") + (e.message || ("HTTP " + res.status));
+  }
+
+  function show(res) {
+    $("#detailsec").classList.remove("hidden");
+    setStatus($("#detailStatus"), res);
+    $("#detail").textContent = res.body === null ? "(空响应体)" : JSON.stringify(res.body, null, 2);
+    // 403 只有一个原因：没填 Key、Key 不对，或服务端压根没配管理 Key。
+    if (res.status === 403) {
+      setKeyState("管理 Key 被拒绝（403）：" + errText(res), true);
+    }
+  }
+
+  function setKeyState(text, bad) {
+    const n = $("#keyState");
+    n.textContent = text;
+    n.style.color = bad ? "var(--err)" : "var(--dim)";
+  }
+
+  function loadStoredKey() {
+    try { return localStorage.getItem(KEY_STORE) || ""; } catch (_) { return ""; }
+  }
+  function storeKey(k) {
+    try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch (_) {}
+  }
+
+  // ---------- 概览 ----------
+
+  function kvInto(box, obj, labels) {
+    const dl = el("dl", "kv");
+    Object.keys(obj || {}).forEach((k) => {
+      const v = obj[k];
+      if (v === null || v === undefined || typeof v === "object") return;
+      dl.appendChild(el("dt", null, (labels && labels[k]) || k));
+      dl.appendChild(el("dd", null, String(v)));
+    });
+    box.appendChild(dl);
+  }
+
+  // GET /v1/admin/stats
+  async function loadStats() {
+    const box = $("#overview");
+    box.textContent = "加载中…";
+    const r = await api("/v1/admin/stats");
+    setStatus($("#statStatus"), r);
+    box.textContent = "";
+    if (r.status !== 200) {
+      show(r);
+      box.appendChild(el("div", "errbox", "取不到统计：" + errText(r)));
+      return;
+    }
+    const d = r.body || {};
+    box.appendChild(el("h3", null, "账号"));
+    kvInto(box, d.accounts, {
+      accounts: "账号数", active: "启用中", used_total: "累计消耗",
+      calls_total: "累计调用", quota_total: "剩余配额合计",
+    });
+    box.appendChild(el("h3", null, "解析闸门（实时）"));
+    kvInto(box, d.gate, {
+      global_limit: "全局并发上限", global_in_use: "进行中", global_free: "空闲槽位",
+      waiting: "排队中", max_queue: "队列上限", active_keys: "活跃 Key 数",
+      rejected_key_busy: "因同 Key 并发被拒", rejected_queue_full: "因队列满被拒",
+      timed_out: "排队超时",
+    });
+    box.appendChild(el("h3", null, "流量"));
+    kvInto(box, d.traffic, { requests: "累计请求", errors: "累计错误", uptime_sec: "运行秒数" });
+    box.appendChild(el("h3", null, "缓存"));
+    const cache = d.cache || {};
+    kvInto(box, cache, null);
+    Object.keys(cache).forEach((k) => {
+      if (cache[k] && typeof cache[k] === "object") {
+        box.appendChild(el("h3", null, "缓存 · " + k));
+        kvInto(box, cache[k], null);
+      }
+    });
+  }
+
+  // ---------- 账号列表 ----------
+
+  const FIELDS = [
+    ["quota", "剩余配额"], ["used", "累计消耗"], ["calls", "累计调用"],
+    ["multiplier", "账号倍率"], ["note", "备注"], ["updated_at", "更新时间"],
+  ];
+
+  function accountCard(a) {
+    const card = el("div", "acct");
+    const hd = el("div", "acct-hd");
+    hd.appendChild(el("b", null, a.name || "(未命名)"));
+    hd.appendChild(el("span", "pill " + (a.disabled ? "bad" : "ok"), a.disabled ? "已停用" : "启用中"));
+    if (a.multiplier === 0) hd.appendChild(el("span", "pill warn", "不扣配额"));
+    hd.appendChild(el("span", "mono", a.id || ""));
+    hd.appendChild(el("span", "mono", a.key || ""));
+    card.appendChild(hd);
+
+    const dl = el("dl", "kv");
+    FIELDS.forEach(([k, label]) => {
+      const v = a[k];
+      if (v === undefined || v === null || v === "") return;
+      dl.appendChild(el("dt", null, label));
+      dl.appendChild(el("dd", null, String(v)));
+    });
+    card.appendChild(dl);
+
+    const btns = el("div", "btns");
+    const amount = el("input", "numin");
+    amount.value = "100";
+    amount.setAttribute("aria-label", "配额调整量");
+    const mult = el("input", "multin");
+    mult.value = String(a.multiplier);
+    mult.setAttribute("aria-label", "账号倍率");
+    const mk = (label, act, cls) => {
+      const b = el("button", cls, label);
+      b.dataset.act = act;
+      b.dataset.id = a.id;
+      return b;
+    };
+    btns.appendChild(amount);
+    btns.appendChild(mk("加配额", "add"));
+    btns.appendChild(mk("减配额", "sub"));
+    btns.appendChild(mk("设为", "set"));
+    btns.appendChild(mult);
+    btns.appendChild(mk("应用倍率", "mult"));
+    btns.appendChild(mk(a.disabled ? "启用" : "停用", "toggle"));
+    btns.appendChild(mk("详情", "get"));
+    const del = mk("删除", "del", "danger");
+    del.style.marginLeft = "auto";
+    btns.appendChild(del);
+    card.appendChild(btns);
+    return card;
+  }
+
+  function renderAccounts() {
+    const box = $("#accounts");
+    box.textContent = "";
+    const q = $("#filter").value.trim().toLowerCase();
+    const list = q ? accounts.filter((a) =>
+      [a.name, a.id, a.key, a.note].some((v) => String(v || "").toLowerCase().includes(q))) : accounts;
+    if (!list.length) {
+      box.appendChild(el("div", "hint", accounts.length ? "没有匹配的账号。" : "还没有账号。"));
+      return;
+    }
+    list.forEach((a) => box.appendChild(accountCard(a)));
+  }
+
+  // GET /v1/admin/accounts
+  async function loadAccounts() {
+    const r = await api("/v1/admin/accounts");
+    setStatus($("#listStatus"), r, accounts.length ? accounts.length + " 个账号" : "");
+    if (r.status !== 200) {
+      show(r);
+      $("#accounts").textContent = "";
+      $("#accounts").appendChild(el("div", "errbox", "取不到账号列表：" + errText(r)));
+      return r;
+    }
+    accounts = (r.body && r.body.accounts) || [];
+    renderAccounts();
+    const st = $("#listStatus");
+    setStatus(st, r, accounts.length + " 个账号");
+    if (r.body && r.body.stats) {
+      st.appendChild(document.createTextNode("  启用 " + r.body.stats.active + "/" + r.body.stats.accounts));
+    }
+    return r;
+  }
+
+  // PATCH /v1/admin/accounts/{句柄}
+  async function patch(id, payload, what) {
+    const r = await api("/v1/admin/accounts/" + encodeURIComponent(id), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    show(r);
+    if (r.status === 200) {
+      await loadAccounts();
+      await loadStats();
+      $("#listStatus").appendChild(document.createTextNode("  " + what + " 已生效"));
+    }
+    return r;
+  }
+
+  // 在账号卡片上就地取值（金额/倍率输入框是每张卡片各自的）
+  function cardInputs(btn) {
+    const card = btn.closest(".acct");
+    return { amount: card.querySelector(".numin"), mult: card.querySelector(".multin") };
+  }
+
+  function findAccount(id) {
+    return accounts.filter((a) => a.id === id)[0];
+  }
+
+  async function runAction(btn) {
+    const id = btn.dataset.id;
+    const a = findAccount(id);
+    if (!a) return;
+    btn.disabled = true;
+    try {
+      switch (btn.dataset.act) {
+        case "add":
+        case "sub":
+        case "set": {
+          const v = num(cardInputs(btn).amount.value, NaN);
+          if (!Number.isFinite(v) || v < 0) { setKeyState("配额要填一个非负数。", true); return; }
+          const act = btn.dataset.act;
+          const payload = act === "set" ? { quota: v } : { add_quota: act === "add" ? v : -v };
+          const label = act === "set" ? ("配额设为 " + v) : ((act === "add" ? "加 " : "减 ") + v);
+          await patch(id, payload, label);
+          return;
+        }
+        case "mult": {
+          const v = num(cardInputs(btn).mult.value, NaN);
+          if (!Number.isFinite(v) || v < 0) { setKeyState("账号倍率要填一个非负数。", true); return; }
+          await patch(id, { multiplier: v }, "账号倍率");
+          return;
+        }
+        case "toggle":
+          await patch(id, { disabled: !a.disabled }, a.disabled ? "启用" : "停用");
+          return;
+        case "get": {
+          const r = await api("/v1/admin/accounts/" + encodeURIComponent(id));
+          show(r);
+          return;
+        }
+        case "del": {
+          if (!confirm("删除账号 " + (a.name || a.id) + "？\n\n" +
+                       "该账号的 Key 会立即失效；已消耗的用量仍留在账本汇总里。")) return;
+          const r = await api("/v1/admin/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+          show(r);
+          if (r.status === 200) { await loadAccounts(); await loadStats(); }
+          return;
+        }
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ---------- 新建账号 ----------
+
+  // POST /v1/admin/accounts
+  async function createAccount() {
+    const btn = $("#createBtn");
+    const box = $("#newKeyBox");
+    box.classList.add("hidden");
+    btn.disabled = true;
+    try {
+      const payload = { name: $("#cname").value.trim(), note: $("#cnote").value.trim() };
+      const quota = num($("#cquota").value, NaN);
+      const mult = num($("#cmult").value, NaN);
+      if (!Number.isFinite(quota) || quota < 0) { setKeyState("初始配额要填一个非负数。", true); return; }
+      if (!Number.isFinite(mult) || mult < 0) { setKeyState("账号倍率要填一个非负数。", true); return; }
+      payload.quota = quota;
+      payload.multiplier = mult;
+      const key = $("#ckey").value.trim();
+      if (key) payload.key = key;
+
+      const r = await api("/v1/admin/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      show(r);
+      if (r.status !== 201) return;
+      const d = r.body || {};
+      box.textContent = "";
+      box.classList.remove("hidden");
+      if (d.key) {
+        // 明文 Key 只出现这一次：把它摆在最显眼的地方，并提供一键复制
+        box.appendChild(el("div", null, "新账号的 Key（只显示这一次，请立即保存）："));
+        const line = el("div", "mono", d.key);
+        line.style.cssText = "font-size:15px;word-break:break-all;margin:6px 0";
+        box.appendChild(line);
+        const copy = el("button", null, "复制 Key");
+        copy.addEventListener("click", async () => {
+          try { await navigator.clipboard.writeText(d.key); copy.textContent = "已复制"; }
+          catch (_) { copy.textContent = "复制失败，请手动选中"; }
+        });
+        box.appendChild(copy);
+      } else {
+        box.appendChild(el("div", null, "账号已创建（用的是你指定的 Key）。"));
+      }
+      $("#ckey").value = "";
+      await loadAccounts();
+      await loadStats();
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ---------- 配额系数 ----------
+
+  // GET /v1/admin/quota
+  async function loadQuota() {
+    const box = $("#quota");
+    box.textContent = "加载中…";
+    const r = await api("/v1/admin/quota");
+    box.textContent = "";
+    if (r.status !== 200) {
+      show(r);
+      box.appendChild(el("div", "errbox", "取不到配额系数：" + errText(r)));
+      return;
+    }
+    const d = r.body || {};
+    const dl = el("dl", "kv");
+    [["unit", "单位"], ["formula", "计算式"], ["note", "说明"]].forEach(([k, label]) => {
+      if (d[k] === undefined) return;
+      dl.appendChild(el("dt", null, label));
+      dl.appendChild(el("dd", null, String(d[k])));
+    });
+    box.appendChild(dl);
+
+    if (d.endpoints) {
+      box.appendChild(el("h3", null, "端点含义"));
+      const t = el("table");
+      Object.keys(d.endpoints).forEach((k) => {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono", k));
+        tr.appendChild(el("td", null, String(d.endpoints[k])));
+        t.appendChild(tr);
+      });
+      box.appendChild(t);
+    }
+
+    if (d.preauth_max) {
+      box.appendChild(el("h3", null, "预授权上限（调用前至少要留这么多配额）"));
+      kvInto(box, d.preauth_max, null);
+    }
+
+    if (d.platforms) {
+      box.appendChild(el("h3", null, "各平台系数（消耗 = 系数 × 条数 × 账号倍率）"));
+      const t = el("table");
+      const tr = el("tr");
+      ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
+      t.appendChild(tr);
+      Object.keys(d.platforms).sort().forEach((p) => {
+        const row = el("tr");
+        row.appendChild(el("td", null, p));
+        ["info", "links", "detail", "batch_links"].forEach((k) => {
+          const v = d.platforms[p][k];
+          const cell = el("td", "mono");
+          if (v && typeof v === "object") cell.textContent = "不支持";
+          else cell.textContent = v === undefined ? "—" : String(v);
+          row.appendChild(cell);
+        });
+        t.appendChild(row);
+      });
+      box.appendChild(t);
+    }
+  }
+
+  // ---------- 接口直连 ----------
+
+  // 只列只读的 GET 接口：链接可以右键复制/新标签页打开，
+  // 用于把数据交给别的工具；写操作必须经过上面的表单（要二次确认）。
+  const READONLY_APIS = [
+    ["账号列表", "/v1/admin/accounts"],
+    ["运行统计", "/v1/admin/stats"],
+    ["配额系数", "/v1/admin/quota"],
+  ];
+
+  function renderApiLinks() {
+    const box = $("#apiLinks");
+    box.textContent = "";
+    READONLY_APIS.forEach(([label, path]) => {
+      const a = el("a", "btn", label + "  " + path);
+      a.href = withKey(path); // 自动拼上 ?key=…，右键复制即可给别的工具用
+      a.addEventListener("click", async (e) => {
+        e.preventDefault();
+        show(await api(path));
+      });
+      box.appendChild(a);
+    });
+  }
+
+  // ---------- 身份与初始化 ----------
+
+  async function applyKey(k, opts) {
+    const save = !opts || opts.save !== false;
+    ADMINKEY = (k || "").trim();
+    if (save) storeKey(ADMINKEY);
+    if (!ADMINKEY) {
+      setKeyState("未填写管理 Key。", false);
+      ["#statsec", "#createsec", "#listsec", "#quotasec", "#apisec"].forEach((s) => $(s).classList.add("hidden"));
+      $("#hdr").textContent = "";
+      return false;
+    }
+    // 用一次真实的管理请求验证 Key：能过就是对的，服务端也顺便告诉我们
+    // 它到底有没有配置管理 Key（403 的文案会区分这两种情况）。
+    const probe = await api("/v1/admin/stats");
+    show(probe);
+    if (probe.status !== 200) {
+      setKeyState("这个 Key 不被接受：" + errText(probe), true);
+      $("#hdr").textContent = "管理 Key：无效";
+      return false;
+    }
+    setKeyState("已保存（仅存于本机浏览器），下面的数据都是用这个 Key 取的。", false);
+    $("#hdr").textContent = "管理 Key：有效";
+    ["#statsec", "#createsec", "#listsec", "#quotasec", "#apisec"].forEach((s) => $(s).classList.remove("hidden"));
+    renderApiLinks();
+    await loadStats();
+    await loadAccounts();
+    await loadQuota();
+    return true;
+  }
+
+  async function boot() {
+    try {
+      const h = await api("/v1/health");
+      if (h.body && h.body.mode) {
+        mode = h.body.mode;
+        $("#modeTag").textContent = mode === "ease" ? "免校验模式" : "账户模式";
+      }
+      if (h.body && h.body.version) $("#verTag").textContent = "v" + h.body.version;
+      if (mode !== "account") {
+        // 免校验模式下管理路由根本不存在（404），这里说清楚原因，
+        // 而不是让人对着一个永远失败的表单猜。
+        $("#easeNote").classList.remove("hidden");
+        $("#authsec").classList.add("hidden");
+        return;
+      }
+      const stored = loadStoredKey();
+      if (stored) {
+        $("#adminkey").value = stored;
+        await applyKey(stored, { save: false });
+      } else {
+        setKeyState("未填写管理 Key。", false);
+      }
+    } catch (e) {
+      setKeyState("初始化失败：" + e, true);
+    }
+  }
+
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (b) runAction(b);
+  });
+
+  $("#keySave").addEventListener("click", () => applyKey($("#adminkey").value, { save: true }));
+  $("#adminkey").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") applyKey($("#adminkey").value, { save: true });
+  });
+  $("#keyClear").addEventListener("click", () => {
+    $("#adminkey").value = "";
+    applyKey("", { save: true });
+  });
+  $("#createBtn").addEventListener("click", createAccount);
+  $("#statRefresh").addEventListener("click", loadStats);
+  $("#listRefresh").addEventListener("click", loadAccounts);
+  $("#filter").addEventListener("input", renderAccounts);
+
+  boot();
+})();
+</script>
+</body>
+</html>

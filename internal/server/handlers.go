@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,25 +46,40 @@ func resolveKey(r *http.Request) string {
 // 旧版是"配了一组静态 Key，命中即放行"；现在 Key 对应一个**有配额和
 // 账号倍率的账号**，所以认证与配额计量是同一件事的两面。
 //
+// 管理面（/v1/admin/*）走的是**另一条**鉴权路径，见 withAdminKey：
+// 管理凭据是固定 Key，不是账本里的账号，因此这里必须先把它分流出去，
+// 否则会出现"管理 Key 不是账号 → 403"这种自相矛盾的结果。
+//
 // 三件事都放在中间件里而不是各 handler 里，是为了让四个配额端点
 // **不可能漏掉**其中任何一件——漏掉预授权就是未计入消耗，漏掉闸门就是没有上限。
 func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler {
-	public := make(map[string]bool, len(specs))
+	// 收集成路径模板而不是精确路径：管理端点里有 /v1/admin/accounts/{key}
+	// 这类带通配的路由，用 map[路径] 查会在"带句柄的具体请求"上漏掉，
+	// 症状是管理 Key 被当成普通账号 Key 去查账本、然后 403。
+	var publicPaths, adminPaths []string
 	for _, rt := range specs {
 		if rt.public {
-			public[rt.path] = true
+			publicPaths = append(publicPaths, rt.path)
+		}
+		if rt.admin {
+			adminPaths = append(adminPaths, rt.path)
 		}
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if public[r.URL.Path] {
+		if matchAnyPath(publicPaths, r.URL.Path) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		// 管理端点：用固定管理 Key 鉴权，与账本无关。
+		if matchAnyPath(adminPaths, r.URL.Path) {
+			s.serveAdminKey(next, w, r)
 			return
 		}
 		// 根路径在开启 WebUI 时也要公开：页面本身不含任何数据（数据全靠
 		// 页面里带的 Key 去请求），若不公开，浏览器只会拿到一个 403 JSON，
 		// 用户连填 Key 的地方都没有。
-		if s.cfg.WebUI && r.URL.Path == "/" &&
+		if s.cfg.WebUI && (r.URL.Path == "/" || r.URL.Path == adminUIPath) &&
 			(r.Method == http.MethodGet || r.Method == http.MethodHead) {
 			next.ServeHTTP(w, r)
 			return
@@ -123,6 +139,54 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 		ctx := context.WithValue(r.Context(), ctxKeyAccount{}, acct)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// ctxKeyAdmin 标记"这次请求的管理 Key 校验已通过"。
+//
+// 用上下文标记而不是把管理 Key 放进 context：handler 只需要知道
+// "验过了"，不需要再拿到那个密钥——拿到就多一处可能被打印/落日志的地方。
+type ctxKeyAdmin struct{}
+
+// adminAuthed 报告本次请求是否已通过管理 Key 校验。
+func adminAuthed(ctx context.Context) bool {
+	ok, _ := ctx.Value(ctxKeyAdmin{}).(bool)
+	return ok
+}
+
+// serveAdminKey 是管理面的鉴权：把请求里的 Key 与配置的固定管理 Key 比对。
+//
+// 三条设计约束：
+//
+//   - **管理 Key 不是账号。** 它不查账本、不看账本的停用状态、不扣配额、
+//     不占按 Key 的解析闸门。它唯一的能力就是调用 /v1/admin/*；
+//     反过来，账本里的账号无论怎么改都拿不到管理权限（账号没有权限位）。
+//   - **没配就永远失败。** 未设置 VIDLINK_ADMIN_KEY 时这里恒返回 403 并
+//     说明原因。刻意不用 404：管理路由确实存在，装作不存在只会让运维
+//     在"是不是路径写错了"上白花时间。
+//   - **常量时间比较。** 管理 Key 是服务级凭据，普通字符串比较会因为
+//     提前返回而泄漏前缀信息，长期看是可被逐字节试探的旁路。
+func (s *Server) serveAdminKey(next http.Handler, w http.ResponseWriter, r *http.Request) {
+	want := strings.TrimSpace(s.cfg.AdminKey)
+	if want == "" {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth",
+			"管理接口未启用：未配置管理 Key（环境变量或 .vl 里的 VIDLINK_ADMIN_KEY）"))
+		return
+	}
+	got := resolveKey(r)
+	if got == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="vidlink-admin"`)
+		writeError(w, core.Errf(core.KindForbidden, "", "auth",
+			"缺少管理 Key：请通过 X-API-Key 头、Authorization: Bearer 头，"+
+				"或 ?key= 查询参数提供"))
+		return
+	}
+	// 长度不同时 ConstantTimeCompare 立即返回 0，但那只泄漏长度；
+	// Key 是定长随机串，长度本身不是秘密。
+	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth", "管理 Key 无效"))
+		return
+	}
+	next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyAdmin{}, true)))
 }
 
 // gateErr 把并发闸门的错误翻译成带分类的领域错误。

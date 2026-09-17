@@ -45,10 +45,18 @@
 go build -o vidlink .
 
 # 运行（默认监听 :8080，账本写到 ./data/accounts.jsonl）
-./vidlink
-# → 日志里会打印一次性管理员 Key（或自己指定 VIDLINK_ADMIN_KEY）
+# VIDLINK_ADMIN_KEY 决定管理接口是否可用：不配置就没人能改账号（解析照常）
+VIDLINK_ADMIN_KEY=$(openssl rand -hex 32) ./vidlink
+export ADMIN=$VIDLINK_ADMIN_KEY
 
-export KEY=vl_admin_xxx
+# 建一个自己的账号（明文 Key 只在这次响应里出现一次）
+curl -s -X POST -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"我自己","quota":1000}' http://127.0.0.1:8080/v1/admin/accounts
+
+# 想用鼠标点：加 VL_WEBUI=true 启动，然后打开 http://127.0.0.1:8080/admin
+#   （账户模式下图形界面默认关，见下文 "图形界面"）
+
+export KEY=vl_xxx   # 上一步响应里的 key
 
 # ① 先看有哪些清晰度（0.5 配额）
 curl -H "X-API-Key: $KEY" \
@@ -181,7 +189,8 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 |---|---|---|
 | API Key 校验 | 有（403） | **无**（不需要任何凭据） |
 | 账号账本 | 读写 `data/accounts.jsonl` | **完全不建立**（不读也不写文件） |
-| 初始管理员 | 自动创建并打印 Key | **不创建** |
+| 管理接口 `/v1/admin/*` | 存在；凭据是 `VIDLINK_ADMIN_KEY` 这个**固定 Key**（没配就恒 403） | **404**（根本不注册） |
+| 管理面板 `/admin` + 解析页 `/` | 视 `VL_WEBUI`（默认关） | 视 `VL_WEBUI`（默认开） |
 | 配额计量与 `X-Quota-*` | 有 | **无**（不回写这两个头） |
 | 按 Key 串行闸门 | 1 个并发解析 | 不适用（没有 Key） |
 | 按 IP 限流 | `VIDLINK_RATE_LIMIT_RPM` | **关闭**（连同它一起关） |
@@ -197,8 +206,9 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 - **保留全局解析槽位与按主机令牌桶。** 它们保护的是上游平台和这台机器的内存
   （1 GB 树莓派上跑 100 路并发解析会直接 OOM），与身份校验无关；
   想要更放开就调 `VIDLINK_GLOBAL_CONCURRENCY`。
-- **`/v1/usage` 与 `/v1/admin/*` 返回 404 而不是 403。** 它们不被注册，
-  外界探测不到"这里本该有个管理接口"。
+- **免校验模式下 `/v1/usage` 与 `/v1/admin/*` 返回 404 而不是 403。**
+  它们不被注册，外界探测不到"这里本该有个管理接口"；账户模式下它们存在，
+  没有管理 Key 时给 403 并说明原因（装作不存在只会让人怀疑路径写错了）。
 
 > ⚠️ **这个模式没有任何身份校验，绝不能暴露到公网。**
 > 只用于本机、内网、或你完全控制的调用方。启动日志里会有一条 WARN 提醒。
@@ -220,10 +230,11 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
 | POST | `/v1/batch/links` | Key | 0.75/条 | 批量直链，5~20 条，**无抖音** |
 | GET | `/v1/proxy?url=` | Key | — | 流式媒体代理（ease 模式默认开启，账户模式默认关闭） |
-| GET/POST | `/v1/admin/accounts` | 管理员 | — | 账号列表 / 创建账号（免校验模式下不存在） |
-| GET/PATCH/DELETE | `/v1/admin/accounts/{key}` | 管理员 | — | 查 / 改 / 删账号 |
-| GET | `/v1/admin/stats` | 管理员 | — | 运行统计 |
-| GET | `/v1/admin/quota` | 管理员 | — | 配额系数全貌（只读） |
+| GET | `/admin` | 公开（页面壳） | — | **管理面板**：填管理 Key 后管理账号（`VL_WEBUI` 开启且非 ease 模式） |
+| GET/POST | `/v1/admin/accounts` | 管理 Key | — | 账号列表 / 创建账号（免校验模式下不存在） |
+| GET/PATCH/DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — | 查 / 改 / 删账号（可用明文 Key 或账号句柄 `acc_…`） |
+| GET | `/v1/admin/stats` | 管理 Key | — | 运行统计 |
+| GET | `/v1/admin/quota` | 管理 Key | — | 配额系数全貌（只读） |
 
 每个响应都带 `X-Request-Id`，错误体里也有同一个值，报障时直接提供即可定位：
 
@@ -290,43 +301,68 @@ X-Request-Id: 91c0651a168bd9acaf6f85b2225d0c9f
 
 ## 账号与配额管理
 
-全新部署没有任何账号，而创建账号又需要管理员权限。服务在冷启动时自动创建
-一个管理员并把 Key 打印一次（只打印一次）：
+管理权限是**一个固定的 Key**，不是账号、也不是账号上的权限位：
+
+- 来源：环境变量 `VIDLINK_ADMIN_KEY` 或 `.vl` 里的同名键；
+- **没配置 = 管理接口整体关闭**：每条 `/v1/admin/*` 都恒返回 `403` 并说明原因，
+  解析、配额、账本一切照常，只是没人能改账号；
+- 它不是账本里的账号：不能用它解析视频；反过来，任何账号也都拿不到管理权限
+  （账号结构里没有权限位，`{"admin":true}` 这类字段会被直接拒绝）；
+- 轮换就是改这个值再重启，账本里不需要同步任何东西。
 
 ```bash
-# 方式 A：让它随机生成，去日志里捞
-./vidlink
-# level=WARN msg="已创建初始管理员账号，请立即保存这个 Key（只显示这一次）" admin_key=vl_admin_...
+# 本机自用：随机生成一个并写进 .vl（或直接放进环境变量）
+printf 'VIDLINK_ADMIN_KEY=%s\n' "$(openssl rand -hex 32)" >> .vl
 
-# 方式 B：自己指定（容器化部署推荐，不必翻日志）
+# 容器化部署：不必翻日志，也不会在日志里出现
 VIDLINK_ADMIN_KEY=$(openssl rand -hex 32) ./vidlink
-```
 
-拿到管理员 Key 后：
-
-```bash
-ADMIN=vl_admin_xxx
+ADMIN=$VIDLINK_ADMIN_KEY
 
 # 建一个账号：初始配额 100、标准倍率
 curl -X POST -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
   -d '{"name":"示例账号","quota":100}' http://127.0.0.1:8080/v1/admin/accounts
-# → 响应里的 key 就是明文（只此一次），此后一律掩码
+# → 响应里的 key 就是明文（只此一次），此后一律掩码；id 是账号句柄
 
-# 补 100 配额
+# 补 100 配额（路径参数可以用明文 Key，也可以用列表里的 id）
 curl -X PATCH -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"add_quota":100}' http://127.0.0.1:8080/v1/admin/accounts/<明文Key>
+  -d '{"add_quota":100}' http://127.0.0.1:8080/v1/admin/accounts/acc_1f2e3d4c5b6a7980
 
 # 活动/内部账号：按 0.5 倍消耗
 curl -X PATCH -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"multiplier":0.5}' http://127.0.0.1:8080/v1/admin/accounts/<明文Key>
+  -d '{"multiplier":0.5}' http://127.0.0.1:8080/v1/admin/accounts/<明文Key 或 acc_ 句柄>
 
 # 停用 / 恢复
 curl -X PATCH ... -d '{"disabled":true}'  ...
 curl -X PATCH ... -d '{"disabled":false}' ...
 ```
 
+**账号句柄 `id`**：列表与详情里的 `id`（形如 `acc_1f2e3d…`）是 Key 的
+SHA-256 截断，不可反推、重启不变、只能用来定位账号。它的存在是为了让管理面板
+能在**不接触明文 Key** 的前提下改配额/停用/删除（明文 Key 只在创建时出现一次）。
+
 账本是 **append-only JSONL**（每次写一条完整快照 + `fsync`），重启自动回放，
 损坏的行会被跳过而不是让服务起不来。默认路径 `data/accounts.jsonl`。
+
+## 图形界面
+
+两个页面都由 `VL_WEBUI` 控制（ease 模式默认开、账户模式默认关）：
+
+| 路径 | 页面 | 鉴权 |
+|---|---|---|
+| `/` | 图形化解析页（含浏览器内混流、代理下载） | 页面公开；解析与用量要账号 Key（ease 模式不需要） |
+| `/admin` | **管理面板**（概览 / 建号 / 改配额改倍率 / 停用删除 / 系数表） | 页面公开；所有数据要**管理 Key**，在页面顶部填入 |
+
+```bash
+VL_WEBUI=true VIDLINK_ADMIN_KEY=... ./vidlink
+# 打开 http://127.0.0.1:8080/      解析页
+# 打开 http://127.0.0.1:8080/admin 管理面板（填管理 Key 后自动带上）
+```
+
+管理面板不引用任何外部资源（离线/内网可用），它发出的每个请求都会自动带上
+管理 Key（内部请求走 `X-API-Key` 头，页面里的链接自动拼 `?key=`）。
+面板只在账户模式下存在：`VL_EASE=true` 时 `/admin` 是 404，
+因为那时没有账号体系可管理。
 
 ## 配置
 
@@ -341,6 +377,8 @@ Windows 计划任务）设环境变量会失败或悄悄丢掉，而"配置没�
 ```bash
 # .vl —— 一行一个 KEY=VALUE；空行与 # 开头的行忽略
 VL_EASE=true
+VIDLINK_ADMIN_KEY=vl_admin_...        # 管理接口的固定 Key（不写就没有管理接口）
+VL_WEBUI=true                         # 打开解析页与管理面板
 VIDLINK_ACCOUNTS_PATH=/var/lib/vidlink/accounts.jsonl
 VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 ```
@@ -377,7 +415,7 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VL_EASE` | `false` | **免校验模式**：账户/配额/鉴权整体关闭，只留解析（见上一节） |
 | `VL_WEBUI` | 跟随模式（ease `true` / 账户 `false`） | 根路径是否返回**图形化页面**；显式设置两个方向都有效 |
 | `VIDLINK_ADDR` | `:8080` | 监听地址 |
-| `VIDLINK_ADMIN_KEY` | 空 | 首次启动时用它创建初始管理员；空则随机生成并打印一次 |
+| `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
 | `VIDLINK_RATE_LIMIT_RPM` | `120` | 每 IP 每分钟请求上限；`0` = 不限 |
 | `VIDLINK_PER_KEY_CONCURRENCY` | `1` | 同一个 Key 的同时请求数 |
@@ -428,7 +466,7 @@ make help             # 全部可用目标
 ```bash
 docker run -d -p 8080:8080 \
   -v vidlink-data:/app/data \
-  -e VIDLINK_ADMIN_KEY="$(openssl rand -hex 32)" \
+  -e VIDLINK_ADMIN_KEY="$(openssl rand -hex 32)" \  # 记住它：这是唯一的管理凭据
   vidlink:latest
 # 抖音需要访客身份时，再把 VIDLINK_COOKIE_DOUYIN 传进来（本地铸造，见上文）
 ```
@@ -439,7 +477,7 @@ docker run -d -p 8080:8080 \
 
 ```
 vidlink/
-├── main.go                          入口：装配 + 初始管理员引导 + 优雅关闭 + 探针模式
+├── main.go                          入口：装配 + 优雅关闭 + 探针模式
 ├── Makefile                         常用开发与运维命令
 ├── Dockerfile                       scratch 镜像（静态二进制 + CA）
 ├── .github/workflows/ci.yml         格式/静态检查/测试/交叉编译/镜像

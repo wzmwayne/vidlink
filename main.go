@@ -12,8 +12,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -133,15 +131,13 @@ func run() error {
 		}
 		defer func() { _ = accounts.Close() }()
 
-		// 冷启动：账本里没有管理员时自动创建一个。
-		// 否则第一次部署会陷入"没有管理员 → 无法创建账号 → 永远没有管理员"。
-		adminKey, err := ensureAdmin(accounts, logger, cfg.AdminKey)
-		if err != nil {
-			return err
-		}
-		if adminKey != "" {
-			logger.Warn("已创建初始管理员账号，请立即保存这个 Key（只显示这一次）",
-				"admin_key", adminKey)
+		// 管理面**不再有"初始管理员账号"这种东西**：管理权限属于一个
+		// 固定的服务级 Key（VIDLINK_ADMIN_KEY，可写在 .vl 里），与账本无关。
+		// 因此这里只剩一件事：没配就说清楚管理接口不可用，
+		// 而不是留一个看起来能用、实际每次都 403 的管理面让人自己猜。
+		if strings.TrimSpace(cfg.AdminKey) == "" {
+			logger.Warn("未配置管理 Key（VIDLINK_ADMIN_KEY）：/v1/admin/* 将始终返回 403；" +
+				"账号只能通过账本文件直接维护")
 		}
 	}
 
@@ -292,68 +288,3 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 			"admin_key_configured", cfg.AdminKey != "")
 	}
 }
-
-// ensureAdmin 在账本里没有任何启用的管理员时创建一个，并返回它的明文 Key。
-// 已经有管理员则返回空串（此时 wantKey 被忽略）。
-//
-// 为什么需要它：全新的部署没有任何账号，而创建账号的接口本身又需要
-// 管理员权限——不自动引导就会死锁。Key 只在创建时打印一次，
-// 之后所有接口都只返回掩码。
-//
-// wantKey 非空时用它作为初始 Key（便于部署自动化），为空则随机生成 256 位。
-func ensureAdmin(store *account.Store, logger *slog.Logger, wantKey string) (string, error) {
-	for _, a := range store.List() {
-		if a.Admin && !a.Disabled {
-			return "", nil
-		}
-	}
-
-	key := strings.TrimSpace(wantKey)
-	generated := false
-	if key == "" {
-		var b [32]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", fmt.Errorf("生成管理员 Key 失败: %w", err)
-		}
-		key = "vl_admin_" + hex.EncodeToString(b[:])
-		generated = true
-	}
-
-	// 这个 Key 可能已经作为普通账号存在（比如上一次部署手工建过）：
-	// 直接提升为管理员，比报"账号已存在"然后卡在无管理员状态要好。
-	if _, ok := store.Get(key); ok {
-		if _, err := store.Update(key, account.Patch{
-			Admin: boolPtr(true), Disabled: boolPtr(false),
-		}); err != nil {
-			return "", fmt.Errorf("提升已有账号为管理员失败: %w", err)
-		}
-		logger.Info("账本中没有启用的管理员，已把指定 Key 的账号提升为管理员")
-		return key, nil
-	}
-
-	if _, err := store.Create(account.Account{
-		Key:        key,
-		Name:       "初始管理员",
-		Admin:      true,
-		Quota:      initialAdminQuota,
-		Multiplier: 1,
-		Note:       "由服务自动创建；可改配额与账号倍率",
-	}); err != nil {
-		return "", fmt.Errorf("创建管理员失败: %w", err)
-	}
-	if generated {
-		logger.Info("账本中没有管理员，已创建初始管理员（随机 Key）")
-	} else {
-		logger.Info("账本中没有管理员，已用 VIDLINK_ADMIN_KEY 创建初始管理员")
-	}
-	return key, nil
-}
-
-func boolPtr(b bool) *bool { return &b }
-
-// initialAdminQuota 是自动创建的初始管理员的配额。
-//
-// 不能给 0：全新部署时操作者手里只有这一个 Key，配额 0 会让它连
-// 一个计量端点都调不动，必须先去管理接口给自己改配额——第一次使用
-// 就卡住，是纯粹的摩擦。
-const initialAdminQuota = 1_000_000

@@ -17,9 +17,15 @@ import (
 
 // adminRoutes 是管理面路由。
 //
-// 为什么单独一张表：管理端点的鉴权规则与业务端点不同（要 admin 标记），
+// 为什么单独一张表：管理端点用的是**固定管理 Key**（配置项
+// VIDLINK_ADMIN_KEY），而不是账本里的账号，鉴权路径与业务端点完全不同；
 // 而它们**同样不能**被 404/405 判定逻辑漏掉，所以必须与业务路由一起
 // 交给同一套 fallback 处理。
+//
+// 管理 Key 与账号体系互不蕴含：
+//   - 管理 Key 不能用来解析（它不是账号，计量端点会回 403）；
+//   - 账号也不是管理员（账号结构里没有权限位，改配额/改倍率都改不出管理权）；
+//   - 未配置管理 Key 时，这里注册的每条路由都恒返回 403。
 func (s *Server) adminRoutes() []routeSpec {
 	return []routeSpec{
 		{method: http.MethodGet, path: "/v1/admin/accounts", admin: true,
@@ -48,7 +54,7 @@ func (s *Server) adminRoutes() []routeSpec {
 // 这个端点的意义是"让管理员能自己核对一次调用到底扣多少"，
 // 而不用去读源码或翻文档。
 func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	preauth := map[string]float64{}
@@ -73,26 +79,23 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// requireAdmin 校验当前账号是不是管理员。
+// requireAdmin 确认本次请求已经过了管理 Key 校验。
 //
-// 返回的是**未掩码**的账号，因为后续操作（改配额、改倍率）需要它。
-func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (account.Account, bool) {
-	acct, ok := accountFrom(r.Context())
-	if !ok {
-		writeError(w, core.Errf(core.KindForbidden, "", "auth", "缺少 API Key"))
-		return account.Account{}, false
-	}
-	if !acct.Admin {
-		// 刻意不透露"这个端点存在但你没权限"以外的任何信息
+// 校验本身在中间件里完成（serveAdminKey），这里只读上下文标记：
+// handler 再拿一次管理 Key 既没必要，也多一处可能被打印进日志的地方。
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if !adminAuthed(r.Context()) {
+		// 正常路径下中间件已经拦住了，走到这里是编程错误（漏挂中间件）；
+		// 给 403 而不是 500：口径必须是"没通过管理 Key 校验"。
 		writeError(w, core.Errf(core.KindForbidden, "", "auth",
-			"该端点需要管理员权限"))
-		return account.Account{}, false
+			"该端点需要管理 Key（X-API-Key 头、Authorization: Bearer 或 ?key=）"))
+		return false
 	}
-	return acct, true
+	return true
 }
 
 func (s *Server) handleAdminListAccounts(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -111,17 +114,16 @@ type createAccountRequest struct {
 	Name       string   `json:"name"`
 	Quota      *float64 `json:"quota"`
 	Multiplier *float64 `json:"multiplier"`
-	Admin      bool     `json:"admin"`
 	Note       string   `json:"note"`
 }
 
 func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	var req createAccountRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
-		writeError(w, core.BadInput("", "请求体不是合法 JSON: %v", err))
+	if err := decodeStrictJSON(w, r, &req); err != nil {
+		writeError(w, core.BadInput("", "请求体不合法: %v", err))
 		return
 	}
 
@@ -148,8 +150,7 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 	}
 
 	a, err := s.accounts.Create(account.Account{
-		Key: key, Name: req.Name, Quota: q, Multiplier: mult,
-		Admin: req.Admin, Note: req.Note,
+		Key: key, Name: req.Name, Quota: q, Multiplier: mult, Note: req.Note,
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrDuplicate) {
@@ -171,11 +172,10 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminGetAccount(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
-	key := r.PathValue("key")
-	a, ok := s.accounts.Get(key)
+	a, ok := s.accounts.Resolve(r.PathValue("key"))
 	if !ok {
 		writeError(w, core.NotFound("", "账号不存在"))
 		return
@@ -193,17 +193,20 @@ type patchAccountRequest struct {
 	AddQuota   *float64 `json:"add_quota"`
 	Multiplier *float64 `json:"multiplier"`
 	Disabled   *bool    `json:"disabled"`
-	Admin      *bool    `json:"admin"`
 }
 
 func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
-	key := r.PathValue("key")
+	acct, ok := s.accounts.Resolve(r.PathValue("key"))
+	if !ok {
+		writeError(w, core.NotFound("", "账号不存在"))
+		return
+	}
 	var req patchAccountRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
-		writeError(w, core.BadInput("", "请求体不是合法 JSON: %v", err))
+	if err := decodeStrictJSON(w, r, &req); err != nil {
+		writeError(w, core.BadInput("", "请求体不合法: %v", err))
 		return
 	}
 	if req.Quota != nil && req.AddQuota != nil {
@@ -212,10 +215,10 @@ func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	a, err := s.accounts.Update(key, account.Patch{
+	a, err := s.accounts.Update(acct.Key, account.Patch{
 		Name: req.Name, Note: req.Note,
 		Quota: req.Quota, AddQuota: req.AddQuota,
-		Multiplier: req.Multiplier, Disabled: req.Disabled, Admin: req.Admin,
+		Multiplier: req.Multiplier, Disabled: req.Disabled,
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
@@ -229,17 +232,17 @@ func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	admin, ok := s.requireAdmin(w, r)
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	// 不需要"不能删自己"的保护：管理 Key 不是账号，删哪个账号
+	// 都不会影响管理面本身的可达性（这正是把 admin 移出账本换来的性质）。
+	acct, ok := s.accounts.Resolve(r.PathValue("key"))
 	if !ok {
+		writeError(w, core.NotFound("", "账号不存在"))
 		return
 	}
-	key := r.PathValue("key")
-	if key == admin.Key {
-		// 删掉自己会立刻失去管理能力，且没有任何界面能恢复
-		writeError(w, core.BadInput("", "不能删除当前正在使用的管理员账号"))
-		return
-	}
-	if err := s.accounts.Delete(key); err != nil {
+	if err := s.accounts.Delete(acct.Key); err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			writeError(w, core.NotFound("", "账号不存在"))
 			return
@@ -251,7 +254,7 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -264,6 +267,18 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			"uptime_sec": int(time.Since(s.startedAt).Seconds()),
 		},
 	})
+}
+
+// decodeStrictJSON 解析管理面的请求体，**拒绝未知字段**。
+//
+// 为什么比默认行为更严：账号结构里已经不存在 admin 这类字段了，
+// 而静默忽略未知字段会让调用方以为"已经设置成功"——比如
+// {"admin":true} 会返回 200 却什么也没发生，接着就是拿着一把
+// 永远 403 的 Key 排查半天。宁可现在报 400 并说清哪个字段不认识。
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
 }
 
 // newAPIKey 生成一个 256 位随机 Key。

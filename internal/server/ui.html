@@ -103,7 +103,9 @@
   <span class="tag ease" id="modeTag">…</span>
   <span class="tag" id="verTag">…</span>
   <span class="tag" id="platTag">…</span>
-  <span class="status" id="hdr" style="margin-left:auto"></span>
+  <!-- 管理面板：只在账户模式 + WebUI 打开时存在（页面对它做一次探测，见 boot） -->
+  <a class="btn hidden" id="adminLink" href="/admin" style="margin-left:auto">管理面板</a>
+  <span class="status" id="hdr"></span>
 </header>
 
 <main>
@@ -897,6 +899,14 @@
       // 媒体代理是否开启由健康检查直接告知，避免额外发一次注定 404 的探测请求
       proxyEnabled = !!(h.body && h.body.proxy);
       $("#hdr").textContent = proxyEnabled ? "媒体代理：开启" : "媒体代理：关闭";
+      // 管理面板只有账户模式下存在（免校验模式没有账号体系，也没有管理接口）。
+      // 面板本身要填管理 Key 才能用，所以这里只是给个入口，不涉及任何权限判断。
+      if (webuiMode === "account") {
+        // 用 HEAD 探一下（很便宜）：200 说明管理面板确实在提供；
+        // 403/404 都表示没有这个页面（WebUI 关着，或当前无人能访问管理面）。
+        const probe = await api("/admin", { method: "HEAD" });
+        if (probe.status === 200) $("#adminLink").classList.remove("hidden");
+      }
     } catch (_) { /* 页面能用就行，失败不阻塞 */ }
 
     try {

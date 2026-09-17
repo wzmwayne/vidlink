@@ -111,7 +111,7 @@ www.bilibili.com/video/BV1294y1Y7tU/             ← 从地址栏/分享面板�
 | Bearer | `Authorization: Bearer vl_xxx` |
 | 查询参数 | `?key=vl_xxx`（会进访问日志与浏览器历史，仅测试用） |
 
-Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一次**，
+Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回一次**，
 之后所有接口只返回掩码；若丢失，请删除该账号并重建。
 
 失败一律 `403` + `kind: "forbidden"`，并且**不区分**"Key 不存在"与"Key 错误"
@@ -232,7 +232,8 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 | 按 Key 并发 | 1（第二个请求 429） | 不适用 |
 | 按 IP 限流 | 按配置 | **关闭** |
 | `/v1/usage` | 可用 | **404** |
-| `/v1/admin/*` | 可用（管理员） | **404** |
+| `/v1/admin/*` | 可用（凭据是固定的管理 Key） | **404** |
+| `/admin`（管理面板）、`/`（解析页） | 视 `VL_WEBUI`（默认关） | **404** / 视 `VL_WEBUI`（默认开） |
 | `/v1/platforms` | 含 `rates` / `unit` | 不含 `rates` / `unit` |
 | 解析端点 | 可用（需 Key） | **可用（无凭据）** |
 | 根路径 `/` | 视 `VL_WEBUI`（默认纯文本导航页，需 Key） | 视 `VL_WEBUI`（默认**图形化解析页**） |
@@ -251,14 +252,14 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 ### 3.1 `GET /v1/version` · 公开
 
 ```json
-{"version": "v0.87", "api_version": "v1", "platform": "linux/arm64"}
+{"version": "v0.88", "api_version": "v1", "platform": "linux/arm64"}
 ```
 
 ### 3.2 `GET /v1/health` · 公开
 
 ```json
 {
-  "status": "ok", "version": "v0.87", "api_version": "v1",
+  "status": "ok", "version": "v0.88", "api_version": "v1",
   "uptime_sec": 3821, "requests": 10422, "errors": 37,
   "cache": {"entries": 128, "hits": 9014, "misses": 1408, "coalesced": 52, "loads": 1408}
 }
@@ -414,19 +415,36 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 - `cost` 已包含账号倍率，与响应头 `X-Quota-Consumed` 一致；
 - 抖音在**解析前**就被挡掉（纯本地平台判定），不浪费上游请求与 IP 风控额度。
 
-### 3.9 管理端点 `/v1/admin/*` · 需管理员 Key · 免校验模式下不存在
+### 3.9 管理端点 `/v1/admin/*` · 需固定管理 Key · 免校验模式下不存在
 
 > `VL_EASE=true` 时管理面整体不注册，所有 `/v1/admin/*` 返回 `404`。
 
-管理端点需要账号带 `admin: true`，否则 `403`。
-所有响应里的 Key 都是掩码（创建时除外）。
+**管理凭据是一个固定的 Key**，来自环境变量或 `.vl` 里的 `VIDLINK_ADMIN_KEY`；
+它不是账本里的账号，账号也没有任何权限位：
+
+| 情况 | 结果 |
+| --- | --- |
+| 请求里的 Key == `VIDLINK_ADMIN_KEY` | 放行 |
+| 是账本里的账号 Key（哪怕配额很高） | `403 forbidden` |
+| 没有配置 `VIDLINK_ADMIN_KEY` | `403 forbidden`，message 里点名该配置项 |
+| 传 Key 的方式 | 与业务端点一致：`X-API-Key` 头 / `Authorization: Bearer` / `?key=` |
+
+由此推出的两条性质：
+
+- 管理 Key **不能**用来解析视频（它不在账本里，计量端点会回 `403`）；
+- 账本里**不存在**"管理员账号"这种东西，`{"admin":true}` 这类字段会被
+  `400` 拒绝（未知字段不静默忽略）。
+
+所有响应里的账号 Key 都是掩码（创建那一次除外）；
+每个账号还有一个**公开句柄** `id`（`acc_` + Key 的 SHA-256 截断），
+可以拿它代替明文 Key 出现在路径里（管理面板就是这么做的）。
 
 #### `GET /v1/admin/accounts`
 
 ```json
 {
   "accounts": [{
-    "key": "vl_a********3f7c", "name": "示例账号", "admin": false,
+    "id": "acc_1f2e3d4c5b6a7980", "key": "vl_a********3f7c", "name": "示例账号",
     "quota": 87.3, "multiplier": 1.0, "used": 12.7, "calls": 14,
     "disabled": false, "created_at": "2026-01-02T03:04:05Z",
     "updated_at": "2026-01-02T03:04:05Z", "note": "备注"
@@ -439,8 +457,10 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 #### `POST /v1/admin/accounts`
 
 ```json
-{"name": "新账号", "quota": 100, "multiplier": 1.0, "admin": false, "note": "备注"}
+{"name": "新账号", "quota": 100, "multiplier": 1.0, "note": "备注"}
 ```
+
+请求体里出现未知字段（例如老接口的 `admin`）会返回 `400`，而不是被静默忽略。
 
 - 不填 `key` 时自动生成 256 位随机 Key；
 - `quota` = 初始配额；`multiplier` 缺省为 `1.0`（**不是 0**，0 是"不扣配额"）；
@@ -452,9 +472,11 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
  "notice": "请立即保存这个 Key，它只会出现这一次"}
 ```
 
-#### `GET /v1/admin/accounts/{key}`
+#### `GET /v1/admin/accounts/{key|id}`
 
-查看单个账号（掩码 Key）。路径里的 `{key}` 用**明文 Key**。
+查看单个账号（掩码 Key + 句柄）。路径参数可以是**明文 Key**，
+也可以是列表里的**句柄 `id`**——后者让管理面板不必接触明文 Key。
+掩码 Key（`vl_a********3f7c`）**不能**当路径参数用，会得到 `404`。
 
 #### `PATCH /v1/admin/accounts/{key}`
 
@@ -462,8 +484,7 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 不能同时使用：
 
 ```json
-{"name": "改名", "note": "备注", "add_quota": 50, "multiplier": 0.5,
- "disabled": false, "admin": true}
+{"name": "改名", "note": "备注", "add_quota": 50, "multiplier": 0.5, "disabled": false}
 ```
 
 常用组合：
@@ -478,7 +499,9 @@ Key 由管理员创建（见 §3.9）。**Key 的明文只在创建时返回一�
 
 #### `DELETE /v1/admin/accounts/{key}`
 
-删除账号（写删除墓碑，重启不会复活）。**不能删除当前正在使用的管理员账号**。
+删除账号（写删除墓碑，重启不会复活）。路径参数同样可以用明文 Key 或句柄 `id`。
+
+删掉任何账号（包括唯一那个）都不会影响管理面本身——管理 Key 不在账本里。
 
 #### `GET /v1/admin/stats`
 
@@ -611,9 +634,9 @@ VIDLINK_PROXY_ALLOW_HOSTS=*.bilivideo.com      # 可选；留空 = 不限制
 
 | 字段 | 说明 |
 | --- | --- |
+| `id` | 公开句柄 `acc_…`（Key 的哈希截断，可用于路径参数） |
 | `key` | API Key（除创建外一律掩码 `vl_a********3f7c`） |
 | `name` / `note` | 名称与备注 |
-| `admin` | 是否管理员 |
 | `quota` | **剩余可用配额** |
 | `used` | 累计消耗（已按账号倍率折算） |
 | `calls` | 累计调用次数（含倍率为 0 的调用） |
@@ -770,13 +793,14 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 |
 | POST | `/v1/batch/links` | Key | 0.75/条，5~20 条，无抖音 |
 | GET | `/v1/proxy?url=` | Key | —（默认关闭） |
-| GET | `/v1/admin/accounts` | 管理员 | — |
-| POST | `/v1/admin/accounts` | 管理员 | — |
-| GET | `/v1/admin/accounts/{key}` | 管理员 | — |
-| PATCH | `/v1/admin/accounts/{key}` | 管理员 | — |
-| DELETE | `/v1/admin/accounts/{key}` | 管理员 | — |
-| GET | `/v1/admin/stats` | 管理员 | — |
-| GET | `/v1/admin/quota` | 管理员 | — |
+| GET | `/admin` | 公开（页面壳，数据要管理 Key） | —（需 `VL_WEBUI` 且非 ease） |
+| GET | `/v1/admin/accounts` | 管理 Key | — |
+| POST | `/v1/admin/accounts` | 管理 Key | — |
+| GET | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
+| PATCH | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
+| DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
+| GET | `/v1/admin/stats` | 管理 Key | — |
+| GET | `/v1/admin/quota` | 管理 Key | — |
 
 其他文档：
 
