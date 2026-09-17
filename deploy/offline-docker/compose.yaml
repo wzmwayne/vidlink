@@ -1,0 +1,38 @@
+# vidlink —— 与 vaultwarden 同一套配置风格：
+#   应用容器 + 独立的 cloudflared 容器（token 方式），数据用 ./ 下的目录 bind mount。
+#
+# 端口：设备上是 18080（vaultwarden 占了 8080），容器内是 8080（写死无所谓）。
+# 只绑 127.0.0.1：局域网/Tailscale 都访问不到，对外只走 cloudflared 隧道。
+# 想让局域网直接访问就把它改成 "18080:8080"。
+services:
+  vidlink:
+    build: .
+    image: vidlink:latest
+    container_name: vidlink
+    restart: unless-stopped
+    user: "1000:1000"          # = wayne；./vl-data 属于他，scratch 里没法 chown
+    volumes:
+      - ./vl-data:/app/data
+    environment:
+      - VL_EASE=false                                     # 账户模式：Key + 配额 + 管理面板
+      - VL_WEBUI=true                                     # / 解析页，/admin 管理面板
+      - VIDLINK_PROXY_ENDPOINT=true                       # 媒体代理（前端混流/代理下载要用）
+      - VIDLINK_PROXY_ALLOW_HOSTS=bilivideo.com,bilivideo.cn,mountaintoys.cn,douyinvod.com
+      - VIDLINK_TRUSTED_PROXY_HEADER=CF-Connecting-IP      # 经隧道后取真实客户端 IP
+      - VIDLINK_RATE_LIMIT_RPM=120
+    env_file:
+      - .env                    # VIDLINK_ADMIN_KEY 与抖音 Cookie（权限 600）
+    ports:
+      - "127.0.0.1:18080:8080"
+
+  # 隧道容器：等拿到 tunnel token 后取消注释（与 vaultwarden 那份写法一致）。
+  # 对应的 Public Hostname 里 Service 填 http://vidlink:8080
+  # （同一 compose 网络的容器名，不要填 127.0.0.1）。
+  #
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: vidlink-cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token <TUNNEL_TOKEN>
+  #   depends_on:
+  #     - vidlink
