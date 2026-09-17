@@ -77,6 +77,14 @@
   .pill.warn { color: var(--warn); border-color: #4a3a12; }
   .numin { width: 96px; }
   .multin { width: 76px; }
+  /* 每个编辑框自成一组：控件在上，说明文字紧贴在同一列的正下方。
+     之前所有输入框并排、说明只藏在 title 里，根本分不清哪个是哪个。 */
+  .fields { display: flex; flex-wrap: wrap; gap: 12px 18px; margin-top: 10px; }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .field > .ctl { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+  .field > .cap { font-size: 11px; line-height: 1.35; color: var(--dim); }
+  .field > .cap b { color: var(--fg); font-weight: 600; }
+  .acct-acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
   pre {
     background: #0f1115; border: 1px solid var(--line); border-radius: 8px;
     padding: 10px; overflow: auto; max-height: 420px;
@@ -486,42 +494,67 @@
       return card;
     }
 
-    const btns = el("div", "btns");
-    const amount = el("input", "numin");
-    amount.value = "100";
-    amount.setAttribute("aria-label", "配额调整量");
-    const mult = el("input", "multin");
-    mult.value = String(a.multiplier);
-    mult.setAttribute("aria-label", "账号倍率");
     const mk = (label, act, cls) => {
       const b = el("button", cls, label);
       b.dataset.act = act;
       b.dataset.id = a.id;
       return b;
     };
-    btns.appendChild(amount);
-    btns.appendChild(mk("加配额", "add"));
-    btns.appendChild(mk("减配额", "sub"));
-    btns.appendChild(mk("设为", "set"));
-    btns.appendChild(mult);
-    btns.appendChild(mk("应用倍率", "mult"));
-    // 每日签到额度与"停止增加界限"：用户自己调 POST /v1/checkin 领取，每天一次
-    const grant = el("input", "numin");
-    grant.value = a.daily_grant ? String(a.daily_grant) : "0";
-    grant.setAttribute("aria-label", "每日签到额度");
-    const gcap = el("input", "numin");
-    gcap.value = a.grant_cap ? String(a.grant_cap) : "0";
-    gcap.setAttribute("aria-label", "停止增加界限");
-    btns.appendChild(grant);
-    btns.appendChild(gcap);
-    btns.appendChild(mk("应用签到", "grant"));
-    btns.appendChild(mk(a.disabled ? "启用" : "停用", "toggle"));
-    btns.appendChild(mk("详情", "get"));
-    btns.appendChild(mk("流水", "ledger"));
-    const del = mk("删除", "del", "danger");
+    // 一个编辑框 = 一组：控件在上、说明紧跟在同一列正下方，
+    // 这样"哪个框是干什么的"不用靠悬停猜（之前正是这里让人迷惑）。
+    const field = (ctl, cap) => {
+      const f = el("div", "field");
+      const c = el("div", "ctl");
+      ctl.forEach((n) => c.appendChild(n));
+      f.appendChild(c);
+      const d = el("div", "cap");
+      if (typeof cap === "string") d.textContent = cap;
+      else cap.forEach((n) => d.appendChild(n));
+      f.appendChild(d);
+      return f;
+    };
+    const input = (cls, value, aria) => {
+      const i = el("input", cls);
+      i.value = String(value);
+      i.setAttribute("aria-label", aria);
+      return i;
+    };
+
+    const fields = el("div", "fields");
+
+    // 配额：加/减是增量，设为是覆盖当前余额
+    const amount = input("numin qtyin", "100", "配额调整量");
+    fields.appendChild(field([amount, mk("加配额", "add"), mk("减配额", "sub"), mk("设为", "set")],
+      [el("b", null, "配额调整"),
+       document.createTextNode("：加/减是在当前余额上增减，设为直接覆盖（当前 " + fmtNum(a.quota) + "）")]));
+
+    // 账号倍率
+    const mult = input("multin", a.multiplier, "账号倍率");
+    fields.appendChild(field([mult, mk("应用倍率", "mult")],
+      "账号倍率：0 不扣配额、0.5 减半、1 标准、2 加倍"));
+
+    // 每日签到额度（用户自己调 POST /v1/checkin 领，每天一次）
+    const grant = input("numin grantin", a.daily_grant ? a.daily_grant : 0, "每日签到额度");
+    fields.appendChild(field([grant, mk("应用", "grant")],
+      [el("b", null, "每日签到额度"),
+       document.createTextNode("：用户每天签到一次可领这么多；0 = 不开放签到")]));
+
+    // 停止增加界限
+    const gcap = input("numin capin", a.grant_cap ? a.grant_cap : 0, "停止增加界限");
+    fields.appendChild(field([gcap, mk("应用", "gcap")],
+      [el("b", null, "停止增加界限"),
+       document.createTextNode("：余额到此不再增加（签到会被截断到该值）；0 = 不封顶")]));
+
+    card.appendChild(fields);
+
+    const acts = el("div", "acct-acts");
+    acts.appendChild(mk(a.disabled ? "启用账号" : "停用账号", "toggle"));
+    acts.appendChild(mk("查看详情", "get"));
+    acts.appendChild(mk("查看流水", "ledger"));
+    const del = mk("删除账号", "del", "danger");
     del.style.marginLeft = "auto";
-    btns.appendChild(del);
-    card.appendChild(btns);
+    acts.appendChild(del);
+    card.appendChild(acts);
     return card;
   }
 
@@ -577,10 +610,11 @@
   // 在账号卡片上就地取值（金额/倍率输入框是每张卡片各自的）
   function cardInputs(btn) {
     const card = btn.closest(".acct");
-    const nums = card.querySelectorAll(".numin");
     return {
-      amount: nums[0], mult: card.querySelector(".multin"),
-      grant: nums[1], gcap: nums[2],
+      amount: card.querySelector(".qtyin"),
+      mult: card.querySelector(".multin"),
+      grant: card.querySelector(".grantin"),
+      gcap: card.querySelector(".capin"),
     };
   }
 
@@ -607,14 +641,23 @@
           return;
         }
         case "grant": {
-          const inp = cardInputs(btn);
-          const g = num(inp.grant.value, NaN), c = num(inp.gcap.value, NaN);
-          if (!Number.isFinite(g) || g < 0 || !Number.isFinite(c) || c < 0) {
-            setKeyState("签到额度与界限要填非负数（0 = 不开放 / 不封顶）。", true);
+          const v = num(cardInputs(btn).grant.value, NaN);
+          if (!Number.isFinite(v) || v < 0) {
+            setKeyState("每日签到额度要填非负数（0 = 不开放签到）。", true);
             return;
           }
-          await patch(id, { daily_grant: g, grant_cap: c },
-            g > 0 ? ("每日签到 +" + g + (c > 0 ? "，界限 " + c : "（不封顶）")) : "关闭每日签到");
+          await patch(id, { daily_grant: v },
+            v > 0 ? ("每日签到额度设为 " + v) : "关闭每日签到");
+          return;
+        }
+        case "gcap": {
+          const v = num(cardInputs(btn).gcap.value, NaN);
+          if (!Number.isFinite(v) || v < 0) {
+            setKeyState("停止增加界限要填非负数（0 = 不封顶）。", true);
+            return;
+          }
+          await patch(id, { grant_cap: v },
+            v > 0 ? ("停止增加界限设为 " + v) : "取消停止增加界限（不封顶）");
           return;
         }
         case "mult": {
