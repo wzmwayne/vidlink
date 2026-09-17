@@ -258,3 +258,34 @@ func TestVLConfigOverride(t *testing.T) {
 		t.Fatal("VL_CONFIG 指向不存在的文件时应报错")
 	}
 }
+
+// TestWebUIFollowsMode：VL_WEBUI 的默认值跟随运行模式，显式设置优先。
+//
+//	免校验模式：默认开（自用工具的场景）
+//	账户模式  ：默认关（常部署在公网，不该默认多一个界面）
+func TestWebUIFollowsMode(t *testing.T) {
+	cases := []struct {
+		ease, webui string
+		want        bool
+	}{
+		{"", "", false},          // 账户模式，未设置 → 关
+		{"", "true", true},       // 账户模式，显式开
+		{"", "false", false},     // 账户模式，显式关
+		{"true", "", true},       // ease，未设置 → 开
+		{"true", "true", true},   // ease，显式开
+		{"true", "false", false}, // ease，显式关
+	}
+	for _, c := range cases {
+		t.Run("ease="+c.ease+",webui="+c.webui, func(t *testing.T) {
+			t.Setenv("VL_EASE", c.ease)
+			t.Setenv("VL_WEBUI", c.webui)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load 失败: %v", err)
+			}
+			if cfg.WebUI != c.want {
+				t.Fatalf("WebUI = %v，想要 %v", cfg.WebUI, c.want)
+			}
+		})
+	}
+}

@@ -60,6 +60,14 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 			next.ServeHTTP(w, r)
 			return
 		}
+		// 根路径在开启 WebUI 时也要公开：页面本身不含任何数据（数据全靠
+		// 页面里带的 Key 去请求），若不公开，浏览器只会拿到一个 403 JSON，
+		// 用户连填 Key 的地方都没有。
+		if s.cfg.WebUI && r.URL.Path == "/" &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		key := resolveKey(r)
 		if key == "" {

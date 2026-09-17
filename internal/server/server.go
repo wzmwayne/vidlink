@@ -250,11 +250,10 @@ func (s *Server) Handler() http.Handler {
 // 又想要正确的 405，两者不可兼得，于是自己判。
 func (s *Server) fallback(specs []routeSpec) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 根路径：免校验模式给图形化解析页；账户模式给纯文本导航页
-		// （账户模式的页面需要凭据，做成网页就得先解决"Key 从哪来"，不适合直接摊开）。
+		// 根路径：开着 WebUI 就给图形化解析页，否则给纯文本导航页。
 		if r.URL.Path == "/" {
 			if r.Method == http.MethodGet || r.Method == http.MethodHead {
-				if s.cfg.IsEase() {
+				if s.cfg.WebUI {
 					s.handleUI(w, r)
 					return
 				}
@@ -575,6 +574,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"requests":    s.reqCount.Load(),
 		"errors":      s.errCount.Load(),
 		"proxy":       s.cfg.ProxySrv.Enabled,
+		"webui":       s.cfg.WebUI,
 		"cache":       s.svc.CacheStats(),
 	})
 }

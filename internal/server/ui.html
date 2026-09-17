@@ -107,11 +107,42 @@
 </header>
 
 <main>
-  <div class="warnbox" style="border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:14px">
+  <div class="warnbox hidden" id="easeNote"
+       style="border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:14px">
     免校验模式：本页直接调用解析接口，<b>不需要 API Key</b>，也<b>不计量配额</b>
     （响应里没有 <code>X-Quota-Consumed</code> / <code>X-Quota-Remaining</code>）。
     请勿把本服务暴露到公网。
   </div>
+
+  <!-- 身份：账户模式下必须填 Key -->
+  <section id="authsec" class="hidden">
+    <h2>API Key</h2>
+    <div class="row">
+      <div class="col" style="flex:3 1 320px">
+        <label for="apikey">账户模式下所有请求都要带上它（只存在本机浏览器里）</label>
+        <input id="apikey" type="password" placeholder="vl_..." autocomplete="off" spellcheck="false">
+      </div>
+      <div class="col narrow" style="flex:0 1 120px">
+        <label>&nbsp;</label>
+        <button class="primary" id="keySave" style="width:100%">保存</button>
+      </div>
+      <div class="col narrow" style="flex:0 1 120px">
+        <label>&nbsp;</label>
+        <button id="keyClear" style="width:100%">清除</button>
+      </div>
+    </div>
+    <div class="hint" id="keyState">未填写 Key，解析与用量查询都会被拒（403）。</div>
+  </section>
+
+  <!-- 账户与用量 -->
+  <section id="usagesec" class="hidden">
+    <h2>账户与用量</h2>
+    <div id="usage">（点右侧刷新）</div>
+    <div class="btns">
+      <button id="usageRefresh">刷新用量</button>
+      <span class="status" id="usageStatus" style="align-self:center"></span>
+    </div>
+  </section>
 
   <!-- 单个解析 -->
   <section>
@@ -167,6 +198,7 @@
       流程：按上面的链接与清晰度，<b>流式下载</b>视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
       在页面内合并为单个 MP4 → 保存到本地。适用于返回 <code>audio_url</code> 的平台（如 B 站）。
       合并是<b>片段级重排</b>，不重新编码，所以速度只取决于下载。
+      <span id="muxCostNote"></span>
     </div>
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
@@ -223,12 +255,26 @@
     return n;
   };
   let proxyEnabled = false;
+  let webuiMode = "account";     // 由 /v1/health 告知
+  const KEY_STORE = "vidlink_key";
+  let APIKEY = "";               // 账户模式下的 Key；免校验模式恒为空
 
   // ---------- 基础设施 ----------
 
+  // withKey 把 Key 拼进 URL —— 只有 <a>/<video> 这类走浏览器原生请求的地方
+  // 才需要它（不能自定义请求头）。fetch 一律走 api()，用请求头传 Key。
+  function withKey(url) {
+    if (!APIKEY) return url;
+    return url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(APIKEY);
+  }
+
   async function api(path, opts) {
     const t0 = performance.now();
-    const res = await fetch(path, opts);
+    const o = Object.assign({}, opts);
+    if (APIKEY) {
+      o.headers = Object.assign({}, o.headers, { "X-API-Key": APIKEY });
+    }
+    const res = await fetch(path, o);
     const text = await res.text();
     let body = null;
     try { body = text ? JSON.parse(text) : null; } catch (_) { body = { raw: text }; }
@@ -253,6 +299,11 @@
     const v = $("#view");
     v.textContent = "";
     const e = (res.body && res.body.error) || {};
+    if (res.status === 403 && webuiMode !== "ease") {
+      $("#authsec").classList.remove("hidden");
+      setKeyState("Key 无效或已停用，请在上方重新填写。", true);
+      $("#apikey").focus();
+    }
     const box2 = el("div");
     box2.appendChild(el("div", "mono", "kind: " + (e.kind || "unknown")));
     box2.appendChild(el("div", null, e.message || "（没有错误信息）"));
@@ -374,9 +425,9 @@
       try {
         const title = await ensureTitle();
         const name = dlName(title, kind, quality, ext);
-        const href = "/v1/proxy?url=" + encodeURIComponent(url) +
+        const href = withKey("/v1/proxy?url=" + encodeURIComponent(url) +
                      "&filename=" + encodeURIComponent(name) +
-                     "&type=" + encodeURIComponent(mimeOf(ext));
+                     "&type=" + encodeURIComponent(mimeOf(ext)));
         const a = document.createElement("a");
         a.href = href;
         a.download = name;   // 兜底：服务端已给 Content-Disposition，这个属性再保一层
@@ -721,13 +772,126 @@
     }
   }
 
+  // ---------- 身份与用量 ----------
+
+  function setKeyState(text, bad) {
+    const el2 = $("#keyState");
+    el2.textContent = text;
+    el2.style.color = bad ? "var(--err)" : "var(--dim)";
+  }
+
+  function loadStoredKey() {
+    try { return localStorage.getItem(KEY_STORE) || ""; } catch (_) { return ""; }
+  }
+
+  function storeKey(k) {
+    try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch (_) {}
+  }
+
+  // 用量 / 账户信息：GET /v1/usage（账户模式需要 Key）
+  async function loadUsage() {
+    const box = $("#usage");
+    const st = $("#usageStatus");
+    st.textContent = "";
+    box.textContent = "加载中…";
+    try {
+      const r = await api("/v1/usage");
+      if (r.status !== 200) {
+        box.textContent = "";
+        const e = (r.body && r.body.error) || {};
+        box.appendChild(el("div", "mono", "HTTP " + r.status + "  " + (e.kind || "")));
+        box.appendChild(el("div", null, e.message || ""));
+        if (r.status === 403) setKeyState("Key 无效或已停用，请重新填写。", true);
+        return;
+      }
+      const d = r.body;
+      st.textContent = "HTTP 200  " + r.ms + " ms";
+      box.textContent = "";
+      const dl = el("dl", "kv");
+      const add = (k, v) => {
+        if (v === undefined || v === null || v === "") return;
+        dl.appendChild(el("dt", null, k));
+        dl.appendChild(el("dd", null, String(v)));
+      };
+      add("账号", d.name);
+      add("剩余配额", d.quota);
+      add("累计消耗", d.used);
+      add("累计调用", d.calls + " 次");
+      add("账号倍率", d.multiplier);
+      add("单位", d.unit);
+      box.appendChild(dl);
+      if (d.limits) {
+        const L = d.limits;
+        box.appendChild(el("h2", null, "限制"));
+        const dl2 = el("dl", "kv");
+        const add2 = (k, v) => { dl2.appendChild(el("dt", null, k)); dl2.appendChild(el("dd", null, String(v))); };
+        add2("同一 Key 并发", L.per_key_concurrency);
+        add2("全局解析并发", L.global_concurrency);
+        add2("批量条数", L.batch_min + " ~ " + L.batch_max);
+        box.appendChild(dl2);
+      }
+      if (d.rates) {
+        box.appendChild(el("h2", null, "各端点系数（消耗 = 系数 × 条数 × 你的倍率）"));
+        const t = el("table");
+        const tr = el("tr");
+        ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
+        t.appendChild(tr);
+        Object.keys(d.rates).sort().forEach((p) => {
+          const r2 = el("tr");
+          r2.appendChild(el("td", null, p));
+          ["info", "links", "detail", "batch_links"].forEach((k) => {
+            const v = d.rates[p][k];
+            const cell = el("td", "mono");
+            if (v && typeof v === "object") cell.textContent = "不支持";
+            else cell.textContent = v === undefined ? "—" : v;
+            r2.appendChild(cell);
+          });
+          t.appendChild(r2);
+        });
+        box.appendChild(t);
+      }
+    } catch (e) {
+      box.textContent = "请求失败：" + e;
+    }
+  }
+
+  async function applyKey(k, { save }) {
+    APIKEY = (k || "").trim();
+    if (save) storeKey(APIKEY);
+    if (!APIKEY) {
+      setKeyState("未填写 Key，解析与用量查询都会被拒（403）。", false);
+      $("#usagesec").classList.add("hidden");
+      $("#hdr").textContent = "";
+      return;
+    }
+    setKeyState("已保存（仅存于本机浏览器）。", false);
+    await loadUsage();
+  }
+
   // ---------- 初始化 ----------
 
   async function boot() {
     try {
       const h = await api("/v1/health");
       if (h.body && h.body.mode) {
+        webuiMode = h.body.mode;
         $("#modeTag").textContent = h.body.mode === "ease" ? "免校验模式" : "账户模式";
+      }
+      // 免校验模式：不需要 Key，用量/账户这些概念也不存在
+      // 账户模式：先把 Key 要过来，否则后面每个请求都是 403
+      if (webuiMode === "ease") {
+        $("#easeNote").classList.remove("hidden");
+      } else {
+        $("#muxCostNote").textContent = "注意：本模式下取流地址与代理下载都会消耗账号配额。";
+        $("#authsec").classList.remove("hidden");
+        $("#usagesec").classList.remove("hidden");
+        const stored = loadStoredKey();
+        if (stored) {
+          $("#apikey").value = stored;
+          await applyKey(stored, { save: false });
+        } else {
+          setKeyState("未填写 Key，解析与用量查询都会被拒（403）。", false);
+        }
       }
       if (h.body && h.body.version) $("#verTag").textContent = "v" + h.body.version;
       // 媒体代理是否开启由健康检查直接告知，避免额外发一次注定 404 的探测请求
@@ -780,6 +944,16 @@
     }
     run(act);
   });
+
+  $("#keySave").addEventListener("click", () => applyKey($("#apikey").value, { save: true }));
+  $("#apikey").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") applyKey($("#apikey").value, { save: true });
+  });
+  $("#keyClear").addEventListener("click", () => {
+    $("#apikey").value = "";
+    applyKey("", { save: true });
+  });
+  $("#usageRefresh").addEventListener("click", loadUsage);
 
   $("#batch").addEventListener("input", () => {
     const n = $("#batch").value.split("\n").map((s) => s.trim()).filter(Boolean).length;

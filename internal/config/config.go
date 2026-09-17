@@ -42,6 +42,16 @@ type Config struct {
 	// 把路径和键数打出来，一眼就能分辨。
 	ConfigFile string
 
+	// WebUI 控制根路径是否返回图形化解析页（VL_WEBUI）。
+	//
+	// 默认值跟随运行模式：免校验模式默认开（那本来就是"自用工具"的场景），
+	// 账户模式默认关（常部署在公网，不该默认多一个匿名可达的界面）；
+	// 显式设置两个方向都有效。
+	//
+	// 账户模式下打开它时，页面本身是公开的（否则浏览器拿不到页面、也就
+	// 没地方填 Key），但页面上的一切数据仍要 Key——用量、解析、代理都一样。
+	WebUI bool
+
 	// AdminKey 是**首次启动时**用来创建初始管理员的 Key。
 	//
 	// 为空则自动生成一个随机 Key 并在日志里打印一次（只打印一次）。
@@ -139,9 +149,11 @@ func Load() (*Config, error) {
 	ease := envBool("VL_EASE", false)
 
 	c := &Config{
-		ConfigFile:         path,
-		Addr:               env("VIDLINK_ADDR", ":8080"),
-		Ease:               ease,
+		ConfigFile: path,
+		Addr:       env("VIDLINK_ADDR", ":8080"),
+		Ease:       ease,
+		// 与媒体代理同样的思路：默认值跟随模式，显式设置优先。
+		WebUI:              envBool("VL_WEBUI", ease),
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),

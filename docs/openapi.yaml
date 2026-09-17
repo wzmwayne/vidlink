@@ -512,6 +512,9 @@ components:
       properties:
         status: { type: string, example: ok }
         mode: { type: string, enum: [account, ease], description: 运行模式 }
+        webui:
+          type: boolean
+          description: 根路径是否为图形化页面（VL_WEBUI）；账户模式下该页面公开，但页内数据请求仍需 API Key
         version: { type: string }
         api_version: { type: string }
         uptime_sec: { type: integer }

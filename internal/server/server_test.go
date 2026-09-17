@@ -899,7 +899,8 @@ func newEaseEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 	t.Helper()
 	cfg := &config.Config{
 		Ease:              true,
-		RateLimitRPM:      1, // 故意给一个"会限流"的值，验证模式本身把它按住了
+		WebUI:             true, // 与 config.Load 的默认值一致：ease 下默认开
+		RateLimitRPM:      1,    // 故意给一个"会限流"的值，验证模式本身把它按住了
 		CORSOrigins:       []string{"*"},
 		Service:           service.DefaultOptions(),
 		Net:               config.NetOptions{Timeout: 5 * time.Second},
@@ -1113,7 +1114,10 @@ func TestEaseModeRootServesUI(t *testing.T) {
 		`代理下载`,        // 视频轨与音频轨都要有代理入口（音频同样受防盗链限制）
 		`前端混合`,        // 下载命名里的四种类型
 		`原生混合`,
-		`+ "VL" +`, // 命名拼接：标题 + "VL" + 类型 + 清晰度/码率
+		`+ "VL" +`,      // 命名拼接：标题 + "VL" + 类型 + 清晰度/码率
+		`id="apikey"`,   // 账户模式：页面上填 Key
+		`id="usagesec"`, // 账户模式：用量与账户信息
+		`/v1/usage`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("页面缺少 %q", want)
@@ -1383,46 +1387,76 @@ func TestUIScriptsShareAllHelpers(t *testing.T) {
 	}
 }
 
-// TestGraphicalUIIsEaseOnly：图形化页面**只在免校验模式**可达。
+// TestWebUIGating：图形化页面由 VL_WEBUI 控制，默认值跟随运行模式。
 //
-// 这条是硬约束，不是风格问题：
-//   - 页面按设计不带任何凭据，账户模式下它需要有 Key 才能干活，
-//     而"Key 从哪来"在浏览器里没有干净的答案；
-//   - 账户模式常常部署在公网，多一个匿名可达的界面就多一片攻击面
-//     （它也确实是本项目里唯一会执行大量前端逻辑的地方）。
-//
-// 因此：ease 下根路径是 text/html 的解析页；账户下必须是纯文本导航页，
-// 且任何路径都不得吐出那段 HTML。
-func TestGraphicalUIIsEaseOnly(t *testing.T) {
-	// 取页面里的一个独有标记，确保判据不是"看起来像网页"
-	marker := `id="muxStart"` // 只存在于图形化页面
-	if !strings.Contains(string(uiHTML), marker) {
-		t.Fatalf("uiHTML 里找不到标记 %q，测试判据需要更新", marker)
+//	免校验模式：默认开（本来就是"自用工具"的场景）
+//	账户模式  ：默认关（常部署在公网，不该默认多一个界面）；
+//	            显式打开时页面**公开可访问**——否则用户连填 Key 的地方都没有，
+//	            但页面上的数据（解析、用量、代理）仍然全部要 Key。
+func TestWebUIGating(t *testing.T) {
+	const marker = `id="muxStart"` // 图形化页面独有
+
+	// ① 账户模式 + WebUI 关（默认）：根路径是纯文本导航页，且仍然要 Key
+	off := newTestEnv(t, nil, defaultStub())
+	if w := do(off.handler(), http.MethodGet, "/", nil); w.Code != http.StatusForbidden {
+		t.Errorf("账户模式+WebUI 关，无 Key 应 403，得到 %d", w.Code)
+	}
+	w := do(off.handler(), http.MethodGet, "/", userHdr(off.userKey))
+	if strings.Contains(w.Body.String(), marker) {
+		t.Error("WebUI 关时不该返回图形化页面")
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("WebUI 关时 Content-Type = %q，想要 text/plain", ct)
 	}
 
-	ease := newEaseEnv(t, nil, defaultStub())
-	w := do(ease.handler(), http.MethodGet, "/", nil)
+	// ② 账户模式 + WebUI 开：页面公开可拿（不含数据），数据接口仍要 Key
+	on := newTestEnv(t, func(c *config.Config) { c.WebUI = true }, defaultStub())
+	h := on.handler()
+	w = do(h, http.MethodGet, "/", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), marker) {
+		t.Fatalf("WebUI 开时根路径应公开返回页面，得到 %d", w.Code)
+	}
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Fatalf("ease 模式根路径应为 text/html，得到 %q", ct)
+		t.Errorf("Content-Type = %q，想要 text/html", ct)
 	}
-	if !strings.Contains(w.Body.String(), marker) {
-		t.Error("ease 模式根路径应返回图形化页面")
+	// 页面本身不含任何账号数据；数据接口没有 Key 依然 403
+	if strings.Contains(w.Body.String(), on.userKey) || strings.Contains(w.Body.String(), on.adminKey) {
+		t.Error("页面里不应出现任何 Key")
+	}
+	if w := do(h, http.MethodGet, "/v1/usage", nil); w.Code != http.StatusForbidden {
+		t.Errorf("WebUI 开着也不能让 /v1/usage 免鉴权，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/usage", userHdr(on.userKey)); w.Code != http.StatusOK {
+		t.Errorf("带 Key 的 /v1/usage 应 200，得到 %d", w.Code)
+	}
+	// 健康检查要如实告知 WebUI 状态
+	var health map[string]any
+	hw := do(h, http.MethodGet, "/v1/health", nil)
+	if err := json.Unmarshal(hw.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["webui"] != true || health["mode"] != "account" {
+		t.Errorf("health 未如实反映: webui=%v mode=%v", health["webui"], health["mode"])
 	}
 
-	acct := newTestEnv(t, nil, defaultStub())
-	h := acct.handler()
-	// 带 Key（已认证）也不该给网页
-	if w := do(h, http.MethodGet, "/", userHdr(acct.userKey)); strings.Contains(w.Body.String(), marker) {
-		t.Error("账户模式根路径泄露了图形化页面")
-	}
-	// 其它任何路径同样不该吐这段 HTML
-	for _, path := range []string{"/", "/index.html", "/ui", "/v1/usage", "/v1/platforms", "/nope"} {
-		w := do(h, http.MethodGet, path, userHdr(acct.userKey))
+	// ③ 账户模式下其它路径也不该吐 HTML（WebUI 只改了根路径的行为）
+	for _, path := range []string{"/index.html", "/ui", "/v1/usage", "/v1/platforms", "/nope"} {
+		w := do(h, http.MethodGet, path, userHdr(on.userKey))
 		if strings.Contains(w.Body.String(), marker) {
-			t.Errorf("账户模式 %s 返回了图形化页面", path)
+			t.Errorf("账户模式 %s 不该返回图形化页面", path)
 		}
 		if ct := w.Header().Get("Content-Type"); strings.Contains(ct, "text/html") {
-			t.Errorf("账户模式 %s 的 Content-Type 是 %q，不应有 HTML", path, ct)
+			t.Errorf("账户模式 %s 的 Content-Type = %q，不该是 HTML", path, ct)
 		}
+	}
+
+	// ④ 免校验模式 + 显式关：退回纯文本导航页（ease 版本）
+	easeOff := newEaseEnv(t, func(c *config.Config) { c.WebUI = false }, defaultStub())
+	w = do(easeOff.handler(), http.MethodGet, "/", nil)
+	if strings.Contains(w.Body.String(), marker) {
+		t.Error("ease + WebUI=false 时不该返回图形化页面")
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("ease + WebUI=false 时 Content-Type = %q，想要 text/plain", ct)
 	}
 }
