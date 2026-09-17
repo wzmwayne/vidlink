@@ -227,6 +227,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET | `/readyz` | 公开 | — | **就绪**探针（无可用平台时 503） |
 | GET | `/v1/usage` | Key | — | 自己的配额、用量、倍率（免校验模式下不存在） |
 | GET | `/v1/ledger` | Key | — | **自己的配额流水**：使用 / 管理员增加 / 减少 / 设置（免校验模式下不存在） |
+| POST | `/v1/checkin` | Key | — | **每日签到领配额**（每天一次，`daily_grant`/`grant_cap` 由管理员设置） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 | 元信息 + 档位列表，**无直链** |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 | **只有直链** |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
@@ -355,7 +356,7 @@ SHA-256 截断，不可反推、重启不变、只能用来定位账号。它的
 ### 公共入口（免费试用）
 
 服务在账户模式下会自动准备一个**公共账号**（默认 Key `vl_public`）：
-Key 是公开的，谁都能用，所以它的配额不来自账本余额，而是**每 IP 每日限额**（默认 100）：
+Key 是公开的，谁都能用，所以它的配额不来自账本余额，而是**每 IP 每日限额**（默认 25）：
 
 ```bash
 # 不注册也能跑通一次完整解析
@@ -366,7 +367,7 @@ curl -H "X-API-Key: vl_public" \
 
 | 行为 | 说明 |
 | --- | --- |
-| 额度口径 | **每 IP 每日 100 配额**，与其他端点同一套系数（info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条 / 代理 1 配额每 MiB）；即每天约 100 条直链或 100 MB 代理流量 |
+| 额度口径 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），端点系数与其他账号相同（info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条）；**代理按 0.2 配额/MiB**（`VIDLINK_PUBLIC_PROXY_RATE`，标准费率是 1）→ 每天约 25 条直链，或约 125 MiB 代理流量 |
 | 用完了 | `429 public_quota_exhausted`，提示去申请独立 Key；额度跨天自动重置（本地时区零点） |
 | 没带 Key | `403` 的 message 里**直接给出公共 Key**，而不是一句"缺少 API Key" |
 | 账单 | 公共 Key **读不了** `/v1/ledger`（共享账号，流水混有所有访客），`/v1/usage` 返回的是"本 IP 今天"的额度 |
@@ -374,6 +375,41 @@ curl -H "X-API-Key: vl_public" \
 | 统计 | 用量与调用次数仍累计到公共账号上，管理面板能看到免费流量；`/v1/admin/stats` 有 `public.ips_today` |
 | 关闭它 | 在管理面板把公共账号**停用**即可（`EnsurePublic` 不会重新启用）；`VIDLINK_PUBLIC_KEY=` 留空则完全不创建 |
 | 记账持久性 | 每 IP 的日计数**只在内存里**，重启即清零（持久化意味着每次计费写一次 SD 卡，不值得） |
+
+### 每日签到（用户自助领配额）
+
+管理员可以在任意账号上设两个属性：
+
+| 属性 | 含义 |
+| --- | --- |
+| `daily_grant` | **每日签到可领的配额**（0 = 不开放签到） |
+| `grant_cap` | **停止增加界限**：`余额 = min(余额 + daily_grant, grant_cap)`；0 = 不封顶 |
+| `grant_day` | 最近一次签到的日期（只读，由服务记录） |
+
+用户自己调接口领取，**每天一次**：
+
+```bash
+curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
+# {"granted":25,"balance":25,"daily":25,"cap":100,"already_checked_in":false,
+#  "at_cap":false,"checked_in":true,"next_checkin_at":"2026-09-18T00:00:00+08:00",
+#  "unit":"配额","message":"签到成功：+25 配额，当前剩余 25"}
+
+# 当天再签：200 + already_checked_in=true，不重复加
+```
+
+规则：
+
+- **每天一次**：按本地日期判断（`grant_day` 随账号快照落盘，重启不丢）；
+- **到界限就停**：余额 ≥ `grant_cap` 时不再增加；
+- **到界限不消耗当天机会**：余额满了签到返回 `at_cap=true` 但不占名额，
+  花掉一些之后当天仍可签——签到的意义就是"需要时补一点"；
+- **不消耗配额**（它是来领配额的），也不占按 Key 的解析闸门；
+- 每次签到写一条流水：`每日签到 +25 → 100（上限 100）`；
+- 未开放签到的账号返回 `400` 并说明要找管理员设置额度；公共 Key 返回 `403`
+  （它的额度是每 IP 每日自动给的，不需要签到）。
+
+管理面板的账号卡片上有「应用签到」按钮（两个输入框：签到额度、停止增加界限），
+解析页的「账户与用量」里有「每日签到领配额」按钮，签完自动刷新余额。
 
 ### 配额流水（账单）
 
@@ -488,7 +524,8 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VIDLINK_ADDR` | `:8080` | 监听地址 |
 | `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
 | `VIDLINK_PUBLIC_KEY` | `vl_public` | 公共账号的 Key（公开、免注册试用）；**留空 = 不提供公共入口** |
-| `VIDLINK_PUBLIC_DAILY_QUOTA` | `100` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
+| `VIDLINK_PUBLIC_DAILY_QUOTA` | `25` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
+| `VIDLINK_PUBLIC_PROXY_RATE` | `0.2` | 公共 Key 的代理费率（配额/MiB）；标准账号固定 1 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
 | `VIDLINK_RATE_LIMIT_RPM` | `120` | 每 IP 每分钟请求上限；`0` = 不限 |
 | `VIDLINK_PER_KEY_CONCURRENCY` | `1` | 同一个 Key 的同时请求数 |

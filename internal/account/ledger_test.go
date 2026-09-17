@@ -1,6 +1,7 @@
 package account
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -262,3 +263,99 @@ func TestPublicAccount(t *testing.T) {
 		t.Errorf("汇总计数 = %d", totals[EntryConsume].Count)
 	}
 }
+
+// TestCheckIn：每日签到的规则。
+//
+//	余额 = min(余额 + 签到额度, 停止增加界限)；每天一次；
+//	已在界限上时"不增加、也不占用当天的签到机会"。
+func TestCheckIn(t *testing.T) {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.Local)
+	s, err := New(Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	grant, cap := 25.0, 100.0
+	if _, err := s.Create(Account{Key: "vl_g", Name: "甲", Quota: 0, Multiplier: 1,
+		DailyGrant: grant, GrantCap: cap}); err != nil {
+		t.Fatal(err)
+	}
+
+	// ① 首次签到：0 → 25
+	a, res, err := s.CheckIn("vl_g")
+	if err != nil || res.Granted != 25 || res.Balance != 25 {
+		t.Fatalf("首次签到 = %+v / %+v / %v", a, res, err)
+	}
+	if a.GrantDay != DayKey(now) {
+		t.Errorf("签到日期 = %q，想要 %q", a.GrantDay, DayKey(now))
+	}
+	// ② 当天再签：already，什么都不变
+	a, res, _ = s.CheckIn("vl_g")
+	if !res.Already || res.Granted != 0 || a.Quota != 25 {
+		t.Errorf("同一天第二次签到应返回 already：%+v / %+v", a, res)
+	}
+	if res.NextAt.Day() != now.AddDate(0, 0, 1).Day() {
+		t.Errorf("下次可签时间应是次日零点：%v", res.NextAt)
+	}
+	// ③ 跨天：25 → 50
+	now = now.AddDate(0, 0, 1)
+	a, res, _ = s.CheckIn("vl_g")
+	if res.Granted != 25 || a.Quota != 50 {
+		t.Errorf("跨天签到应 +25 → 50：%+v / %+v", a, res)
+	}
+	// ④ 接近界限：90 + 25 → 截断到 100
+	if _, err := s.Update("vl_g", Patch{Quota: floatPtrAcc(90)}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.AddDate(0, 0, 1)
+	a, res, _ = s.CheckIn("vl_g")
+	if res.Granted != 10 || a.Quota != 100 {
+		t.Errorf("应被界限截断成 +10 → 100：%+v / %+v", a, res)
+	}
+	// ⑤ 已在界限上：不增加，也不占用当天机会
+	before := a.GrantDay
+	now = now.AddDate(0, 0, 1)
+	a, res, _ = s.CheckIn("vl_g")
+	if !res.AtCap || res.Granted != 0 || a.Quota != 100 {
+		t.Errorf("已达界限应返回 at_cap：%+v / %+v", a, res)
+	}
+	if a.GrantDay != before {
+		t.Error("已达界限的那次不该消耗当天的签到机会")
+	}
+	// 花掉一些之后，当天仍可签（这正是"不消耗机会"的意义）
+	if _, err := s.Consume("vl_g", 30, "links/bilibili ×1"); err != nil {
+		t.Fatal(err)
+	}
+	a, res, _ = s.CheckIn("vl_g")
+	if res.Granted != 25 || a.Quota != 95 {
+		t.Errorf("花掉后当天应能签到：%+v / %+v", a, res)
+	}
+
+	// 流水：签到记成 add，说明里写明签到与上限
+	entries, totals := s.Ledger(LedgerQuery{Key: "vl_g", Type: EntryAdd, Limit: 20})
+	if len(entries) != 4 || !strings.Contains(entries[0].Detail, "每日签到") {
+		t.Fatalf("签到流水不对：%+v", entries)
+	}
+	if totals[EntryAdd].Units != 25+25+10+25 {
+		t.Errorf("add 汇总 = %v，想要 85", totals[EntryAdd].Units)
+	}
+
+	// 未开放签到的账号：明确报错，而不是"签了但没加"
+	if _, err := s.Create(Account{Key: "vl_n", Quota: 5, Multiplier: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CheckIn("vl_n"); !errors.Is(err, ErrCheckInDisabled) {
+		t.Errorf("未开放签到应返回 ErrCheckInDisabled，得到 %v", err)
+	}
+	// 停用账号不能靠签到复活
+	off := true
+	if _, err := s.Update("vl_g", Patch{Disabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CheckIn("vl_g"); !errors.Is(err, ErrDisabled) {
+		t.Errorf("停用账号签到应报 ErrDisabled，得到 %v", err)
+	}
+}
+
+func floatPtrAcc(f float64) *float64 { return &f }

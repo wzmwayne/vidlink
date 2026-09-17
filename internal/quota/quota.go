@@ -69,15 +69,27 @@ const defaultPlatformKey core.Platform = ""
 // 前者的出口带宽是后者的几百倍。按体积是唯一与真实成本同向的计法。
 const ProxyUnitBytes = 1 << 20
 
-// ProxyCost 计算媒体代理一次传输的配额消耗。
+// PublicProxyRate 是**公共 Key** 的代理费率（配额/MiB）。
+//
+// 比标准费率（1/MiB）低得多：公共入口是给人试的，而代理吃的是服务端
+// 出口带宽——0.2 意味着"每日 25 配额"能换约 125 MiB 流量，
+// 既够试完一整条短视频，又不会把出口带宽变成免费资源。
+const PublicProxyRate = 0.2
+
+// ProxyCost 计算媒体代理一次传输的配额消耗（标准费率 1 配额/MiB）。
 //
 // 倍率为 0 的账号（免费账号）仍然是 0，与该账号在其他端点上的语义一致：
 // 不扣配额，但调用次数照样累计。
 func ProxyCost(bytes int64, accountMultiplier float64) float64 {
-	if bytes <= 0 || accountMultiplier <= 0 {
+	return ProxyCostAt(bytes, 1, accountMultiplier)
+}
+
+// ProxyCostAt 用指定费率计算代理消耗（公共 Key 用 PublicProxyRate）。
+func ProxyCostAt(bytes int64, ratePerMiB, accountMultiplier float64) float64 {
+	if bytes <= 0 || accountMultiplier <= 0 || ratePerMiB <= 0 {
 		return 0
 	}
-	return round4(float64(bytes) / float64(ProxyUnitBytes) * accountMultiplier)
+	return round4(float64(bytes) / float64(ProxyUnitBytes) * ratePerMiB * accountMultiplier)
 }
 
 // Table 是倍率表。

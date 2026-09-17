@@ -95,7 +95,8 @@ func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 	cfg := &config.Config{
 		AdminKey:          "vl_admin_test", // 管理凭据是配置项，不是账本里的账号
 		PublicKey:         "vl_public",     // 公共入口：Key 公开、按 IP 每日限额
-		PublicDailyQuota:  100,
+		PublicDailyQuota:  25,
+		PublicProxyRate:   quota.PublicProxyRate,
 		RateLimitRPM:      0, // 默认不限流；测限流的用例自己打开
 		CORSOrigins:       []string{"*"},
 		Service:           service.DefaultOptions(),
@@ -2309,8 +2310,8 @@ func TestPublicKeyUsesPerIPDailyQuota(t *testing.T) {
 	if got := w.Header().Get("X-Quota-Consumed"); got != "1" {
 		t.Errorf("X-Quota-Consumed = %q，想要 1", got)
 	}
-	if got := w.Header().Get("X-Quota-Remaining"); got != "99" {
-		t.Errorf("X-Quota-Remaining = %q，想要 99（每 IP 每日 100 扣掉 1）", got)
+	if got := w.Header().Get("X-Quota-Remaining"); got != "24" {
+		t.Errorf("X-Quota-Remaining = %q，想要 24（每 IP 每日 25 扣掉 1）", got)
 	}
 	pub, ok := env.store.Get(env.srv.cfg.PublicKey)
 	if !ok || !pub.PublicAccount {
@@ -2332,8 +2333,8 @@ func TestPublicKeyUsesPerIPDailyQuota(t *testing.T) {
 	if w2.Code != http.StatusOK {
 		t.Fatalf("另一个 IP 应可用，得到 %d", w2.Code)
 	}
-	if got := w2.Header().Get("X-Quota-Remaining"); got != "99" {
-		t.Errorf("新 IP 的剩余额度应重新从 100 开始，得到 %q", got)
+	if got := w2.Header().Get("X-Quota-Remaining"); got != "24" {
+		t.Errorf("新 IP 的剩余额度应重新从 25 开始，得到 %q", got)
 	}
 
 	// ③ 额度用尽 → 429 public_quota_exhausted（同一个 IP 连续调用）
@@ -2342,7 +2343,7 @@ func TestPublicKeyUsesPerIPDailyQuota(t *testing.T) {
 	r3.RemoteAddr = "198.51.100.7:1111"
 	h.ServeHTTP(httptest.NewRecorder(), r3) // 先花掉 1
 	// 直接把额度打满
-	for i := 0; i < 99; i++ {
+	for i := 0; i < 24; i++ {
 		rr := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
 		rr.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
 		rr.RemoteAddr = "198.51.100.7:1111"
@@ -2414,14 +2415,22 @@ func TestPublicKeyCanUseProxyFromDailyQuota(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("公共 Key 代理应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
-	if got := w.Header().Get("X-Quota-Consumed"); got != "2" {
-		t.Errorf("X-Quota-Consumed = %q，想要 2", got)
+	// 公共 Key 的代理费率更低：2 MiB × 0.2 = 0.4
+	if got := w.Header().Get("X-Quota-Consumed"); got != "0.4" {
+		t.Errorf("X-Quota-Consumed = %q，想要 0.4（公共费率 0.2/MiB）", got)
 	}
-	if got := w.Header().Get("X-Quota-Remaining"); got != "98" {
-		t.Errorf("X-Quota-Remaining = %q，想要 98", got)
+	if got := w.Header().Get("X-Quota-Remaining"); got != "24.6" {
+		t.Errorf("X-Quota-Remaining = %q，想要 24.6", got)
 	}
-	if pub, _ := env.store.Get(env.srv.cfg.PublicKey); pub.Used != 2 {
-		t.Errorf("公共账号用量应累计为 2，得到 %v", pub.Used)
+	if pub, _ := env.store.Get(env.srv.cfg.PublicKey); pub.Used != 0.4 {
+		t.Errorf("公共账号用量应累计为 0.4，得到 %v", pub.Used)
+	}
+	// 普通账号同一份流量按标准费率 1/MiB 扣
+	other := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	wo := do(other.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL),
+		userHdr(other.userKey))
+	if got := wo.Header().Get("X-Quota-Consumed"); got != "2" {
+		t.Errorf("普通账号 X-Quota-Consumed = %q，想要 2（标准费率）", got)
 	}
 }
 
@@ -2437,7 +2446,7 @@ func TestHealthExposesPublicKey(t *testing.T) {
 	if !ok {
 		t.Fatalf("health 应带 public 段：%s", w.Body.String())
 	}
-	if pub["key"] != env.srv.cfg.PublicKey || pub["daily_per_ip"] != float64(100) {
+	if pub["key"] != env.srv.cfg.PublicKey || pub["daily_per_ip"] != float64(25) {
 		t.Errorf("public 段内容不对：%v", pub)
 	}
 	// 免校验模式没有账户体系，不该报公共入口
@@ -2473,3 +2482,117 @@ func TestTipImageIsPublicAndEmbedded(t *testing.T) {
 		t.Error("赞赏码应放在默认折叠的 details 里")
 	}
 }
+
+// TestCheckInEndpoint：每日签到接口。
+//
+//   - 每天一次：第二次返回 already_checked_in，不重复加
+//   - 不改余额以外的东西，也不消耗配额（它是来领配额的）
+//   - 公共 Key 不需要签到（它的额度是每 IP 每日）
+//   - 未开放签到的账号明确报错
+func TestCheckInEndpoint(t *testing.T) {
+	grant, cap := 25.0, 60.0
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	if _, err := env.store.Update(env.userKey, account.Patch{
+		Quota: floatPtr(10), DailyGrant: &grant, GrantCap: &cap,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type resp struct {
+		Granted   float64 `json:"granted"`
+		Balance   float64 `json:"balance"`
+		Already   bool    `json:"already_checked_in"`
+		AtCap     bool    `json:"at_cap"`
+		CheckedIn bool    `json:"checked_in"`
+		Message   string  `json:"message"`
+	}
+	post := func(key string) (*httptest.ResponseRecorder, resp) {
+		w := do(h, http.MethodPost, "/v1/checkin", userHdr(key))
+		var r resp
+		_ = json.Unmarshal(w.Body.Bytes(), &r)
+		return w, r
+	}
+
+	// ① 首次签到：10 → 35
+	w, r := post(env.userKey)
+	if w.Code != http.StatusOK || r.Granted != 25 || r.Balance != 35 || !r.CheckedIn {
+		t.Fatalf("首次签到 = %d %+v（%s）", w.Code, r, w.Body.String())
+	}
+	if got := w.Header().Get("X-Quota-Consumed"); got != "" {
+		t.Errorf("签到不该消耗配额，却回写了 X-Quota-Consumed=%q", got)
+	}
+	// ② 同日再签：already
+	_, r = post(env.userKey)
+	if !r.Already || r.Granted != 0 {
+		t.Errorf("第二次签到应 already：%+v", r)
+	}
+	if a, _ := env.store.Get(env.userKey); a.Quota != 35 {
+		t.Errorf("重复签到不该改余额：%v", a.Quota)
+	}
+	// ③ 上限截断：把余额调到 50，模拟跨天（直接改 GrantDay）
+	if _, err := env.store.Update(env.userKey, account.Patch{Quota: floatPtr(50)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.Update(env.userKey, account.Patch{Name: ptrStr("换个名字绕过当天限制")}); err != nil {
+		t.Fatal(err)
+	}
+	// 直接把 GrantDay 清掉（等价于"到了第二天"）
+	env.store.ClearCheckInDay(env.userKey)
+	_, r = post(env.userKey)
+	if r.Granted != 10 || r.Balance != 60 {
+		t.Errorf("应被界限截断成 +10 → 60：%+v", r)
+	}
+	// ④ 已达界限：不增加、也不占当天机会
+	if _, err := env.store.Update(env.userKey, account.Patch{Quota: floatPtr(60)}); err != nil {
+		t.Fatal(err)
+	}
+	env.store.ClearCheckInDay(env.userKey)
+	_, r = post(env.userKey)
+	if !r.AtCap || r.Granted != 0 || !strings.Contains(r.Message, "界限") {
+		t.Errorf("已达界限应 at_cap：%+v", r)
+	}
+
+	// ⑤ 公共 Key：明确拒绝并说明原因
+	if w, _ := post(env.srv.cfg.PublicKey); w.Code != http.StatusForbidden {
+		t.Errorf("公共 Key 签到应 403，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	// ⑥ 未开放签到的账号：400 + 指路
+	if _, err := env.store.Update(env.userKey, account.Patch{DailyGrant: floatPtr(0)}); err != nil {
+		t.Fatal(err)
+	}
+	env.store.ClearCheckInDay(env.userKey)
+	if w, _ := post(env.userKey); w.Code != http.StatusBadRequest {
+		t.Errorf("未开放签到应 400，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	// ⑦ 没有 Key → 403
+	if w := do(h, http.MethodPost, "/v1/checkin", nil); w.Code != http.StatusForbidden {
+		t.Errorf("无 Key 签到应 403，得到 %d", w.Code)
+	}
+	// ⑧ usage 里要说清签到口径与今天签没签
+	if _, err := env.store.Update(env.userKey, account.Patch{DailyGrant: &grant}); err != nil {
+		t.Fatal(err)
+	}
+	uw := do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	var u map[string]any
+	if err := json.Unmarshal(uw.Body.Bytes(), &u); err != nil {
+		t.Fatal(err)
+	}
+	ci, ok := u["checkin"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage 应有 checkin 段：%s", uw.Body.String())
+	}
+	if ci["daily"] != 25.0 || ci["endpoint"] != "POST /v1/checkin" {
+		t.Errorf("checkin 段内容不对：%v", ci)
+	}
+}
+
+// TestEaseModeHidesCheckIn：免校验模式没有账户，签到接口也不存在。
+func TestEaseModeHidesCheckIn(t *testing.T) {
+	env := newEaseEnv(t, nil, defaultStub())
+	if w := do(env.handler(), http.MethodPost, "/v1/checkin", nil); w.Code != http.StatusNotFound {
+		t.Errorf("免校验模式签到应 404，得到 %d", w.Code)
+	}
+}
+
+func ptrStr(s string) *string { return &s }

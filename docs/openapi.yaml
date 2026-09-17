@@ -24,6 +24,8 @@ info:
     公共 Key 调 `/v1/ledger` 一律 `403`（共享账号，流水混有所有访客）；
     `/v1/usage` 对公共 Key 返回的是"本 IP 今天"的额度（`public: true` + `daily`）。
     每 IP 的日计数只在内存里，重启清零。并发闸门对公共 Key 按 **IP** 生效。
+    公共 Key 的代理费率另有配置：`VIDLINK_PUBLIC_PROXY_RATE`，默认 0.2 配额/MiB
+    （标准账号是 1），也就是每日 25 配额约等于 125 MiB 代理流量。
 
     ## 媒体代理的配额
 
@@ -239,6 +241,25 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/checkin:
+    post:
+      tags: [账号]
+      summary: 每日签到领配额（每天一次）
+      description: |
+        账号上由管理员设置 daily_grant（每日可领）与 grant_cap（停止增加界限，
+        0=不封顶）：余额 = min(余额 + daily_grant, grant_cap)。**不消耗配额**。
+        今天已签返回 200 + already_checked_in=true；余额已达界限返回 200 +
+        at_cap=true 且不占用当天机会；账号未开放签到返回 400；公共 Key 返回 403。
+      operationId: checkIn
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CheckIn" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /v1/ledger:
     get:
@@ -800,6 +821,20 @@ components:
         disabled: { type: boolean }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CheckIn:
+      type: object
+      properties:
+        granted: { type: number, description: 本次真正加上的配额（已达界限时为 0） }
+        balance: { type: number, description: 签到后的余额 }
+        daily: { type: number, description: 每日签到额度 }
+        cap: { type: number, description: 停止增加界限（0 = 不封顶） }
+        already_checked_in: { type: boolean }
+        at_cap: { type: boolean, description: 余额已在界限上；不占用当天机会 }
+        checked_in: { type: boolean }
+        next_checkin_at: { type: string, format: date-time }
+        unit: { type: string, example: 配额 }
+        message: { type: string }
 
     Ledger:
       type: object

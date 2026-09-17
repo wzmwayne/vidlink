@@ -424,6 +424,13 @@
     ["multiplier", "账号倍率"], ["note", "备注"], ["updated_at", "更新时间"],
   ];
 
+  // 每日签到的人话描述（没配就不显示这一行）
+  function grantText(a) {
+    if (!a.daily_grant) return "";
+    return "每天可签 +" + a.daily_grant + (a.grant_cap ? "，上限 " + a.grant_cap : "（不封顶）") +
+      (a.grant_day ? "，最近签到 " + a.grant_day : "");
+  }
+
   function accountCard(a) {
     const card = el("div", "acct");
     const hd = el("div", "acct-hd");
@@ -442,6 +449,11 @@
       dl.appendChild(el("dt", null, label));
       dl.appendChild(el("dd", null, String(v)));
     });
+    const g = grantText(a);
+    if (g) {
+      dl.appendChild(el("dt", null, "每日签到"));
+      dl.appendChild(el("dd", null, g));
+    }
     card.appendChild(dl);
 
     // 公共账号的额度来自"每 IP 每日限额"，改它的余额/倍率没有意义——
@@ -486,6 +498,16 @@
     btns.appendChild(mk("设为", "set"));
     btns.appendChild(mult);
     btns.appendChild(mk("应用倍率", "mult"));
+    // 每日签到额度与"停止增加界限"：用户自己调 POST /v1/checkin 领取，每天一次
+    const grant = el("input", "numin");
+    grant.value = a.daily_grant ? String(a.daily_grant) : "0";
+    grant.setAttribute("aria-label", "每日签到额度");
+    const gcap = el("input", "numin");
+    gcap.value = a.grant_cap ? String(a.grant_cap) : "0";
+    gcap.setAttribute("aria-label", "停止增加界限");
+    btns.appendChild(grant);
+    btns.appendChild(gcap);
+    btns.appendChild(mk("应用签到", "grant"));
     btns.appendChild(mk(a.disabled ? "启用" : "停用", "toggle"));
     btns.appendChild(mk("详情", "get"));
     btns.appendChild(mk("流水", "ledger"));
@@ -548,7 +570,11 @@
   // 在账号卡片上就地取值（金额/倍率输入框是每张卡片各自的）
   function cardInputs(btn) {
     const card = btn.closest(".acct");
-    return { amount: card.querySelector(".numin"), mult: card.querySelector(".multin") };
+    const nums = card.querySelectorAll(".numin");
+    return {
+      amount: nums[0], mult: card.querySelector(".multin"),
+      grant: nums[1], gcap: nums[2],
+    };
   }
 
   function findAccount(id) {
@@ -571,6 +597,17 @@
           const payload = act === "set" ? { quota: v } : { add_quota: act === "add" ? v : -v };
           const label = act === "set" ? ("配额设为 " + v) : ((act === "add" ? "加 " : "减 ") + v);
           await patch(id, payload, label);
+          return;
+        }
+        case "grant": {
+          const inp = cardInputs(btn);
+          const g = num(inp.grant.value, NaN), c = num(inp.gcap.value, NaN);
+          if (!Number.isFinite(g) || g < 0 || !Number.isFinite(c) || c < 0) {
+            setKeyState("签到额度与界限要填非负数（0 = 不开放 / 不封顶）。", true);
+            return;
+          }
+          await patch(id, { daily_grant: g, grant_cap: c },
+            g > 0 ? ("每日签到 +" + g + (c > 0 ? "，界限 " + c : "（不封顶）")) : "关闭每日签到");
           return;
         }
         case "mult": {

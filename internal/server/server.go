@@ -200,7 +200,9 @@ func (s *Server) routes() []routeSpec {
 		// ---- 免配额但需要身份：用量查询与自己的流水都要知道"你是谁" ----
 		specs = append(specs,
 			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage},
-			routeSpec{method: http.MethodGet, path: "/v1/ledger", handler: s.handleLedger})
+			routeSpec{method: http.MethodGet, path: "/v1/ledger", handler: s.handleLedger},
+			// 每日签到领配额：与用量、账单一样属于"身份相关但不计费"的接口
+			routeSpec{method: http.MethodPost, path: "/v1/checkin", handler: s.handleCheckIn})
 		// ---- 管理面：用固定管理 Key（未配置时每条都恒 403）----
 		specs = append(specs, s.adminRoutes()...)
 	}
@@ -616,6 +618,14 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// publicProxyRate 返回公共 Key 的代理费率（配额/MiB），带配置回退。
+func (s *Server) publicProxyRate() float64 {
+	if r := s.cfg.PublicProxyRate; r > 0 {
+		return r
+	}
+	return quota.PublicProxyRate
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"status":      "ok",
@@ -635,6 +645,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		body["public"] = map[string]any{
 			"key":          s.cfg.PublicKey,
 			"daily_per_ip": s.publicQ.Limit(),
+			"proxy_rate":   s.publicProxyRate(),
 			"ledger":       false,
 		}
 	}

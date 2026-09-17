@@ -421,7 +421,7 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 
 | 项 | 行为 |
 | --- | --- |
-| 额度 | **每 IP 每日 100 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），与其它端点同一套系数；代理按 1 配额/MiB |
+| 额度 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`）；端点系数与普通账号相同，**代理费率更低：0.2 配额/MiB**（`VIDLINK_PUBLIC_PROXY_RATE`） |
 | 响应头 | `X-Quota-Consumed` 是本次消耗，`X-Quota-Remaining` 是**本 IP 今天**的剩余 |
 | 超限 | `429 public_quota_exhausted`，message 提示申请独立 Key；额度按本地时区零点重置 |
 | 没带 Key | `403` 的 message 里直接给出公共 Key 与每日额度 |
@@ -432,6 +432,36 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 | 关闭 | 管理面板停用公共账号，或把 `VIDLINK_PUBLIC_KEY` 留空 |
 
 > 每 IP 的日计数**只在内存里**，重启清零——持久化要每次计费写一次 SD 卡，对这个量级不值得。
+
+### 3.8a2 每日签到 `POST /v1/checkin` · 需 Key · 不消耗配额
+
+账号上由管理员设置两个属性：`daily_grant`（每日签到可领配额）与
+`grant_cap`（停止增加界限，0 = 不封顶）。用户自己调这个接口领取，**每天一次**：
+
+```json
+{
+  "granted": 25, "balance": 125, "daily": 25, "cap": 200,
+  "already_checked_in": false, "at_cap": false, "checked_in": true,
+  "next_checkin_at": "2026-09-18T00:00:00+08:00", "unit": "配额",
+  "message": "签到成功：+25 配额，当前剩余 125"
+}
+```
+
+```bash
+curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
+```
+
+| 情况 | 响应 |
+| --- | --- |
+| 签到成功 | `200`，`granted>0`、`checked_in=true`，流水里多一条 `add`：`每日签到 +25 → 125（上限 200）` |
+| 今天已签 | `200`，`already_checked_in=true`、`granted=0`（**不是错误**，客户端据此显示"明天再来"） |
+| 余额已达界限 | `200`，`at_cap=true`、`granted=0`，**不占用当天的签到机会**（花掉一些后当天仍可签） |
+| 账号未开放签到（`daily_grant=0`） | `400` + 提示找管理员设置额度 |
+| 公共 Key | `403`（它的额度是每 IP 每日自动给的，与账本余额无关） |
+| 账号停用 | `403` |
+
+`GET /v1/usage` 的 `checkin` 段给出 `daily` / `cap` / `checked_in_today` /
+`last_checkin_day` / `endpoint` / `formula`，页面据此决定按钮状态。
 
 ### 3.8b 配额流水 `GET /v1/ledger` · 需 Key · 不消耗配额
 
@@ -901,6 +931,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/readyz` | 公开 | — |
 | GET | `/v1/usage` | Key | — |
 | GET | `/v1/ledger` | Key | —（自己的流水） |
+| POST | `/v1/checkin` | Key | —（每日签到领配额） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 |

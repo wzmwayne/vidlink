@@ -80,9 +80,11 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		// 否则管理员核对用量时会以为它漏记了。
 		"proxy": map[string]any{
 			"rate":            "1 配额/MiB",
+			"rate_per_mib":    1,
+			"public_rate":     s.publicProxyRate(),
 			"unit_bytes":      quota.ProxyUnitBytes,
 			"platform_factor": false,
-			"formula":         "实扣 = 传输体积(MiB) × 1 × 账号倍率",
+			"formula":         "实扣 = 传输体积(MiB) × 费率 × 账号倍率（标准 1，公共 Key 见 public_rate）",
 			"note": "媒体代理按传输体积计费，不乘平台系数（它与上游解析成本无关）。" +
 				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；" +
 				"提前中断不退。",
@@ -92,6 +94,7 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 			"enabled":          s.cfg.PublicKey != "",
 			"key":              s.cfg.PublicKey,
 			"daily_per_ip":     s.publicQ.Limit(),
+			"proxy_rate":       s.publicProxyRate(),
 			"accounting":       "不使用账本余额；用量与调用次数仍累计到公共账号上",
 			"ledger_available": false,
 			"note": "公共 Key 是共享的，额度按「每 IP 每日」计算，过期自动重置；" +
@@ -137,6 +140,9 @@ type createAccountRequest struct {
 	Name       string   `json:"name"`
 	Quota      *float64 `json:"quota"`
 	Multiplier *float64 `json:"multiplier"`
+	// DailyGrant / GrantCap：每日自动补额与它的封顶（0 = 关闭 / 不封顶）
+	DailyGrant *float64 `json:"daily_grant"`
+	GrantCap   *float64 `json:"grant_cap"`
 	Note       string   `json:"note"`
 }
 
@@ -172,8 +178,20 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 		q = *req.Quota
 	}
 
+	grant, cap := 0.0, 0.0
+	if req.DailyGrant != nil {
+		grant = *req.DailyGrant
+	}
+	if req.GrantCap != nil {
+		cap = *req.GrantCap
+	}
+	if grant < 0 || cap < 0 {
+		writeError(w, core.BadInput("", "daily_grant 与 grant_cap 不能为负"))
+		return
+	}
 	a, err := s.accounts.Create(account.Account{
-		Key: key, Name: req.Name, Quota: q, Multiplier: mult, Note: req.Note,
+		Key: key, Name: req.Name, Quota: q, Multiplier: mult,
+		DailyGrant: grant, GrantCap: cap, Note: req.Note,
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrDuplicate) {
@@ -216,6 +234,9 @@ type patchAccountRequest struct {
 	AddQuota   *float64 `json:"add_quota"`
 	Multiplier *float64 `json:"multiplier"`
 	Disabled   *bool    `json:"disabled"`
+	// DailyGrant / GrantCap：每日自动补额与封顶（0 = 关闭 / 不封顶）
+	DailyGrant *float64 `json:"daily_grant"`
+	GrantCap   *float64 `json:"grant_cap"`
 }
 
 func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request) {
@@ -242,6 +263,7 @@ func (s *Server) handleAdminPatchAccount(w http.ResponseWriter, r *http.Request)
 		Name: req.Name, Note: req.Note,
 		Quota: req.Quota, AddQuota: req.AddQuota,
 		Multiplier: req.Multiplier, Disabled: req.Disabled,
+		DailyGrant: req.DailyGrant, GrantCap: req.GrantCap,
 	})
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {

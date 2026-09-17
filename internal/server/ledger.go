@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -180,4 +181,65 @@ func (s *Server) handleAdminLedger(w http.ResponseWriter, r *http.Request) {
 	resp["entries"] = ledgerEntries(entries)
 	resp["totals"] = totals
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleCheckIn 执行每日签到：POST /v1/checkin
+//
+// 不消耗配额（它是来领配额的），也不占按 Key 的解析闸门。
+// 结果用 200 + 字段表达，而不是把"今天已签到"当错误：客户端据此决定
+// 显示"已签到，明天再来"还是"+25"，不需要解析错误码。
+func (s *Server) handleCheckIn(w http.ResponseWriter, r *http.Request) {
+	acct, ok := accountFrom(r.Context())
+	if !ok {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth", "缺少 API Key"))
+		return
+	}
+	// 公共 Key 不需要签到：它的额度是"每 IP 每日"，与账本余额无关
+	if acct.PublicAccount {
+		writeError(w, core.Errf(core.KindForbidden, "", "auth",
+			"公共 Key 不需要签到：它的额度是每 IP 每日自动给的；"+
+				"需要每日签到领配额请向管理员申请独立 Key"))
+		return
+	}
+
+	updated, res, err := s.accounts.CheckIn(acct.Key)
+	if err != nil {
+		switch {
+		case errors.Is(err, account.ErrCheckInDisabled):
+			writeError(w, core.Errf(core.KindBadInput, "", "checkin",
+				"该账号未开放每日签到（需要管理员在账号上设置「每日签到额度」）"))
+		case errors.Is(err, account.ErrDisabled):
+			writeError(w, core.Errf(core.KindForbidden, "", "auth", "账号已停用"))
+		case errors.Is(err, account.ErrNotFound):
+			writeError(w, core.Errf(core.KindForbidden, "", "auth", "API Key 无效"))
+		default:
+			writeError(w, core.E(core.KindInternal, "", "checkin", "签到失败", err))
+		}
+		return
+	}
+
+	msg := fmt.Sprintf("签到成功：+%.4g %s，当前剩余 %.4g", res.Granted, unitName, res.Balance)
+	switch {
+	case res.Already:
+		msg = fmt.Sprintf("今天已经签到过了，%s 后可再签", res.NextAt.Format("2006-01-02 15:04"))
+	case res.AtCap:
+		msg = fmt.Sprintf("余额已达「停止增加界限」，本次不增加，也不占用今天的签到机会"+
+			"（当前 %.4g）", res.Balance)
+	}
+	if res.Granted > 0 {
+		s.log.Info("每日签到", "request_id", requestID(r.Context()), "key", acct.Masked(),
+			"granted", res.Granted, "balance", res.Balance, "cap", updated.GrantCap)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"granted":            res.Granted,
+		"balance":            res.Balance,
+		"daily":              updated.DailyGrant,
+		"cap":                updated.GrantCap,
+		"already_checked_in": res.Already,
+		"at_cap":             res.AtCap,
+		"checked_in":         res.Granted > 0,
+		"next_checkin_at":    res.NextAt,
+		"unit":               unitName,
+		"message":            msg,
+	})
 }

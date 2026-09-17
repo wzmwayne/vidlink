@@ -233,7 +233,7 @@ func (s *Server) chargeProxyDeclared(w http.ResponseWriter, r *http.Request, dec
 	if !ok {
 		return true // 免校验模式：没有账户，也就没有配额
 	}
-	units := quota.ProxyCost(declared, acct.Multiplier)
+	units := quota.ProxyCostAt(declared, s.proxyRateFor(acct), acct.Multiplier)
 	detail := fmt.Sprintf("proxy %.4g MiB（按体积）", float64(declared)/float64(quota.ProxyUnitBytes))
 
 	// 公共账号：额度在每 IP 日限额里，账本只记用量（见 consumePublicQuota）
@@ -281,7 +281,7 @@ func (s *Server) chargeProxyActual(r *http.Request, written int64) {
 	if !ok {
 		return
 	}
-	units := quota.ProxyCost(written, acct.Multiplier)
+	units := quota.ProxyCostAt(written, s.proxyRateFor(acct), acct.Multiplier)
 	if units <= 0 {
 		return
 	}
@@ -315,6 +315,20 @@ func (s *Server) proxyAccount(r *http.Request) (account.Account, bool) {
 	return accountFrom(r.Context())
 }
 
+// proxyRateFor 返回这个账号的代理费率（配额/MiB）。
+//
+// 公共 Key 用更低的一档（默认 0.2）：它是给人试的入口，而代理吃的是
+// 服务端出口带宽，两者不该同一个价。
+func (s *Server) proxyRateFor(acct account.Account) float64 {
+	if acct.PublicAccount {
+		if r := s.cfg.PublicProxyRate; r > 0 {
+			return r
+		}
+		return quota.PublicProxyRate
+	}
+	return 1
+}
+
 // proxyBudgetBytes 按账户剩余配额折算出本次最多能传的字节数。
 //
 // 上限存在的意义是防止"上游不给长度 + 配额不足"变成无限免费流量：
@@ -334,7 +348,8 @@ func (s *Server) proxyBudgetBytes(r *http.Request) int64 {
 	if allowance <= 0 {
 		return 0
 	}
-	affordable := int64(allowance / acct.Multiplier * float64(quota.ProxyUnitBytes))
+	rate := s.proxyRateFor(acct)
+	affordable := int64(allowance / (acct.Multiplier * rate) * float64(quota.ProxyUnitBytes))
 	if affordable < 0 {
 		return 0
 	}

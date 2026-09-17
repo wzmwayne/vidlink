@@ -158,8 +158,10 @@
     <h2>账户与用量</h2>
     <div id="usage">（点右侧刷新）</div>
     <div class="btns">
+      <button class="primary hidden" id="checkinBtn">每日签到领配额</button>
       <button id="usageRefresh">刷新用量</button>
       <span class="status" id="usageStatus" style="align-self:center"></span>
+      <span class="status" id="checkinStatus" style="align-self:center"></span>
     </div>
   </section>
 
@@ -948,6 +950,23 @@
       add("单位", d.unit);
       box.appendChild(dl);
 
+      // 每日签到：显示额度、今天签没签，并按状态调整按钮
+      if (d.checkin) {
+        add("每日签到", "+" + d.checkin.daily + (d.checkin.cap ? "，上限 " + d.checkin.cap : "（不封顶）"));
+        add("签到状态", d.checkin.checked_in_today
+          ? ("今天已签到" + (d.checkin.last_checkin_day ? "（" + d.checkin.last_checkin_day + "）" : ""))
+          : "今天还没签到");
+        const cb = $("#checkinBtn");
+        cb.classList.remove("hidden");
+        cb.disabled = !!d.checkin.checked_in_today;
+        cb.title = d.checkin.checked_in_today
+          ? "今天已经签过了，明天零点后可再签"
+          : ("领取 +" + d.checkin.daily + " 配额（每天一次）");
+        cb.textContent = d.checkin.checked_in_today ? "今日已签到" : "每日签到领配额";
+      } else {
+        $("#checkinBtn").classList.add("hidden");
+      }
+
       // 公共账号：额度是"本 IP 今天"的，也没有个人账单。
       // 说明放在常规字段之后，别把"账号/配额"那几行挤到下面去。
       if (d.public === true) {
@@ -1223,6 +1242,28 @@
     applyKey("", { save: true });
   });
   $("#usageRefresh").addEventListener("click", loadUsage);
+
+  // 每日签到：POST /v1/checkin，成功后刷新用量（余额变了）
+  $("#checkinBtn").addEventListener("click", async () => {
+    const b = $("#checkinBtn");
+    const st = $("#checkinStatus");
+    b.disabled = true;
+    st.textContent = "签到中…";
+    try {
+      const r = await api("/v1/checkin", { method: "POST" });
+      if (r.status === 200 && r.body) {
+        st.textContent = r.body.message || "签到完成";
+        await loadUsage();
+      } else {
+        const e = (r.body && r.body.error) || {};
+        st.textContent = "HTTP " + r.status + " " + (e.message || "");
+        b.disabled = false;
+      }
+    } catch (e) {
+      st.textContent = "签到失败：" + e;
+      b.disabled = false;
+    }
+  });
   $("#ledgerRefresh").addEventListener("click", loadLedger);
   $("#ledgerType").addEventListener("change", loadLedger);
 

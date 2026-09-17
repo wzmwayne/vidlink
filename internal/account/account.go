@@ -80,6 +80,26 @@ type Account struct {
 	//   1.0 标准   0.5 减半   0.0 不扣配额（仍记用量与调用次数）   2.0 加倍
 	Multiplier float64 `json:"multiplier"`
 
+	// DailyGrant 是**每日签到可领的配额**（默认 0 = 不开放签到）。
+	//
+	// 由用户自己调 POST /v1/checkin 领取，每天一次——不是后台自动发，
+	// 也不是"用到就补"：签到这个动作本身有价值（用户知道自己有额度、
+	// 也给了服务端一个自然的触达点）。
+	DailyGrant float64 `json:"daily_grant,omitempty"`
+
+	// GrantCap 是**配额停止增加界限**：补额后余额不超过它。
+	//
+	//	余额 = min(余额 + DailyGrant, GrantCap)
+	//
+	// 余额已经 ≥ 界限时当天不再补（记为"已结算"，避免同一天反复加）。
+	// 为 0 表示不限（只加不封顶）——那是有意的写法，不是"关闭"，
+	// 关闭请用 DailyGrant=0。
+	GrantCap float64 `json:"grant_cap,omitempty"`
+
+	// GrantDay 是最近一次**签到**的日期（本地时区 YYYY-MM-DD）。
+	// 每天只能签一次就是靠它判断的；它随账号快照一起落盘，重启不丢。
+	GrantDay string `json:"grant_day,omitempty"`
+
 	// Used 是累计消耗的 units（已按账号倍率折算后的实扣值）。
 	Used float64 `json:"used"`
 	// Calls 是累计成功配额计量的调用次数。
@@ -386,6 +406,111 @@ func (s *Store) RecordUsage(key string, units float64, detail string) error {
 	return nil
 }
 
+// DayKey 把时间点规约成"本地日期"（每日补额的分界）。
+func DayKey(t time.Time) string { return t.Format("2006-01-02") }
+
+// CheckInResult 是一次签到的结果。
+type CheckInResult struct {
+	// Granted 是本次真正加上的配额（已达上限时为 0）。
+	Granted float64 `json:"granted"`
+	// Balance 是签到后的余额。
+	Balance float64 `json:"balance"`
+	// Already 表示今天已经签过（本次什么都没做）。
+	Already bool `json:"already_checked_in"`
+	// AtCap 表示余额已经在"停止增加界限"上（本次不消耗签到机会）。
+	AtCap bool `json:"at_cap"`
+	// NextAt 是下次可签到的时间（今天已签时才有意义）。
+	NextAt time.Time `json:"next_checkin_at"`
+}
+
+// CheckIn 执行每日签到：余额 = min(余额 + DailyGrant, GrantCap)。
+//
+//	GrantCap 为 0 表示不封顶；DailyGrant 为 0 表示这个账号不开放签到。
+//
+// 三条规则都是有意的：
+//
+//   - **每天一次**：靠 GrantDay（本地日期）判断，随快照落盘，重启不丢；
+//   - **到界限就停**：余额已经 ≥ GrantCap 时不再增加（"配额停止增加界限"）；
+//   - **到界限不消耗当天机会**：签到的意义就是"需要时补一点"，余额满了
+//     把它作废对用户没有好处，所以这次不算签过——花掉一些之后当天仍可签。
+func (s *Store) CheckIn(key string) (Account, CheckInResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.accounts[key]
+	if !ok {
+		return Account{}, CheckInResult{}, ErrNotFound
+	}
+	now := s.now()
+	today := DayKey(now)
+	next := nextDay(now)
+
+	res := CheckInResult{Balance: a.Quota, NextAt: next}
+	if a.DailyGrant <= 0 {
+		return *a, res, ErrCheckInDisabled
+	}
+	if a.Disabled {
+		return *a, res, ErrDisabled
+	}
+	if a.GrantDay == today {
+		res.Already = true
+		return *a, res, nil
+	}
+	if a.GrantCap > 0 && a.Quota >= a.GrantCap {
+		// 已在界限上：不增加、也不占用今天的签到机会
+		res.AtCap = true
+		return *a, res, nil
+	}
+
+	before := *a
+	units := a.DailyGrant
+	if a.GrantCap > 0 && a.Quota+units > a.GrantCap {
+		units = a.GrantCap - a.Quota
+	}
+	a.Quota += units
+	a.GrantDay = today
+	a.UpdatedAt = now
+
+	e := Entry{
+		Time: now, Type: EntryAdd, Key: a.Key, ID: a.ID, Name: a.Name,
+		Units: units, Balance: a.Quota, Used: a.Used, Calls: a.Calls,
+		Detail: fmt.Sprintf("每日签到 +%.4g → %.4g", units, a.Quota) +
+			func() string {
+				if a.GrantCap > 0 {
+					return fmt.Sprintf("（上限 %.4g）", a.GrantCap)
+				}
+				return ""
+			}(),
+	}
+	s.ledgerAdd(e)
+	if err := s.appendAccount(a, &e); err != nil {
+		*a = before
+		s.ledgerDrop()
+		return before, CheckInResult{Balance: before.Quota, NextAt: next}, err
+	}
+	res.Granted = units
+	res.Balance = a.Quota
+	return *a, res, nil
+}
+
+// ErrCheckInDisabled 表示这个账号没有开放每日签到（DailyGrant 为 0）。
+var ErrCheckInDisabled = errors.New("该账号未开放每日签到")
+
+// nextDay 返回次日零点（本地时区）。
+func nextDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location()).AddDate(0, 0, 1)
+}
+
+// ClearCheckInDay 清掉"今天已签到"的标记（仅供测试模拟跨天）。
+func (s *Store) ClearCheckInDay(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.accounts[key]; ok {
+		a.GrantDay = ""
+	}
+}
+
 // Resolve 按"账号 Key 或公开句柄"取账号，供管理面使用。
 //
 // 两种寻址方式并存的原因：管理面板手上只有句柄（它拿不到明文 Key），
@@ -481,6 +606,9 @@ type Patch struct {
 	Multiplier *float64
 	Disabled   *bool
 	Note       *string
+	// DailyGrant / GrantCap 是每日签到可领的配额与它的封顶（见 Account 上的说明）。
+	DailyGrant *float64
+	GrantCap   *float64
 	// AddQuota 是**增量**调整（正数增加、负数扣减）。
 	// 与 Quota 的区别：Quota 是设成某值，AddQuota 是在现有值上加减。
 	AddQuota *float64
@@ -528,6 +656,18 @@ func (s *Store) Update(key string, p Patch) (Account, error) {
 	if p.Disabled != nil {
 		a.Disabled = *p.Disabled
 	}
+	if p.DailyGrant != nil {
+		if *p.DailyGrant < 0 {
+			return Account{}, errors.New("签到额度不能为负")
+		}
+		a.DailyGrant = *p.DailyGrant
+	}
+	if p.GrantCap != nil {
+		if *p.GrantCap < 0 {
+			return Account{}, errors.New("补额上限不能为负")
+		}
+		a.GrantCap = *p.GrantCap
+	}
 	a.UpdatedAt = s.now()
 
 	// 流水：把这次改了什么写成一句人能读的话。类型上只分四类业务含义，
@@ -552,6 +692,12 @@ func (s *Store) Update(key string, p Patch) (Account, error) {
 	if p.Quota != nil && *p.Quota != before.Quota {
 		units = *p.Quota - before.Quota
 		parts = append(parts, fmt.Sprintf("配额设为 %.4g（%+.4g）", *p.Quota, units))
+	}
+	if p.DailyGrant != nil && *p.DailyGrant != before.DailyGrant {
+		parts = append(parts, fmt.Sprintf("每日签到额度 %.4g → %.4g", before.DailyGrant, *p.DailyGrant))
+	}
+	if p.GrantCap != nil && *p.GrantCap != before.GrantCap {
+		parts = append(parts, fmt.Sprintf("补额上限 %.4g → %.4g", before.GrantCap, *p.GrantCap))
 	}
 	if p.AddQuota != nil && *p.AddQuota != 0 {
 		units += *p.AddQuota

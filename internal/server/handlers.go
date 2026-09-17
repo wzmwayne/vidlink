@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"vidlink/internal/account"
 	"vidlink/internal/core"
@@ -637,10 +638,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			"daily":      snap,
 			"rates":      s.allRates(),
 			"proxy": map[string]any{
-				"rate":            "1 配额/MiB",
+				"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRateFor(acct)),
+				"rate_per_mib":    s.proxyRateFor(acct),
 				"unit_bytes":      quota.ProxyUnitBytes,
 				"platform_factor": false,
-				"note":            "媒体代理按传输体积计费：实扣 = 体积(MiB) × 1 × 账号倍率",
+				"note": fmt.Sprintf("媒体代理按传输体积计费：实扣 = 体积(MiB) × %.4g × 账号倍率"+
+					"（公共 Key 的代理费率低于标准费率）", s.proxyRateFor(acct)),
 			},
 			"limits": map[string]any{
 				"per_key_concurrency": s.gate.Options().PerKey,
@@ -654,7 +657,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	usage := map[string]any{
 		"name":       acct.Name,
 		"unit":       unitName,
 		"quota":      acct.Quota,
@@ -665,6 +668,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		// 代理按体积计费，与上面的平台系数表不同源，单独给一条
 		"proxy": map[string]any{
 			"rate":            "1 配额/MiB",
+			"rate_per_mib":    1,
 			"unit_bytes":      quota.ProxyUnitBytes,
 			"platform_factor": false,
 			"note":            "媒体代理按传输体积计费：实扣 = 体积(MiB) × 1 × 你的账号倍率",
@@ -675,7 +679,20 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			"batch_min":           s.cfg.BatchMin,
 			"batch_max":           s.cfg.BatchMax,
 		},
-	})
+	}
+	// 每日签到：把口径与"今天签没签"一并给出，页面据此决定按钮状态
+	if acct.DailyGrant > 0 {
+		usage["checkin"] = map[string]any{
+			"enabled":          true,
+			"daily":            acct.DailyGrant,
+			"cap":              acct.GrantCap, // 0 = 不封顶
+			"checked_in_today": acct.GrantDay == account.DayKey(time.Now()),
+			"last_checkin_day": acct.GrantDay,
+			"endpoint":         "POST /v1/checkin",
+			"formula":          "余额 = min(余额 + 每日签到额度, 停止增加界限)，每天一次",
+		}
+	}
+	writeJSON(w, http.StatusOK, usage)
 }
 
 // unitName 是配额单位的对外名称。

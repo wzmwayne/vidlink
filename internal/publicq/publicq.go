@@ -22,7 +22,10 @@ import (
 )
 
 // DefaultDaily 是每 IP 每日的默认配额（可用 VIDLINK_PUBLIC_DAILY_QUOTA 覆盖）。
-const DefaultDaily = 100
+//
+// 25 是配合"代理 0.2 配额/MiB"定的：约等于每天 25 条直链，
+// 或约 125 MiB 代理流量——够试完一条短视频，又不至于变成免费带宽。
+const DefaultDaily = 25
 
 // maxIPs 是常驻内存的 IP 数量上限。
 //
