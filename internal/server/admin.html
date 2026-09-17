@@ -79,6 +79,14 @@
   .multin { width: 76px; }
   /* 每个编辑框自成一组：控件在上，说明文字紧贴在同一列的正下方。
      之前所有输入框并排、说明只藏在 title 里，根本分不清哪个是哪个。 */
+  details.acct-ops { margin-top: 10px; }
+  details.acct-ops > summary {
+    cursor: pointer; font-size: 12px; color: var(--dim);
+    padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--panel2); display: inline-block;
+  }
+  details.acct-ops > summary:hover { border-color: var(--accent); color: var(--fg); }
+  details.acct-ops[open] > summary { color: var(--fg); }
   .fields { display: flex; flex-wrap: wrap; gap: 12px 18px; margin-top: 10px; }
   .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .field > .ctl { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
@@ -439,6 +447,25 @@
       (a.grant_day ? "，最近签到 " + a.grant_day : "");
   }
 
+  // 展开状态按账号 id 记住：每次操作后列表都会重渲染，
+  // 不记住的话"点一下应用、面板自己收起"会让人以为操作没生效。
+  const opsOpen = new Set();
+
+  // opsBlock 把"操作区"包进默认折叠的 details 里。
+  function opsBlock(a, build) {
+    const det = el("details", "acct-ops");
+    det.open = opsOpen.has(a.id);
+    const sum = el("summary", null, det.open ? "收起操作 ▲" : "操作：配额 / 倍率 / 签到 / 停用 / 删除 ▼");
+    det.appendChild(sum);
+    det.addEventListener("toggle", () => {
+      if (det.open) opsOpen.add(a.id);
+      else opsOpen.delete(a.id);
+      sum.textContent = det.open ? "收起操作 ▲" : "操作：配额 / 倍率 / 签到 / 停用 / 删除 ▼";
+    });
+    det.appendChild(build());
+    return det;
+  }
+
   function accountCard(a) {
     const card = el("div", "acct");
     const hd = el("div", "acct-hd");
@@ -479,18 +506,20 @@
       note.textContent = "公共账号：Key 公开（" + (a.key || "") + "），配额按「每 IP 每日限额」计算，" +
         "不使用这里的余额；停用它即关闭公共入口。用量与调用次数照常累计，供你观察免费流量。";
       card.appendChild(note);
-      const only = el("div", "btns");
-      const mk2 = (label, act, cls) => {
-        const b = el("button", cls, label);
-        b.dataset.act = act; b.dataset.id = a.id; return b;
-      };
-      only.appendChild(mk2(a.disabled ? "启用" : "停用", "toggle"));
-      only.appendChild(mk2("详情", "get"));
-      only.appendChild(mk2("流水", "ledger"));
-      const del = mk2("删除", "del", "danger");
-      del.style.marginLeft = "auto";
-      only.appendChild(del);
-      card.appendChild(only);
+      card.appendChild(opsBlock(a, () => {
+        const only = el("div", "acct-acts");
+        const mk2 = (label, act, cls) => {
+          const b = el("button", cls, label);
+          b.dataset.act = act; b.dataset.id = a.id; return b;
+        };
+        only.appendChild(mk2(a.disabled ? "启用账号" : "停用账号", "toggle"));
+        only.appendChild(mk2("查看详情", "get"));
+        only.appendChild(mk2("查看流水", "ledger"));
+        const del = mk2("删除账号", "del", "danger");
+        del.style.marginLeft = "auto";
+        only.appendChild(del);
+        return only;
+      }));
       return card;
     }
 
@@ -545,16 +574,19 @@
       [el("b", null, "停止增加界限"),
        document.createTextNode("：余额到此不再增加（签到会被截断到该值）；0 = 不封顶")]));
 
-    card.appendChild(fields);
-
-    const acts = el("div", "acct-acts");
-    acts.appendChild(mk(a.disabled ? "启用账号" : "停用账号", "toggle"));
-    acts.appendChild(mk("查看详情", "get"));
-    acts.appendChild(mk("查看流水", "ledger"));
-    const del = mk("删除账号", "del", "danger");
-    del.style.marginLeft = "auto";
-    acts.appendChild(del);
-    card.appendChild(acts);
+    card.appendChild(opsBlock(a, () => {
+      const box = el("div");
+      box.appendChild(fields);
+      const acts = el("div", "acct-acts");
+      acts.appendChild(mk(a.disabled ? "启用账号" : "停用账号", "toggle"));
+      acts.appendChild(mk("查看详情", "get"));
+      acts.appendChild(mk("查看流水", "ledger"));
+      const del = mk("删除账号", "del", "danger");
+      del.style.marginLeft = "auto";
+      acts.appendChild(del);
+      box.appendChild(acts);
+      return box;
+    }));
     return card;
   }
 
