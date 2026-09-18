@@ -13,6 +13,7 @@ import (
 	"vidlink/internal/account"
 	"vidlink/internal/core"
 	"vidlink/internal/quota"
+	"vidlink/internal/rates"
 )
 
 // adminRoutes 是管理面路由。
@@ -42,16 +43,21 @@ func (s *Server) adminRoutes() []routeSpec {
 			handler: s.handleAdminStats},
 		{method: http.MethodGet, path: "/v1/admin/quota", admin: true,
 			handler: s.handleAdminQuota},
+		// 改价与复位：见 handleAdminQuotaUpdate / handleAdminQuotaReset
+		{method: http.MethodPut, path: "/v1/admin/quota", admin: true,
+			handler: s.handleAdminQuotaUpdate},
+		{method: http.MethodDelete, path: "/v1/admin/quota", admin: true,
+			handler: s.handleAdminQuotaReset},
 		{method: http.MethodGet, path: "/v1/admin/ledger", admin: true,
 			handler: s.handleAdminLedger},
 	}
 }
 
-// handleAdminQuota 返回配额消耗系数的全貌。
+// handleAdminQuota 返回计费倍率的全貌（生效值 + 覆盖层 + 审计）。
 //
-// 只读：系数是**共享的运营参数**，影响所有账号，所以刻意不提供写接口——
-// 改它要走代码评审（见 docs/配额倍率表.md 的"怎么改"）。
-// 单个账号的临时调整请改该账号的 multiplier，那是按账号隔离的。
+// 可读也可写：GET 看现状，PUT 改格子/代理费率，DELETE 复位。
+// 单个账号的临时调整仍走该账号的 multiplier（那是按账号隔离的）；
+// 这里改的是**共享的价目表**，影响所有账号的后续调用。
 //
 // 这个端点的意义是"让管理员能自己核对一次调用到底扣多少"，
 // 而不用去读源码或翻文档。
@@ -59,11 +65,28 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
+	writeJSON(w, http.StatusOK, s.quotaSnapshot())
+}
+
+// quotaSnapshot 组装 /v1/admin/quota 的响应（GET/PUT/DELETE 共用一套形状，
+// 面板改完一次往返就能重渲染）。
+func (s *Server) quotaSnapshot() map[string]any {
 	preauth := map[string]float64{}
 	for _, ep := range quota.AllEndpoints {
 		preauth[string(ep)] = s.quotaTable.MaxCoefficient(ep)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	view := s.rates.View()
+	defaults := map[string]any{}
+	for k, v := range s.quotaTable.Coefficients("") {
+		defaults[string(k)] = v
+	}
+	history := make([]map[string]any, 0, len(view.History))
+	for _, h := range view.History {
+		history = append(history, map[string]any{
+			"at": h.At, "action": h.Action, "actor": h.Actor, "detail": h.Detail,
+		})
+	}
+	out := map[string]any{
 		"unit":    unitName,
 		"formula": "消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率",
 		"endpoints": map[string]any{
@@ -73,9 +96,22 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 			"batch_links": "批量只取直链，按成功条数计量",
 		},
 		// 预授权上限：解析开始前按该端点在所有平台中的最高系数检查一次配额。
-		// 客户端据此可以预判"最少要留多少配额才能调这个端点"。
-		"preauth_max": preauth,
-		"platforms":   s.allRates(),
+		// 客户端据此可以预判"最少要留多少配额才能调这个端点"。改价后立刻跟着变。
+		"preauth_max":      preauth,
+		"platforms":        s.allRates(),
+		"default_platform": defaults,
+		// 覆盖层（管理员改过的格子）与出厂默认，便于面板算出"哪一格被改过"
+		"overrides":  view.Overrides,
+		"defaults":   view.Defaults,
+		"source":     view.Source,
+		"path":       view.Path,
+		"updated_at": view.UpdatedAt,
+		"limits": map[string]any{
+			"min_rate": quota.MinRate,
+			"max_rate": quota.MaxRate,
+		},
+		"warnings": s.quotaTable.Warnings(),
+		"history":  history,
 		// 代理是唯一不按"端点 × 平台"计费的配额出口，必须单独说明，
 		// 否则管理员核对用量时会以为它漏记了。
 		"proxy": map[string]any{
@@ -84,9 +120,8 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 			"unit_bytes":      quota.ProxyUnitBytes,
 			"platform_factor": false,
 			"formula":         "实扣 = 传输体积(MiB) × 费率 × 账号倍率（费率对所有账号相同）",
-			"note": "媒体代理按传输体积计费，不乘平台系数（它与上游解析成本无关）。" +
-				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；" +
-				"提前中断不退。",
+			"note": "媒体代理按传输体积计费，**不乘平台系数**（它与上游解析成本无关）。" +
+				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；提前中断不退。",
 		},
 		// 公共入口：Key 公开，配额按每 IP 每日限额，与账本余额无关
 		"public": map[string]any{
@@ -100,7 +135,67 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		},
 		"note": "系数只影响后续调用，已发生的用量不重算；" +
 			"单个账号的调整请改该账号的 multiplier",
-	})
+	}
+	return out
+}
+
+// updateQuotaRequest 是改价的请求体。
+//
+// 语义是**逐格合并**：只提交要动的格子，其余保持不变；
+// 值为 null 表示清除该格的自定义（回到内置默认）。
+//
+//	{"rates": {"links": {"douyin": 1.5, "kuaishou": null}}, "proxy_rate": 0.6}
+type updateQuotaRequest struct {
+	Rates     map[string]map[string]*float64 `json:"rates"`
+	ProxyRate *float64                       `json:"proxy_rate"`
+}
+
+// handleAdminQuotaUpdate 修改计费倍率（PUT /v1/admin/quota）。
+func (s *Server) handleAdminQuotaUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	var req updateQuotaRequest
+	if err := decodeStrictJSON(w, r, &req); err != nil {
+		writeError(w, core.BadInput("", "请求体不合法: %v", err))
+		return
+	}
+	if len(req.Rates) == 0 && req.ProxyRate == nil {
+		writeError(w, core.BadInput("", "请求体里没有任何要改的内容："+
+			"rates（平台 → 端点 → 倍率，null 表示恢复默认）与 proxy_rate 至少给一个"))
+		return
+	}
+	view, err := s.rates.Apply(req.Rates, req.ProxyRate)
+	if err != nil {
+		writeError(w, core.BadInput("", "%v", err))
+		return
+	}
+	s.log.Info("计费倍率已更新", "request_id", requestID(r.Context()),
+		"path", view.Path, "proxy_rate", view.ProxyRate,
+		"detail", lastHistoryDetail(view))
+	writeJSON(w, http.StatusOK, s.quotaSnapshot())
+}
+
+// handleAdminQuotaReset 清空全部自定义，回到内置默认（DELETE /v1/admin/quota）。
+func (s *Server) handleAdminQuotaReset(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	view, err := s.rates.Reset()
+	if err != nil {
+		writeError(w, core.E(core.KindInternal, "", "rates", "恢复默认失败", err))
+		return
+	}
+	s.log.Warn("计费倍率已恢复内置默认", "request_id", requestID(r.Context()),
+		"path", view.Path)
+	writeJSON(w, http.StatusOK, s.quotaSnapshot())
+}
+
+func lastHistoryDetail(v rates.View) string {
+	if len(v.History) == 0 {
+		return ""
+	}
+	return v.History[len(v.History)-1].Detail
 }
 
 // requireAdmin 确认本次请求已经过了管理 Key 校验。

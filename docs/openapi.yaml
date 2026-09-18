@@ -58,7 +58,10 @@ info:
     全局解析槽位 10 + 队列 30（503）。
 
 servers:
-  - { url: "http://127.0.0.1:8080", description: 本地默认 }
+  # 路径全部是相对路径；这里给两个可选基地址。
+  # 官方测试实例：公共 Key vl_public 免注册可试（跑在树莓派上，可能限流/变动，生产请自部署）
+  - { url: "https://vl.wzml.cc.cd", description: 官方测试实例（可直接试；生产请自部署） }
+  - { url: "/", description: 相对当前服务地址（自部署默认 http://127.0.0.1:8080） }
 
 tags:
   - { name: 元信息, description: 公开端点 }
@@ -441,12 +444,45 @@ paths:
   /v1/admin/quota:
     get:
       tags: [管理]
-      summary: 配额系数全貌（只读）
-      description: 系数是共享参数，影响所有账号，因此只提供读接口；单账号调整请改 `multiplier`。
+      summary: 计费倍率全貌（生效值 + 覆盖层 + 审计）
+      description: |
+        返回当前**生效值**、改过的格子（overrides）、出厂默认（defaults）、
+        预授权上限、校验范围、定价告警（warnings）与最近 50 条变更（history）。
+        倍率可在运行期修改：PUT 改格子/代理费率，DELETE 恢复出厂默认。
+        单账号的临时调整仍走该账号的 `multiplier`。
       operationId: adminQuota
       responses:
         "200":
           description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/QuotaTable" } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    put:
+      tags: [管理]
+      summary: 修改计费倍率（逐格合并；null 表示恢复默认）
+      description: |
+        只提交要改的格子，其余保持不变。任何一格非法 → 整请求 400，不会部分生效。
+        抖音 × batch_links 不能设（平台能力问题，不是价格）。改价只影响后续请求；
+        落盘失败返回 500 且内存已回滚。
+      operationId: adminQuotaUpdate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotaUpdateRequest" }
+      responses:
+        "200":
+          description: OK（与 GET 同形，便于前端一次往返重渲染）
+          content: { application/json: { schema: { $ref: "#/components/schemas/QuotaTable" } } }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      tags: [管理]
+      summary: 恢复出厂默认倍率（清空全部覆盖，含代理费率）
+      operationId: adminQuotaReset
+      responses:
+        "200":
+          description: OK（与 GET 同形）
           content: { application/json: { schema: { $ref: "#/components/schemas/QuotaTable" } } }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -920,15 +956,69 @@ components:
         multiplier: { type: number }
         disabled: { type: boolean }
 
+    QuotaUpdateRequest:
+      type: object
+      description: 逐格合并；未出现的格子不动，值为 null 表示清除该格的自定义（回到出厂默认）
+      properties:
+        rates:
+          type: object
+          description: 平台 → 端点 → 倍率或 null
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: number
+              nullable: true
+        proxy_rate:
+          type: number
+          nullable: true
+          description: 代理费率（配额/MiB，0 表示代理不扣配额）；null 表示恢复默认
+
     QuotaTable:
       type: object
       properties:
         unit: { type: string, example: 配额 }
         formula: { type: string, example: "消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率" }
         endpoints: { type: object, additionalProperties: { type: string } }
+        source: { type: string, enum: [defaults, file], description: 值来自内置默认还是倍率文件 }
+        path: { type: string, description: 倍率文件路径（可能为空） }
+        updated_at: { type: string, format: date-time }
+        default_platform:
+          type: object
+          additionalProperties: { type: number }
+          description: 通用档（未单列的平台走它）
+        overrides:
+          type: object
+          description: 被管理员改过的格子（平台 → 端点 → 倍率）
+          additionalProperties:
+            type: object
+            additionalProperties: { type: number }
+        defaults:
+          type: object
+          description: 出厂默认（平台 → 端点 → 倍率）
+          additionalProperties:
+            type: object
+            additionalProperties: { type: number }
+        limits:
+          type: object
+          properties:
+            min_rate: { type: number }
+            max_rate: { type: number }
+        warnings:
+          type: array
+          items: { type: string }
+          description: 定价提示（例如 detail 比 links 还便宜）；只提示不阻止保存
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              at: { type: string, format: date-time }
+              action: { type: string, enum: [update, reset] }
+              actor: { type: string, description: 恒为 admin（管理面只有一个固定 Key） }
+              detail: { type: string }
         preauth_max:
           type: object
           additionalProperties: { type: number }
-          description: 各端点的预授权上限（该端点在所有平台中的最高系数）
+          description: 各端点的预授权上限（该端点在所有平台中的最高**生效**系数，改价后立刻重算）
         platforms: { type: object, additionalProperties: true }
         note: { type: string }

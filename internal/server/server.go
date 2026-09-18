@@ -26,6 +26,7 @@ import (
 	"vidlink/internal/gate"
 	"vidlink/internal/publicq"
 	"vidlink/internal/quota"
+	"vidlink/internal/rates"
 	"vidlink/internal/service"
 )
 
@@ -75,6 +76,10 @@ type Server struct {
 	// 公共 Key 是共享的，账本余额对它没有意义，所以单独一套口径。
 	publicQ *publicq.Limiter
 
+	// rates 是计费倍率的覆盖层：出厂默认在 quota 包里，管理员改的差值在这里。
+	// 计量路径直接读 rates.Table()（读锁），改价不会给每次请求加锁。
+	rates *rates.Store
+
 	startedAt time.Time
 	reqCount  atomic.Int64
 	errCount  atomic.Int64
@@ -91,7 +96,10 @@ type Deps struct {
 	QuotaTable *quota.Table
 	// PublicQ 可注入（测试用它固定"今天"）；nil 时按配置新建。
 	PublicQ *publicq.Limiter
-	Logger  *slog.Logger
+	// Rates 是计费倍率的覆盖层（可编辑 + 落盘 + 审计）。
+	// nil 时建一个纯内存的默认表，保证既有调用方与测试零改动。
+	Rates  *rates.Store
+	Logger *slog.Logger
 }
 
 // New 构造服务器。
@@ -109,6 +117,17 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	if d.PublicQ == nil {
 		d.PublicQ = publicq.New(cfg.PublicDailyQuota, nil)
 	}
+	if d.Rates == nil {
+		// 纯内存：改动不落盘。生产路径由 main.go 注入带文件的 Store。
+		st, err := rates.New(rates.Options{Seed: cfg.ProxyRate, Table: d.QuotaTable})
+		if err != nil {
+			return nil, err
+		}
+		d.Rates = st
+	}
+	// 计量用的表与可编辑倍率表**必须是同一张**：分成两张的话，
+	// 管理面改的是 A、扣费读的是 B，表现就是"改了不生效"。
+	d.QuotaTable = d.Rates.Table()
 	if cfg.IsEase() && d.Accounts != nil {
 		// 免校验模式下账户体系不存在；传进来也用不到，直接忽略以免误用。
 		d.Accounts = nil
@@ -141,6 +160,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		gate:       d.Gate,
 		quotaTable: d.QuotaTable,
 		publicQ:    d.PublicQ,
+		rates:      d.Rates,
 		startedAt:  time.Now(),
 	}, nil
 }
@@ -531,7 +551,8 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 				// 按 Origin 变化的响应绝不能被共享缓存复用
 				w.Header().Add("Vary", "Origin")
 			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+			// PUT/DELETE 是管理面改倍率用的（/v1/admin/quota）
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
 			w.Header().Set("Access-Control-Expose-Headers", corsExposeHeaders)
 			w.Header().Set("Access-Control-Max-Age", "600")

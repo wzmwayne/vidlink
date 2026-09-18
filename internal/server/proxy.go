@@ -315,11 +315,14 @@ func (s *Server) proxyAccount(r *http.Request) (account.Account, bool) {
 	return accountFrom(r.Context())
 }
 
-// proxyRate 返回媒体代理的费率（配额/MiB）。
+// proxyRate 返回媒体代理的费率（配额/MiB，生效值）。
 //
-// **所有账号一个价**：代理的成本是服务端出口带宽，与账号身份无关；
-// 分档只会让"这次要花多少"变成需要查表的题。
+// **所有账号一个价**，而且**永不参与平台系数**：代理搬的是任意 CDN 的字节，
+// 与"哪家平台解析更贵"无关。改平台系数不会影响这里（有测试钉死）。
 func (s *Server) proxyRate() float64 {
+	if s.rates != nil {
+		return s.rates.Table().ProxyRate()
+	}
 	if r := s.cfg.ProxyRate; r > 0 {
 		return r
 	}
@@ -346,6 +349,10 @@ func (s *Server) proxyBudgetBytes(r *http.Request) int64 {
 		return 0
 	}
 	rate := s.proxyRate()
+	if rate <= 0 {
+		// 代理费率被管理员设成 0（白送带宽）：不按余额折算上限，避免除零
+		return noLimit
+	}
 	affordable := int64(allowance / (acct.Multiplier * rate) * float64(quota.ProxyUnitBytes))
 	if affordable < 0 {
 		return 0

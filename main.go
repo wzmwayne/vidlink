@@ -34,6 +34,7 @@ import (
 	"vidlink/internal/gate"
 	"vidlink/internal/netx"
 	"vidlink/internal/quota"
+	"vidlink/internal/rates"
 	"vidlink/internal/server"
 	"vidlink/internal/service"
 	"vidlink/internal/sign/abogus"
@@ -160,6 +161,31 @@ func run() error {
 		}
 	}
 
+	// 计费倍率：出厂默认在 internal/quota，运行期的覆盖层由 internal/rates 管。
+	// 免校验模式下没有配额这回事，仍然给一个纯内存的（管理路由不会注册）。
+	quotaTable := quota.DefaultTable()
+	ratesStore, err := rates.New(rates.Options{
+		Path: ratePath(cfg), Seed: cfg.ProxyRate, Table: quotaTable,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化计费倍率失败: %w", err)
+	}
+	{
+		v := ratesStore.View()
+		n := 0
+		for _, eps := range v.Overrides {
+			n += len(eps)
+		}
+		logger.Info("计费倍率已加载",
+			"source", v.Source, "path", cfg.RatesPath,
+			"proxy_rate", v.ProxyRate, "overrides", n)
+		if v.Source == "file" && cfg.ProxyRate > 0 && cfg.ProxyRate != v.ProxyRate {
+			logger.Warn("VIDLINK_PROXY_RATE 与倍率文件里的值不一致：以**文件**为准"+
+				"（改值请走 /v1/admin/quota，或删掉文件重新播种）",
+				"env", cfg.ProxyRate, "file", v.ProxyRate)
+		}
+	}
+
 	// 5) 并发闸门：默认每 Key 1 个请求、全局 10 个解析任务
 	gateOpts := gate.Options{
 		PerKey:      cfg.PerKeyConcurrency,
@@ -173,7 +199,8 @@ func run() error {
 		Service:    svc,
 		Accounts:   accounts,
 		Gate:       gate.New(gateOpts),
-		QuotaTable: quota.DefaultTable(),
+		QuotaTable: quotaTable,
+		Rates:      ratesStore,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -320,4 +347,13 @@ func logStartup(logger *slog.Logger, cfg *config.Config, reg *extract.Registry) 
 		logger.Info("账户模式已启用", "accounts_path", cfg.AccountsPath,
 			"admin_key_configured", cfg.AdminKey != "")
 	}
+}
+
+// ratePath 返回倍率覆盖层的路径：免校验模式下用纯内存（无账户即无配额），
+// 其余情况用配置里的路径。
+func ratePath(cfg *config.Config) string {
+	if cfg.IsEase() {
+		return ""
+	}
+	return cfg.RatesPath
 }

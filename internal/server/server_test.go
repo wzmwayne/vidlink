@@ -27,6 +27,7 @@ import (
 	"vidlink/internal/gate"
 	"vidlink/internal/netx"
 	"vidlink/internal/quota"
+	"vidlink/internal/rates"
 	"vidlink/internal/service"
 )
 
@@ -1269,12 +1270,16 @@ func TestEaseModeRootServesUI(t *testing.T) {
 	low := strings.ToLower(body)
 	for _, forbidden := range []string{
 		"<script src", "<link ", "@import", "url(http", `src="http`, "src='http",
-		`href="http`, "href='http", "googleapis", "unpkg", "jsdelivr",
+		"googleapis", "unpkg", "jsdelivr",
 	} {
 		if strings.Contains(low, forbidden) {
 			t.Errorf("页面引用了外部资源: %q", forbidden)
 		}
 	}
+	// 页面**允许**指向项目自己的可点击外链（仓库 / 接口文档），但只允许
+	// github.com 一个域，且必须带 rel="noopener"——否则 window.opener
+	// 会把本页暴露给被打开的页面。
+	checkExternalLinks(t, body)
 	// 上限设为 120KB：混流器（自己实现的 fMP4 重排）占了大头，
 	// 但它换掉的是"外链 mp4box.js / 25MB ffmpeg.wasm"这条路。
 	if len(body) > 120*1024 {
@@ -1696,7 +1701,8 @@ func TestAdminPanelStaysSelfContained(t *testing.T) {
 	low := strings.ToLower(body)
 	for _, forbidden := range []string{
 		"<script src", "<link ", "@import", "url(http", `src="http`, "src='http",
-		`href="http`, "href='http", "googleapis", "unpkg", "jsdelivr",
+		"googleapis", "unpkg", "jsdelivr",
+		`href="http`, "href='http", // 管理面板一个外链都不放
 	} {
 		if strings.Contains(low, forbidden) {
 			t.Errorf("管理面板引用了外部资源: %q", forbidden)
@@ -2704,5 +2710,365 @@ func TestUsageAlwaysReportsCheckInAvailability(t *testing.T) {
 	aw = do(h, http.MethodGet, "/v1/admin/accounts", userHdr(env.adminKey))
 	if !strings.Contains(aw.Body.String(), `"can_check_in":false`) {
 		t.Errorf("停用账号的 can_check_in 应为 false：%s", aw.Body.String())
+	}
+}
+
+// checkExternalLinks 校验页面里的可点击外链只有 github.com 一个域，
+// 且都带了 rel="noopener"。
+//
+// 页面承诺"不加载任何外部资源"，但**允许**指向项目仓库与文档的外链
+// （用户要求把开源信息与接口文档放在页面上）。两者的区别是"加载"与
+// "点开才走"——脚本、样式、图片、字体一律不许外链，超链接可以。
+func checkExternalLinks(t *testing.T, body string) {
+	t.Helper()
+	re := regexp.MustCompile(`href="(https?://[^"]+)"`)
+	found := 0
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		found++
+		u, err := url.Parse(m[1])
+		if err != nil {
+			t.Errorf("外链不是合法 URL：%q", m[1])
+			continue
+		}
+		if u.Host != "github.com" {
+			t.Errorf("页面里不允许出现指向 %s 的外链（只允许 github.com）", u.Host)
+		}
+		// 同一个 <a> 标签里必须有 rel="noopener"
+		idx := strings.Index(body, m[0])
+		tagEnd := strings.Index(body[idx:], ">")
+		if tagEnd < 0 {
+			t.Errorf("外链标签不完整：%q", m[0])
+			continue
+		}
+		tag := body[idx : idx+tagEnd]
+		if !strings.Contains(tag, `rel="noopener`) {
+			t.Errorf("外链缺少 rel=\"noopener\"：%s", tag)
+		}
+		if !strings.Contains(tag, `target="_blank"`) {
+			t.Errorf("外链应在新标签页打开：%s", tag)
+		}
+	}
+	if found < 3 {
+		t.Errorf("用户页应至少有仓库 / 接口文档 / OpenAPI 三个外链，找到 %d 个", found)
+	}
+}
+
+// TestUserPageShowsOpenSourceNotice：用户页头部要有开源信息、官方测试地址
+// 与"别靠换 IP 刷额度"的说明。
+func TestUserPageShowsOpenSourceNotice(t *testing.T) {
+	body := string(uiHTML)
+	for _, want := range []string{
+		`id="ossNote"`,
+		"https://github.com/wzmwayne/vidlink",
+		"/blob/master/docs/API.md",
+		"/blob/master/docs/openapi.yaml",
+		"https://vl.wzml.cc.cd",
+		"AGPL-3.0",
+		"别用换 IP 的方式刷额度",
+		"约 8 MB",
+		`id="ratesNote"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("用户页缺少 %q", want)
+		}
+	}
+	// 两种模式都要看到这块提示：它不能挂在只在账户模式显示的区块里
+	if strings.Contains(body, `id="ossNote" class="hidden"`) {
+		t.Error("开源提示不该默认隐藏")
+	}
+	// 公共额度耗尽的错误文案也要给出部署建议（用户明确要求）
+	env := newTestEnv(t, nil, defaultStub())
+	r := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+	r.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+	r.RemoteAddr = "192.0.2.10:1234"
+	// 先把当天额度打满
+	for i := 0; i < 25; i++ {
+		rr := httptest.NewRequest(http.MethodGet, "/v1/links?url=https://stub.test/v/1", nil)
+		rr.Header.Set("X-API-Key", env.srv.cfg.PublicKey)
+		rr.RemoteAddr = "192.0.2.10:1234"
+		env.handler().ServeHTTP(httptest.NewRecorder(), rr)
+	}
+	w := httptest.NewRecorder()
+	env.handler().ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("额度用尽应 429，得到 %d", w.Code)
+	}
+	_, msg, _ := errBody(t, w)
+	if !strings.Contains(msg, "自己部署") || !strings.Contains(msg, "github.com/wzmwayne/vidlink") {
+		t.Errorf("429 文案应给出「自己部署」的建议与仓库链接，得到 %q", msg)
+	}
+}
+
+// TestAdminPanelHasEditableRateGrid：管理面板要能改倍率（网格 + PUT）。
+func TestAdminPanelHasEditableRateGrid(t *testing.T) {
+	body := string(adminHTML)
+	for _, want := range []string{
+		`id="rateEditor"`, `id="rateDirty"`,
+		`"proxyRateIn"`, `"data-platform"`, `"data-endpoint"`,
+		`"/v1/admin/quota"`, `method: "PUT"`, `method: "DELETE"`,
+		"保存改动", "恢复内置默认", "重新载入",
+		"rateEdits", "warnings", "history",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("管理面板缺少 %q", want)
+		}
+	}
+}
+
+// --- 计费倍率：管理面可编辑 ---
+
+// TestAdminQuotaUpdateRequiresAdmin：改价只有管理 Key 能做。
+func TestAdminQuotaUpdateRequiresAdmin(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	body := `{"rates":{"douyin":{"links":5}}}`
+
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota", body, nil); w.Code != http.StatusForbidden {
+		t.Errorf("无 Key 改价应 403，得到 %d", w.Code)
+	}
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota", body, userHdr(env.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("普通账号改价应 403，得到 %d", w.Code)
+	}
+	if w := do(h, http.MethodDelete, "/v1/admin/quota", userHdr(env.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("普通账号复位应 403，得到 %d", w.Code)
+	}
+	// 管理 Key：能改
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota", body, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("管理 Key 改价应 200，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	// 免校验模式：整条路由不存在
+	ease := newEaseEnv(t, nil, defaultStub())
+	if w := doJSON(ease.handler(), http.MethodPut, "/v1/admin/quota", body, nil); w.Code != http.StatusNotFound {
+		t.Errorf("免校验模式改价应 404，得到 %d", w.Code)
+	}
+	if w := do(ease.handler(), http.MethodDelete, "/v1/admin/quota", nil); w.Code != http.StatusNotFound {
+		t.Errorf("免校验模式复位应 404，得到 %d", w.Code)
+	}
+}
+
+// TestAdminQuotaUpdateChangesMetering：改完立刻按新系数扣费。
+func TestAdminQuotaUpdateChangesMetering(t *testing.T) {
+	dy := stubExtractor{name: core.PlatformDouyin, videos: defaultStub().videos}
+	env := newTestEnv(t, nil, dy)
+	h := env.handler()
+
+	// 先按默认价（抖音 links 1.1）
+	w := do(h, http.MethodGet, "/v1/links?platform=douyin&id=1", userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1.1" {
+		t.Fatalf("默认抖音 links 应扣 1.1，得到 %q", got)
+	}
+	// 改价：抖音 links = 5
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota",
+		`{"rates":{"douyin":{"links":5}}}`, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("改价失败：%d（%s）", w.Code, w.Body.String())
+	}
+	w = do(h, http.MethodGet, "/v1/links?platform=douyin&id=2", userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "5" {
+		t.Errorf("改价后应扣 5，得到 %q", got)
+	}
+	// 对外读数同步
+	var usage map[string]any
+	uw := do(h, http.MethodGet, "/v1/usage", userHdr(env.userKey))
+	_ = json.Unmarshal(uw.Body.Bytes(), &usage)
+	rates := usage["rates"].(map[string]any)["douyin"].(map[string]any)
+	if rates["links"] != 5.0 {
+		t.Errorf("/v1/usage 的抖音 links = %v，想要 5", rates["links"])
+	}
+	if usage["rates_note"] == nil {
+		t.Error("/v1/usage 应说明系数是当前部署的实时值")
+	}
+	// 平台清单同步
+	pw := do(h, http.MethodGet, "/v1/platforms", nil)
+	if !strings.Contains(pw.Body.String(), `"links":5`) {
+		t.Errorf("/v1/platforms 应反映新价：%s", pw.Body.String())
+	}
+	// 清除自定义 → 回到默认
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota",
+		`{"rates":{"douyin":{"links":null}}}`, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("清除失败：%d（%s）", w.Code, w.Body.String())
+	}
+	w = do(h, http.MethodGet, "/v1/links?platform=douyin&id=3", userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1.1" {
+		t.Errorf("清除后应回到 1.1，得到 %q", got)
+	}
+}
+
+// TestAdminQuotaUpdateRecomputesPreauth：预授权上限跟着改价走（降价不再误伤，
+// 涨价不漏预授权）。
+func TestAdminQuotaUpdateRecomputesPreauth(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	if _, err := env.store.Update(env.userKey, account.Patch{Quota: floatPtr(8)}); err != nil {
+		t.Fatal(err)
+	}
+	// 默认上限 1.1 ≤ 8 → 能解析
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("默认价应能解析，得到 %d", w.Code)
+	}
+	// 把 bilibili links 提到 10 → 预授权按最贵档 10 检查 → 余额 8 不够
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota",
+		`{"rates":{"bilibili":{"links":10}}}`, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("改价失败：%d", w.Code)
+	}
+	w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey))
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("涨价后预授权应拦下（429），得到 %d（%s）", w.Code, w.Body.String())
+	}
+	// 复位 → 又能解析
+	if w := do(h, http.MethodDelete, "/v1/admin/quota", userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("复位失败：%d", w.Code)
+	}
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Errorf("复位后应恢复，得到 %d", w.Code)
+	}
+}
+
+// TestProxyCostIgnoresPlatformRates：代理永不使用平台系数。
+//
+// 这是用户明确要求的不变量：把平台系数改到天上，1 MiB 的代理还是 0.5。
+func TestProxyCostIgnoresPlatformRates(t *testing.T) {
+	const size = 2 << 20 // 2 MiB
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, size))
+	}))
+	defer upstream.Close()
+
+	env := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
+	h := env.handler()
+
+	w := do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1" {
+		t.Fatalf("2 MiB 默认应扣 1（0.5/MiB），得到 %q", got)
+	}
+	// 把所有平台系数改到 50（含批量），代理仍按 0.5/MiB
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota",
+		`{"rates":{"default":{"info":50,"links":50,"detail":50,"batch_links":50}}}`,
+		userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("改价失败：%d（%s）", w.Code, w.Body.String())
+	}
+	w = do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1" {
+		t.Errorf("平台系数改成 50 后代理仍应扣 1，得到 %q", got)
+	}
+	// 改代理费率本身则生效
+	if w := doJSON(h, http.MethodPut, "/v1/admin/quota",
+		`{"proxy_rate":2}`, userHdr(env.adminKey)); w.Code != http.StatusOK {
+		t.Fatalf("改代理费率失败：%d（%s）", w.Code, w.Body.String())
+	}
+	w = do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
+	if got := w.Header().Get("X-Quota-Consumed"); got != "4" {
+		t.Errorf("代理费率改成 2 后 2 MiB 应扣 4，得到 %q", got)
+	}
+	// 平台系数改了 → 预授权上限也跟着变（说明计量表与可编辑表是同一张）
+	aw := do(h, http.MethodGet, "/v1/admin/quota", userHdr(env.adminKey))
+	var admin map[string]any
+	if err := json.Unmarshal(aw.Body.Bytes(), &admin); err != nil {
+		t.Fatal(err)
+	}
+	pre := admin["preauth_max"].(map[string]any)
+	if pre["links"] != 50.0 {
+		t.Errorf("links 的预授权上限 = %v，想要 50", pre["links"])
+	}
+}
+
+// TestAdminQuotaValidation：非法请求整体拒绝，且不改动现状。
+func TestAdminQuotaValidation(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	cases := []struct{ name, body string }{
+		{"未知平台", `{"rates":{"weibo":{"links":1}}}`},
+		{"未知端点", `{"rates":{"douyin":{"parse":1}}}`},
+		{"负数", `{"rates":{"douyin":{"links":-1}}}`},
+		{"超出上限", `{"rates":{"douyin":{"links":9999}}}`},
+		{"抖音批量不支持", `{"rates":{"douyin":{"batch_links":1}}}`},
+		{"代理费率非法", `{"proxy_rate":-1}`},
+		{"未知字段", `{"rate":{"douyin":{"links":1}}}`},
+		{"空请求", `{}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := doJSON(h, http.MethodPut, "/v1/admin/quota", c.body, userHdr(env.adminKey))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("应 400，得到 %d（%s）", w.Code, w.Body.String())
+			}
+		})
+	}
+	// 现状未变
+	gw := do(h, http.MethodGet, "/v1/admin/quota", userHdr(env.adminKey))
+	var d map[string]any
+	if err := json.Unmarshal(gw.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d["overrides"] != nil {
+		t.Errorf("失败的请求不该留下覆盖：%v", d["overrides"])
+	}
+	if d["source"] != "defaults" {
+		t.Errorf("source = %v，想要 defaults", d["source"])
+	}
+	if d["limits"] == nil || d["warnings"] == nil {
+		t.Error("GET 应带 limits 与 warnings")
+	}
+}
+
+// TestCORSPreflightAllowsPutDelete：跨域面板要能改倍率（预检必须放行 PUT/DELETE）。
+func TestCORSPreflightAllowsPutDelete(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	w := do(env.handler(), http.MethodOptions, "/v1/admin/quota", map[string]string{
+		"Origin":                        "https://panel.example.com",
+		"Access-Control-Request-Method": "PUT",
+	})
+	if w.Code != http.StatusNoContent && w.Code != http.StatusOK {
+		t.Fatalf("预检应 200/204，得到 %d", w.Code)
+	}
+	allow := w.Header().Get("Access-Control-Allow-Methods")
+	for _, m := range []string{"PUT", "DELETE"} {
+		if !strings.Contains(allow, m) {
+			t.Errorf("Allow-Methods 应包含 %s，得到 %q", m, allow)
+		}
+	}
+}
+
+// TestRatesPersistAcrossRestart：改过的倍率要能从文件读回来（重启不丢）。
+func TestRatesPersistAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rates.json")
+
+	build := func() *Server {
+		st, err := rates.New(rates.Options{Path: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env := newTestEnv(t, nil, defaultStub())
+		// 两张表必须一起换（server.New 里的不变量：计量表 == 可编辑倍率表）
+		env.srv.rates = st
+		env.srv.quotaTable = st.Table()
+		return env.srv
+	}
+	srv := build()
+	if w := doJSON(srv.Handler(), http.MethodPut, "/v1/admin/quota",
+		`{"rates":{"bilibili":{"links":2.5}},"proxy_rate":0.25}`,
+		userHdr("vl_admin_test")); w.Code != http.StatusOK {
+		t.Fatalf("改价失败：%d（%s）", w.Code, w.Body.String())
+	}
+
+	// 模拟重启：新建一个指向同一文件的 server
+	srv2 := build()
+	w := do(srv2.Handler(), http.MethodGet, "/v1/admin/quota", userHdr("vl_admin_test"))
+	var d map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d["source"] != "file" {
+		t.Errorf("重启后 source = %v，想要 file", d["source"])
+	}
+	proxy := d["proxy"].(map[string]any)
+	if proxy["rate_per_mib"] != 0.25 {
+		t.Errorf("重启后代理费率 = %v，想要 0.25", proxy["rate_per_mib"])
+	}
+	plats := d["platforms"].(map[string]any)
+	if plats["bilibili"].(map[string]any)["links"] != 2.5 {
+		t.Errorf("重启后 bilibili links = %v，想要 2.5",
+			plats["bilibili"].(map[string]any)["links"])
 	}
 }

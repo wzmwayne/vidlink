@@ -46,7 +46,8 @@ ssh user@host 'curl -s http://127.0.0.1:18080/v1/health'
   而 scratch 里没有 `chown`、`sudo` 往往又要密码。想改成镜像内置的
   `65534:65534` 就得先 `sudo chown -R 65534:65534 vl-data`。
 - **数据**：账本在 `./vl-data/accounts.jsonl`（append-only JSONL），
-  换镜像/重启都不丢；`docker compose down` 也不会删它（没有用命名卷）。
+  计费倍率的覆盖层在 `./vl-data/rates.json`（原子写、只存改过的格子），
+  换镜像/重启都不丢；`docker compose down` 也不会删它们（没有用命名卷）。
 - **cloudflared**：`compose.yaml` 里留了一段注释模板。拿到 tunnel token 后
   取消注释并填 token；Cloudflare 后台的 Public Hostname 里
   **Service 填 `http://vidlink:8080`**（同一 compose 网络里的容器名，

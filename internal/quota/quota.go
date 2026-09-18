@@ -22,10 +22,17 @@
 //
 //  3. **系数表只回答"该扣多少"，不碰账本。** 配额属于账号，
 //     扣减的原子性由 account 包保证。分开之后，调系数不会碰到账本逻辑。
+//
+//  4. **默认值与覆盖层分开。** 这个包里放的是**内置默认**（编译进来、
+//     不可变），运行期由管理员改出来的差值放在 internal/rates 的覆盖层里，
+//     两者叠加才是生效值。这样"出厂价目表"永远可复现，重置只需丢掉覆盖层。
 package quota
 
 import (
 	"fmt"
+	"math"
+	"sort"
+	"sync"
 
 	"vidlink/internal/core"
 )
@@ -52,6 +59,42 @@ var AllEndpoints = []Endpoint{
 // defaultPlatformKey 是"通用"档的键。表里没列出的平台都走它。
 const defaultPlatformKey core.Platform = ""
 
+// PlatformDefault 是通用档在**接口与文件里的名字**。
+//
+// 内部键是空字符串（map 里好写），但对外的 JSON 键不能是 ""——
+// 那既不好读，也容易和"没填"混淆，所以对外一律用 "default"。
+const PlatformDefault = "default"
+
+// AllPlatforms 是价目表里**单列**的平台，顺序固定（文档与面板都按它排）。
+var AllPlatforms = []core.Platform{
+	core.PlatformBilibili, core.PlatformDouyin,
+	core.PlatformKuaishou, core.PlatformXiaohongshu,
+}
+
+// PlatformName 把内部平台键转成对外名字（通用档 → "default"）。
+func PlatformName(p core.Platform) string {
+	if p == defaultPlatformKey {
+		return PlatformDefault
+	}
+	return string(p)
+}
+
+// NormalizePlatform 把对外名字转成内部平台键。
+//
+// 认识的只有"default"与四个平台：**不允许**任意字符串进来，否则价目表里
+// 会攒下一堆拼错平台名的死行，而且没人知道它们什么时候生效。
+func NormalizePlatform(name string) (core.Platform, bool) {
+	if name == PlatformDefault {
+		return defaultPlatformKey, true
+	}
+	for _, p := range AllPlatforms {
+		if string(p) == name {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 // ProxyUnitBytes 是媒体代理的计费单位：1 个配额对应 1 MiB 传输量。
 //
 // 代理**刻意不乘**端点系数与平台系数（docs/配额倍率表.md 有完整说明）：
@@ -69,7 +112,10 @@ const defaultPlatformKey core.Platform = ""
 // 前者的出口带宽是后者的几百倍。按体积是唯一与真实成本同向的计法。
 const ProxyUnitBytes = 1 << 20
 
-// ProxyRate 是媒体代理的**统一费率**：0.5 配额/MiB。
+// ProxyRate 是媒体代理费率的**内置默认值**：0.5 配额/MiB。
+//
+// 运行期可被管理员改（存在 internal/rates 的覆盖层里），这里只是出厂默认
+// 与"文件不存在时的种子"。
 //
 // 所有账号一个价（公共 Key 也一样）——分档定价在这个规模上没有意义，
 // 只会让"这次要花多少"变成需要查表的题。0.5 这个数是这样定的：
@@ -98,15 +144,31 @@ func ProxyCostAt(bytes int64, ratePerMiB, accountMultiplier float64) float64 {
 	return round4(float64(bytes) / float64(ProxyUnitBytes) * ratePerMiB * accountMultiplier)
 }
 
-// Table 是倍率表。
+// RateLimits 是单个系数的合法范围。
 //
-// 结构是 map[端点][平台] → 倍率；平台键为 defaultPlatformKey 表示通用档。
-// 没在表里出现的平台组合一律走通用档，这样新增平台不需要改这张表就有合理的默认系数。
+// 上限 100 不是运营判断，而是**防手滑**：把 1.2 打成 120 会让一个账号
+// 一次调用就被扣光；下限 0 合法（0 表示这个端点不扣配额）。
+const (
+	MinRate = 0
+	MaxRate = 100
+)
+
+// Table 是**可变的**倍率表：内置默认 + 运行期覆盖层。
+//
+// 结构是 map[端点][平台] → 倍率；平台键 defaultPlatformKey 表示通用档。
+// 生效值按"覆盖 → 内置默认"逐层回退，找不到平台就回退到通用档，
+// 所以新增平台不需要改这张表就有合理的默认系数。
+//
+// 并发：读路径（每次计量）走读锁，写路径（管理面改价）走写锁。
+// 计量本身是纯计算，锁竞争可以忽略。
 type Table struct {
-	base map[Endpoint]map[core.Platform]float64
+	mu       sync.RWMutex
+	defaults map[Endpoint]map[core.Platform]float64
+	override map[Endpoint]map[core.Platform]float64
+	proxy    float64
 }
 
-// DefaultTable 返回内置系数表。
+// DefaultTable 返回内置系数表（没有任何覆盖）。
 //
 // 数值依据（2026-09 实测定档，完整说明见 docs/配额倍率表.md）：
 //
@@ -130,10 +192,22 @@ type Table struct {
 //
 // B 站不单独设系数：实网验证发现匿名即可拿完整 1080P（非签名 playurl 通道
 // + try_look=1），既不需要内嵌账号也不存在额外成本，因此与通用档一致。
+//
+// 注意：这些是**出厂默认**。运行期管理员可以覆盖任意一格（见 internal/rates），
+// 想恢复出厂值就重置覆盖层。
 func DefaultTable() *Table {
-	return &Table{base: map[Endpoint]map[core.Platform]float64{
-		// 只列出**与通用档不同**的平台。没列出的自动走 defaultPlatformKey，
-		// 所以将来新增平台不需要动这张表就有合理的默认系数。
+	return &Table{
+		defaults: defaultRates(),
+		proxy:    ProxyRate,
+	}
+}
+
+// defaultRates 是"出厂价目表"。
+//
+// 只列出**与通用档不同**的平台。没列出的自动走 defaultPlatformKey，
+// 所以将来新增平台不需要动这张表就有合理的默认系数。
+func defaultRates() map[Endpoint]map[core.Platform]float64 {
+	return map[Endpoint]map[core.Platform]float64{
 		EndpointInfo: {
 			defaultPlatformKey:  0.5,
 			core.PlatformDouyin: 0.75,
@@ -150,7 +224,7 @@ func DefaultTable() *Table {
 		EndpointBatchLinks: {
 			defaultPlatformKey: 0.75,
 		},
-	}}
+	}
 }
 
 // BatchUnsupportedReason 返回该平台不能进批量的原因；空串表示支持。
@@ -183,6 +257,10 @@ var batchUnsupported = map[core.Platform]string{
 
 // Coefficient 返回一次调用的端点系数（已含平台差异；不含账号倍率）。
 //
+// 解析顺序：覆盖层的具体平台 → 覆盖层的通用档 → 内置默认的具体平台 →
+// 内置默认的通用档。前两层让管理员改的值生效，后两层让"没改过的平台"
+// 与"新平台"都有价。
+//
 // 对批量端点，返回的是**每条**的系数。
 func (t *Table) Coefficient(e Endpoint, p core.Platform) (float64, error) {
 	if e == EndpointBatchLinks {
@@ -190,15 +268,26 @@ func (t *Table) Coefficient(e Endpoint, p core.Platform) (float64, error) {
 			return 0, ErrPlatformUnsupported{Endpoint: e, Platform: p, Reason: reason}
 		}
 	}
-	byPlatform, ok := t.base[e]
-	if !ok {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.coefficientLocked(e, p)
+}
+
+func (t *Table) coefficientLocked(e Endpoint, p core.Platform) (float64, error) {
+	for _, layer := range []map[Endpoint]map[core.Platform]float64{t.override, t.defaults} {
+		byPlatform, ok := layer[e]
+		if !ok {
+			continue
+		}
+		if v, ok := byPlatform[p]; ok {
+			return v, nil
+		}
+		if v, ok := byPlatform[defaultPlatformKey]; ok {
+			return v, nil
+		}
+	}
+	if _, ok := t.defaults[e]; !ok {
 		return 0, fmt.Errorf("未知端点 %q", e)
-	}
-	if v, ok := byPlatform[p]; ok {
-		return v, nil
-	}
-	if v, ok := byPlatform[defaultPlatformKey]; ok {
-		return v, nil
 	}
 	return 0, fmt.Errorf("端点 %q 没有可用的倍率", e)
 }
@@ -251,31 +340,167 @@ func (t *Table) Coefficients(p core.Platform) map[Endpoint]float64 {
 	return out
 }
 
-// MaxBase 返回该端点在所有平台上的最高基础倍率。
+// MaxCoefficient 返回该端点在所有平台上的最高**生效**系数。
 //
 // 用途是**预授权**：解析开始前我们还不知道是哪家平台（要解析链接才知道），
 // 但可以先按最贵的可能值检查配额够不够。这样既不会让配额为空的客户
-// 未计入消耗到我们打上游的成本，也不会因为事后才发现配额不足而对他已经拿到的
-// 结果已经返回了才发现配额不足。
+// 未计入消耗到我们打上游的成本，也不会事后才发现配额不足。
 //
 // 真正的扣减配额仍按**实际平台**的系数结算，所以预授权只是上限检查，
-// 不会多扣。
+// 不会多扣。改价后这个上限会立刻跟着变——否则降价之后老上限仍会误伤。
 func (t *Table) MaxCoefficient(e Endpoint) float64 {
-	byPlatform, ok := t.base[e]
-	if !ok {
-		return 0
-	}
 	var max float64
-	for p, v := range byPlatform {
-		if p == defaultPlatformKey {
-			continue // 通用档不是"某个平台"，不参与取最大
-		}
-		if v > max {
+	for _, p := range AllPlatforms {
+		if v, err := t.Coefficient(e, p); err == nil && v > max {
 			max = v
 		}
 	}
-	if def, ok := byPlatform[defaultPlatformKey]; ok && def > max {
-		max = def
+	if v, err := t.Coefficient(e, defaultPlatformKey); err == nil && v > max {
+		max = v
 	}
 	return max
+}
+
+// --- 覆盖层（管理面）---
+
+// Overrides 返回当前的覆盖层副本（只含被管理员改过的格子）。
+func (t *Table) Overrides() map[Endpoint]map[core.Platform]float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return copyRates(t.override)
+}
+
+// Defaults 返回内置默认的副本（出厂价目表）。
+func (t *Table) Defaults() map[Endpoint]map[core.Platform]float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return copyRates(t.defaults)
+}
+
+// SetOverride 写入/清除一格覆盖。v 为 nil 表示清除该格（回到内置默认）。
+func (t *Table) SetOverride(e Endpoint, p core.Platform, v *float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if v == nil {
+		if byPlatform, ok := t.override[e]; ok {
+			delete(byPlatform, p)
+			if len(byPlatform) == 0 {
+				delete(t.override, e)
+			}
+		}
+		return
+	}
+	if t.override == nil {
+		t.override = make(map[Endpoint]map[core.Platform]float64, len(AllEndpoints))
+	}
+	if t.override[e] == nil {
+		t.override[e] = make(map[core.Platform]float64, len(AllPlatforms)+1)
+	}
+	t.override[e][p] = *v
+}
+
+// ReplaceOverrides 整体替换覆盖层（用于加载文件与重置）。
+func (t *Table) ReplaceOverrides(m map[Endpoint]map[core.Platform]float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.override = copyRates(m)
+}
+
+// ProxyRate 返回媒体代理费率的生效值（配额/MiB）。
+func (t *Table) ProxyRate() float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.proxy <= 0 {
+		return ProxyRate
+	}
+	return t.proxy
+}
+
+// SetProxyRate 设置代理费率。
+func (t *Table) SetProxyRate(v float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.proxy = v
+}
+
+// ValidateCell 校验一格的取值。管理 API 与前端共用这一份口径。
+func ValidateCell(e Endpoint, p core.Platform, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("%s/%s 的系数必须是有限数字", PlatformName(p), e)
+	}
+	if v < MinRate || v > MaxRate {
+		return fmt.Errorf("%s/%s 的系数 %v 超出允许范围 [%v, %v]",
+			PlatformName(p), e, v, MinRate, MaxRate)
+	}
+	if e == EndpointBatchLinks {
+		if reason, bad := batchUnsupported[p]; bad {
+			return fmt.Errorf("%s 不支持 %s（%s），不能给它设系数",
+				PlatformName(p), e, reason)
+		}
+	}
+	for _, known := range AllEndpoints {
+		if known == e {
+			return nil
+		}
+	}
+	return fmt.Errorf("未知端点 %q", e)
+}
+
+// Warnings 检查当前**生效值**是否偏离设计意图，返回人能读的提示。
+//
+// 刻意只提示不阻止：定价是运营决策，代码不该替管理员做判断。
+// 但像"detail 比 links 还便宜"这种多半是手滑，值得在面板上红一下。
+func (t *Table) Warnings() []string {
+	out := []string{} // 非 nil：JSON 里是 [] 而不是 null，客户端不用区分两种空
+	seen := map[string]bool{}
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, p := range append(append([]core.Platform{}, AllPlatforms...), defaultPlatformKey) {
+		links, lerr := t.Coefficient(EndpointLinks, p)
+		detail, derr := t.Coefficient(EndpointDetail, p)
+		info, ierr := t.Coefficient(EndpointInfo, p)
+		if lerr == nil && derr == nil && detail <= links {
+			add(fmt.Sprintf("%s：detail(%v) ≤ links(%v)，links 会被完全支配",
+				PlatformName(p), detail, links))
+		}
+		if lerr == nil && derr == nil && ierr == nil && detail >= info+links {
+			add(fmt.Sprintf("%s：detail(%v) ≥ info+links(%v)，打包折扣消失",
+				PlatformName(p), detail, info+links))
+		}
+	}
+	for _, e := range AllEndpoints {
+		for _, p := range append(append([]core.Platform{}, AllPlatforms...), defaultPlatformKey) {
+			v, err := t.Coefficient(e, p)
+			if err != nil {
+				continue
+			}
+			if v == 0 {
+				add(fmt.Sprintf("%s/%s = 0：该端点不扣配额", PlatformName(p), e))
+			}
+			if v > 10 {
+				add(fmt.Sprintf("%s/%s = %v：超过 10，确认不是手滑？", PlatformName(p), e, v))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func copyRates(in map[Endpoint]map[core.Platform]float64) map[Endpoint]map[core.Platform]float64 {
+	if in == nil {
+		return nil
+	}
+	out := make(map[Endpoint]map[core.Platform]float64, len(in))
+	for e, byPlatform := range in {
+		cp := make(map[core.Platform]float64, len(byPlatform))
+		for p, v := range byPlatform {
+			cp[p] = v
+		}
+		out[e] = cp
+	}
+	return out
 }

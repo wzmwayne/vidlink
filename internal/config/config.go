@@ -89,11 +89,20 @@ type Config struct {
 	// 所以 25 配额约等于每天 25 条直链，或约 50 MiB 代理流量。
 	PublicDailyQuota float64
 
-	// ProxyRate 是媒体代理的费率（配额/MiB，默认 0.5，**所有账号同价**）。
+	// ProxyRate 是媒体代理费率的**首次种子**（配额/MiB，默认 0.5）。
 	//
 	// 代理的成本是服务端出口带宽，与账号身份无关，所以只有一个数。
-	// 调大 = 抑制代理用量（带宽紧张时），调小 = 鼓励用代理。
+	// 运行期它存在倍率文件里（RatesPath），由管理员改；本变量只在
+	// **文件还不存在**时决定初值——之后一律以文件为准，否则管理员在面板上
+	// 改的值会被下次重启悄悄覆盖回去。
 	ProxyRate float64
+
+	// RatesPath 是计费倍率覆盖层的落盘路径（JSON，原子写）。
+	//
+	// 存的是"被管理员改过的格子"（出厂默认仍在代码里，见 internal/quota），
+	// 与账本同目录，这样容器只需要挂一个卷两样都持久化。
+	// 为空 = 纯内存：改动重启即丢，只适合测试。
+	RatesPath string
 
 	// RateLimitRPM 是每 IP 每分钟请求上限；<=0 表示不限。
 	RateLimitRPM int
@@ -301,6 +310,7 @@ func Load() (*Config, error) {
 		PublicKey:          env("VIDLINK_PUBLIC_KEY", "vl_public"),
 		PublicDailyQuota:   envFloat("VIDLINK_PUBLIC_DAILY_QUOTA", publicq.DefaultDaily),
 		ProxyRate:          envFloat("VIDLINK_PROXY_RATE", quota.ProxyRate),
+		RatesPath:          env("VIDLINK_RATES_PATH", "data/rates.json"),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
 		Proxy:              env("VIDLINK_PROXY", ""),

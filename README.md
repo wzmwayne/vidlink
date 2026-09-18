@@ -40,6 +40,9 @@
 
 ## 快速开始
 
+完整接口文档（全部端点、示例、错误码）见 **[docs/API.md](docs/API.md)**；
+这里只跑通三步。官方测试实例是 <https://vl.wzml.cc.cd>（公共 Key `vl_public` 免注册可试）。
+
 ```bash
 # 构建
 go build -o vidlink .
@@ -47,37 +50,25 @@ go build -o vidlink .
 # 运行（默认监听 :8080，账本写到 ./data/accounts.jsonl）
 # VIDLINK_ADMIN_KEY 决定管理接口是否可用：不配置就没人能改账号（解析照常）
 VIDLINK_ADMIN_KEY=$(openssl rand -hex 32) ./vidlink
+
+export BASE=http://127.0.0.1:8080        # 官方测试实例则是 https://vl.wzml.cc.cd
 export ADMIN=$VIDLINK_ADMIN_KEY
 
-# 建一个自己的账号（明文 Key 只在这次响应里出现一次）
+# ① 建一个自己的账号（明文 Key 只在这次响应里出现一次）
 curl -s -X POST -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"name":"我自己","quota":1000}' http://127.0.0.1:8080/v1/admin/accounts
+  -d '{"name":"我自己","quota":1000}' "$BASE/v1/admin/accounts"
 
-# 想用鼠标点：加 VL_WEBUI=true 启动，然后打开 http://127.0.0.1:8080/admin
-#   （账户模式下图形界面默认关，见下文 "图形界面"）
+# ② 用它的 Key 取一条能播的直链（1.0 配额；只想试试就直接用公共 Key vl_public）
+export KEY=vl_xxx
+curl -H "X-API-Key: $KEY" "$BASE/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7"
 
-export KEY=vl_xxx   # 上一步响应里的 key
-
-# ① 先看有哪些清晰度（0.5 配额）
-curl -H "X-API-Key: $KEY" \
-  'http://127.0.0.1:8080/v1/info?url=https://www.bilibili.com/video/BV1GJ411x7h7'
-
-# ② 取一条能播的直链（1.0 配额）
-curl -H "X-API-Key: $KEY" \
-  'http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7&quality=1080'
-
-# ③ 元信息 + 全部档位直链（1.2 配额）
-curl -H "X-API-Key: $KEY" \
-  'http://127.0.0.1:8080/v1/detail?url=https://www.bilibili.com/video/BV1GJ411x7h7'
-
-# ④ 批量取直链（0.75/条，5~20 条，不支持抖音）
-curl -X POST http://127.0.0.1:8080/v1/batch/links \
-  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"text":"https://b23.tv/xxx\nhttps://b23.tv/yyy\nhttps://b23.tv/zzz\nhttps://b23.tv/aaa\nhttps://b23.tv/bbb"}'
-
-# ⑤ 查看自己的配额与用量
-curl -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/usage
+# ③ 查自己的配额与用量
+curl -H "X-API-Key: $KEY" "$BASE/v1/usage"
 ```
+
+想用鼠标点：加 `VL_WEBUI=true` 启动，打开 `$BASE/`（解析页）与 `$BASE/admin`（管理面板）。
+批量、字幕/图集、浏览器内混流、代理下载、每日签到、配额流水、改计费倍率等
+都在 [docs/API.md](docs/API.md) 里。
 
 ## 图形化页面（VL_WEBUI）
 
@@ -114,12 +105,10 @@ Key 无效或过期时会明确提示 403 并高亮输入框。
 
 ```bash
 VL_EASE=true ./vidlink
-
-# 不用任何凭据，直接解析
-curl 'http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7'
+# 之后所有解析端点都不需要任何凭据，例如 GET /v1/links?url=…
 ```
 
-**浏览器打开 `http://127.0.0.1:8080/` 就是一个图形化解析页**：填链接点按钮即可，
+**浏览器打开 `$BASE/` 就是一个图形化解析页**：填链接点按钮即可，
 结果按"直链 / 请求头 / 视频轨 / 音频轨 / 字幕 / 图集 / 原始 JSON"分区渲染，
 带复制直链、复制 curl / ffmpeg 命令、批量解析（5~20 条）、平台能力表。
 
@@ -244,7 +233,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 每个响应都带 `X-Request-Id`，错误体里也有同一个值，报障时直接提供即可定位：
 
 ```
-$ curl -i -H 'X-API-Key: ...' 'http://127.0.0.1:8080/v1/nope'
+$ curl -i -H 'X-API-Key: ...' '$BASE/v1/nope'
 HTTP/1.1 404 Not Found
 X-Request-Id: 91c0651a168bd9acaf6f85b2225d0c9f
 {"error":{"kind":"not_found","message":"未知路径: /v1/nope","request_id":"91c0651a168bd9acaf6f85b2225d0c9f"}}
@@ -269,6 +258,31 @@ X-Request-Id: 91c0651a168bd9acaf6f85b2225d0c9f
 - 响应头回写 `X-Quota-Consumed` / `X-Quota-Remaining`；
 - 解析前会按该端点的**最贵档位**做一次上限检查（预授权），不够直接 `429`，真正扣减仍按实际平台结算；
 - 账号倍率由管理员设置：`0` 不扣配额（仍记调用次数）、`0.5` 减半、`1.0` 标准、`2.0` 加倍。
+
+### 计费倍率（运行期可编辑）
+
+倍率是**数据**，不是编译进代码的常量：4 个平台 × 4 个端点 + 通用档 + 代理费率，
+都可以在运行期改，改完立刻对后续请求生效（预授权上限同步重算）。
+
+| 事项 | 说明 |
+| --- | --- |
+| 出厂默认 | 代码里的价目表（`internal/quota`），永远可复现、可一键重置 |
+| 改动存哪 | `data/rates.json`（`VIDLINK_RATES_PATH`）：**只存改过的格子**，原子写、权限 600 |
+| 怎么改 | 管理面板的「计费倍率（可编辑）」网格，或 `PUT /v1/admin/quota`（`DELETE` 恢复默认） |
+| 代理例外 | 代理**永不参与平台系数**：它按体积单一费率计费，改平台系数不影响它（有测试钉死） |
+| 环境变量 | `VIDLINK_PROXY_RATE` 只在**文件不存在**时当种子；之后以文件为准，避免重启覆盖面板上的改动 |
+| 审计 | 文件里保留最近 50 次变更（时间 / 动作 / 说明）；管理面只有一个固定 Key，所以记不到人 |
+| 坏了怎么办 | 倍率文件损坏或不合法 → **拒绝启动**并指出原因（不带着半个价目表跑） |
+
+```bash
+# 抖音 links 改成 1.5，代理费率改成 0.6
+curl -X PUT -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"rates":{"douyin":{"links":1.5}},"proxy_rate":0.6}' "$BASE/v1/admin/quota"
+```
+
+具体口径与字段见 [docs/API.md](docs/API.md) §3.9.5，默认值与推导见
+[docs/配额倍率表.md](docs/配额倍率表.md)。**客户端应以 `/v1/usage` 返回的实时值为准**——
+文档里印的是仓库默认值，部署者可能改过。
 
 配额是**用量额度**，不是余额也不是货币：服务不涉及任何支付、充值或交易，
 接口里也不存在任何金额字段。遇到配额不足返回 `429`（**刻意不用 402 Payment Required**）。
@@ -331,25 +345,11 @@ printf 'VIDLINK_ADMIN_KEY=%s\n' "$(openssl rand -hex 32)" >> .vl
 # 容器化部署：不必翻日志，也不会在日志里出现
 VIDLINK_ADMIN_KEY=$(openssl rand -hex 32) ./vidlink
 
-ADMIN=$VIDLINK_ADMIN_KEY
-
-# 建一个账号：初始配额 100、标准倍率
-curl -X POST -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"name":"示例账号","quota":100}' http://127.0.0.1:8080/v1/admin/accounts
-# → 响应里的 key 就是明文（只此一次），此后一律掩码；id 是账号句柄
-
-# 补 100 配额（路径参数可以用明文 Key，也可以用列表里的 id）
-curl -X PATCH -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"add_quota":100}' http://127.0.0.1:8080/v1/admin/accounts/acc_1f2e3d4c5b6a7980
-
-# 活动/内部账号：按 0.5 倍消耗
-curl -X PATCH -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"multiplier":0.5}' http://127.0.0.1:8080/v1/admin/accounts/<明文Key 或 acc_ 句柄>
-
-# 停用 / 恢复
-curl -X PATCH ... -d '{"disabled":true}'  ...
-curl -X PATCH ... -d '{"disabled":false}' ...
-```
+拿到管理 Key 之后，账号管理都在 `/v1/admin/accounts` 一族接口上：`POST` 建号
+（明文 Key 只在响应里出现一次）、`PATCH` 改配额/账号倍率/每日签到额度/停用、
+`DELETE` 删号（路径参数可以是明文 Key，也可以是列表里的句柄 `acc_…`）。
+逐字段说明与完整示例见 **[docs/API.md](docs/API.md)** §3.9；也可以直接用管理面板
+（`VL_WEBUI=true` 后打开 `$BASE/admin`）——每个编辑框下面都写着它是干什么的。
 
 **账号句柄 `id`**：列表与详情里的 `id`（形如 `acc_1f2e3d…`）是 Key 的
 SHA-256 截断，不可反推、重启不变、只能用来定位账号。它的存在是为了让管理面板
@@ -363,12 +363,9 @@ SHA-256 截断，不可反推、重启不变、只能用来定位账号。它的
 服务在账户模式下会自动准备一个**公共账号**（默认 Key `vl_public`）：
 Key 是公开的，谁都能用，所以它的配额不来自账本余额，而是**每 IP 每日限额**（默认 25）：
 
-```bash
-# 不注册也能跑通一次完整解析
-curl -H "X-API-Key: vl_public" \
-  'http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1GJxx'
-# 响应头：X-Quota-Consumed: 1   X-Quota-Remaining: 99   ← 剩余是"本 IP 今天"的
-```
+不注册也能跑通一次完整解析：带着 `X-API-Key: vl_public` 调任意解析端点即可，
+响应头里的 `X-Quota-Remaining` 是**本 IP 今天**的剩余（示例见
+[docs/API.md](docs/API.md) §3.8a）。
 
 | 行为 | 说明 |
 | --- | --- |
@@ -391,16 +388,8 @@ curl -H "X-API-Key: vl_public" \
 | `grant_cap` | **停止增加界限**：`余额 = min(余额 + daily_grant, grant_cap)`；0 = 不封顶 |
 | `grant_day` | 最近一次签到的日期（只读，由服务记录） |
 
-用户自己调接口领取，**每天一次**：
-
-```bash
-curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
-# {"granted":25,"balance":25,"daily":25,"cap":100,"already_checked_in":false,
-#  "at_cap":false,"checked_in":true,"next_checkin_at":"2026-09-18T00:00:00+08:00",
-#  "unit":"配额","message":"签到成功：+25 配额，当前剩余 25"}
-
-# 当天再签：200 + already_checked_in=true，不重复加
-```
+用户自己调 `POST /v1/checkin` 领取，**每天一次**（完整请求/响应见
+[docs/API.md](docs/API.md) §3.8a2）：
 
 规则：
 
@@ -423,16 +412,11 @@ curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
 余额与累计用量只能回答"现在剩多少"，回答不了"这笔是怎么来的"。流水补上后者：
 每一次消耗、管理员每一次增加/减少/设置都会记一条，含变化量、变化后余额与说明。
 
-```bash
-# 用户：只读自己的（服务端按 Key 限定，接口里没有"读别人"的入口）
-curl -H "X-API-Key: $KEY" 'http://127.0.0.1:8080/v1/ledger?limit=20&type=consume'
+- 用户读自己的：`GET /v1/ledger?limit=20&type=consume`（服务端按 Key 限定，
+  接口里没有"读别人"的入口，也不消耗配额）；
+- 管理员读总账单：`GET /v1/admin/ledger`；读指定账号加 `?id=acc_…`（句柄）或 `?key=…`。
 
-# 管理员：总账单
-curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger'
-
-# 管理员：指定账号（句柄或明文 Key 都行）
-curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980'
-```
+完整示例见 [docs/API.md](docs/API.md) §3.8b 与 §3.9。
 
 | 类型 | 含义 |
 | --- | --- |
@@ -459,8 +443,8 @@ curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?id=acc_1f2e3d
 
 ```bash
 VL_WEBUI=true VIDLINK_ADMIN_KEY=... ./vidlink
-# 打开 http://127.0.0.1:8080/      解析页
-# 打开 http://127.0.0.1:8080/admin 管理面板（填管理 Key 后自动带上）
+# 打开 $BASE/      解析页
+# 打开 $BASE/admin 管理面板（填管理 Key 后自动带上）
 ```
 
 管理面板的账号卡片默认只展示信息，**操作区（改配额 / 倍率 / 签到额度 / 停用 / 删除）
@@ -536,7 +520,8 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
 | `VIDLINK_PUBLIC_KEY` | `vl_public` | 公共账号的 Key（公开、免注册试用）；**留空 = 不提供公共入口** |
 | `VIDLINK_PUBLIC_DAILY_QUOTA` | `25` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
-| `VIDLINK_PROXY_RATE` | `0.5` | 媒体代理费率（配额/MiB），**所有账号同价**；调大抑制代理用量，调小鼓励使用 |
+| `VIDLINK_PROXY_RATE` | `0.5` | 媒体代理费率的**首次种子**（配额/MiB，所有账号同价）；文件存在后以文件为准 |
+| `VIDLINK_RATES_PATH` | `data/rates.json` | 计费倍率覆盖层的落盘路径（原子写）；留空 = 纯内存，重启即丢 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
 | `VIDLINK_RATE_LIMIT_RPM` | `120` | 每 IP 每分钟请求上限；`0` = 不限 |
 | `VIDLINK_PER_KEY_CONCURRENCY` | `1` | 同一个 Key 的同时请求数 |
@@ -766,7 +751,11 @@ export VIDLINK_COOKIE_DOUYIN='UIFID_TEMP=...; ttwid=...'
 
 ## 文档
 
-- [**API 文档**](docs/API.md) — 接口说明、示例与排障
+- [**API 文档**](docs/API.md) — **唯一的人读接口文档**：全部端点、示例（相对路径）、
+  错误码、公共 Key、每日签到、配额流水、可编辑倍率、媒体代理
+- 在线版本：<https://github.com/wzmwayne/vidlink/blob/master/docs/API.md>
+- 官方测试实例：<https://vl.wzml.cc.cd>（公共 Key `vl_public` 免注册可试；
+  它跑在一台树莓派上，可能限流或随时变动，**正式使用请自部署**）
 - [OpenAPI 3.0 规格](docs/openapi.yaml) — 接口契约（可直接生成客户端 SDK）
 - [配额倍率表](docs/配额倍率表.md) — 每个系数是多少、为什么、怎么改
 - [配额说明（用户版）](docs/配额说明-用户版.md) — 面向调用方的配额速查

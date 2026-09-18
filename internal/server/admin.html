@@ -93,6 +93,15 @@
   .field > .cap { font-size: 11px; line-height: 1.35; color: var(--dim); }
   .field > .cap b { color: var(--fg); font-weight: 600; }
   .acct-acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  /* 可编辑倍率网格：每格一个输入框，列头带说明 */
+  table.rates { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  table.rates th, table.rates td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; }
+  table.rates th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  table.rates input { width: 88px; }
+  table.rates input.changed { border-color: var(--warn); }
+  table.rates tr.defrow td { color: var(--dim); }
+  .ratehint { font-size: 11px; line-height: 1.35; color: var(--dim); font-weight: 400; }
+  .ratehint b { color: var(--fg); }
   pre {
     background: #0f1115; border: 1px solid var(--line); border-radius: 8px;
     padding: 10px; overflow: auto; max-height: 420px;
@@ -255,9 +264,10 @@
     </div>
   </section>
 
-  <!-- 配额系数 -->
+  <!-- 计费倍率：可编辑 -->
   <section id="quotasec" class="hidden">
-    <h2>配额系数（只读）</h2>
+    <h2>计费倍率（可编辑）<span class="pill hidden" id="rateDirty">未保存</span></h2>
+    <div id="rateEditor"></div>
     <div id="quota"></div>
   </section>
 
@@ -870,10 +880,246 @@
     box.textContent = "";
     if (r.status !== 200) {
       show(r);
-      box.appendChild(el("div", "errbox", "取不到配额系数：" + errText(r)));
+      box.appendChild(el("div", "errbox", "取不到计费倍率：" + errText(r)));
       return;
     }
     const d = r.body || {};
+    renderRateEditor(d);
+    renderQuotaReadOnly(d);
+
+    if (d.platforms) {
+      box.appendChild(el("h3", null, "当前生效值（消耗 = 系数 × 条数 × 账号倍率）"));
+      const t = el("table");
+      const tr = el("tr");
+      ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
+      t.appendChild(tr);
+      Object.keys(d.platforms).sort().forEach((p) => {
+        const row = el("tr");
+        row.appendChild(el("td", null, p));
+        ["info", "links", "detail", "batch_links"].forEach((k) => {
+          const v = d.platforms[p][k];
+          const cell = el("td", "mono");
+          if (v && typeof v === "object") cell.textContent = "不支持";
+          else cell.textContent = v === undefined ? "—" : String(v);
+          row.appendChild(cell);
+        });
+        t.appendChild(row);
+      });
+      box.appendChild(t);
+    }
+  }
+
+  // ---------- 计费倍率：可编辑网格 ----------
+
+  const ENDPOINT_DOC = [
+    ["info", "只给元信息与档位列表，不含直链"],
+    ["links", "只给直链（核心产出）"],
+    ["detail", "元信息 + 全部档位直链"],
+    ["batch_links", "批量直链，按条计量"],
+  ];
+  const PLATFORMS = ["bilibili", "douyin", "kuaishou", "xiaohongshu", "default"];
+  const PLATFORM_CN = {
+    bilibili: "哔哩哔哩", douyin: "抖音", kuaishou: "快手",
+    xiaohongshu: "小红书", default: "通用（未单列的平台）",
+  };
+
+  let rateSnapshot = null;       // 最近一次载入的生效值，用于算"改过哪些格"
+  const rateEdits = {};          // "platform|endpoint" → 新值（空串 = 恢复默认）
+
+  function rateKey(p, e) { return p + "|" + e; }
+
+  function markDirty() {
+    const n = Object.keys(rateEdits).length;
+    const tag = $("#rateDirty");
+    tag.classList.toggle("hidden", n === 0);
+    tag.textContent = n ? ("未保存 " + n + " 处") : "未保存";
+  }
+
+  function renderRateEditor(d) {
+    const box = $("#rateEditor");
+    box.textContent = "";
+    rateSnapshot = d;
+    for (const k of Object.keys(rateEdits)) delete rateEdits[k];
+    markDirty();
+
+    const meta = el("div", "hint");
+    let nOver = 0;
+    Object.keys(d.overrides || {}).forEach((p) => { nOver += Object.keys(d.overrides[p]).length; });
+    const src = nOver === 0 ? "内置默认（没有任何自定义）"
+      : ("文件 · " + nOver + " 处自定义");
+    meta.textContent = "来源：" + src + (d.path ? "（" + d.path + "）" : "") +
+      (d.updated_at ? "　最近修改：" + String(d.updated_at).replace("T", " ").slice(0, 19) : "") +
+      "　允许范围 [" + d.limits.min_rate + ", " + d.limits.max_rate + "]";
+    box.appendChild(meta);
+
+    const t = el("table", "rates");
+    const head = el("tr");
+    head.appendChild(el("th", null, "平台"));
+    ENDPOINT_DOC.forEach(([k, doc]) => {
+      const th = el("th");
+      th.appendChild(el("div", "mono", k));
+      const h = el("div", "ratehint");
+      h.textContent = doc;
+      th.appendChild(h);
+      head.appendChild(th);
+    });
+    t.appendChild(head);
+
+    PLATFORMS.forEach((p) => {
+      const row = el("tr", p === "default" ? "defrow" : null);
+      const nameCell = el("td");
+      nameCell.appendChild(el("div", null, PLATFORM_CN[p] || p));
+      nameCell.appendChild(el("div", "mono ratehint", p));
+      row.appendChild(nameCell);
+      ENDPOINT_DOC.forEach(([e]) => {
+        const td = el("td");
+        const raw = (d.platforms[p] || {})[e];
+        if (raw && typeof raw === "object") {
+          // 平台能力问题（抖音不支持批量），不是价格：不能编辑
+          td.appendChild(el("span", "pill bad", "不支持"));
+          const why = el("div", "ratehint");
+          why.textContent = raw.reason || "";
+          td.appendChild(why);
+          row.appendChild(td);
+          return;
+        }
+        const inp = el("input", "numin");
+        inp.value = raw === undefined ? "" : String(raw);
+        inp.setAttribute("data-platform", p);
+        inp.setAttribute("data-endpoint", e);
+        inp.setAttribute("aria-label", (PLATFORM_CN[p] || p) + " " + e);
+        inp.addEventListener("input", () => {
+          const cur = (rateSnapshot.platforms[p] || {})[e];
+          const v = inp.value.trim();
+          const same = v === "" ? (cur === undefined)
+            : (Number(v) === Number(cur) && v !== "");
+          if (same) delete rateEdits[rateKey(p, e)];
+          else rateEdits[rateKey(p, e)] = v;
+          inp.classList.toggle("changed", !same);
+          markDirty();
+        });
+        td.appendChild(inp);
+        row.appendChild(td);
+      });
+      t.appendChild(row);
+    });
+    box.appendChild(t);
+
+    // 代理费率：全局单值，永不参与平台系数
+    const prow = el("div", "field");
+    const ctl = el("div", "ctl");
+    const pin = el("input", "numin");
+    pin.setAttribute("id", "proxyRateIn");
+    pin.value = String(d.proxy.rate_per_mib);
+    ctl.appendChild(pin);
+    const saveProxy = el("button", null, "只改代理费率");
+    ctl.appendChild(saveProxy);
+    prow.appendChild(ctl);
+    const pcap = el("div", "cap");
+    pcap.appendChild(el("b", null, "代理费率（配额/MiB）"));
+    pcap.appendChild(document.createTextNode(
+      "：按传输体积计费，所有账号同价，**不乘平台系数**；0 = 代理不扣配额"));
+    prow.appendChild(pcap);
+    box.appendChild(prow);
+    saveProxy.addEventListener("click", () => saveRates({ proxyOnly: true }));
+
+    const btns = el("div", "acct-acts");
+    const save = el("button", "primary", "保存改动");
+    const reset = el("button", "danger", "恢复内置默认");
+    const reload = el("button", null, "重新载入");
+    btns.appendChild(save);
+    btns.appendChild(reset);
+    btns.appendChild(reload);
+    box.appendChild(btns);
+    save.addEventListener("click", () => saveRates({}));
+    reload.addEventListener("click", async () => { await loadQuota(); });
+    reset.addEventListener("click", async () => {
+      if (!confirm("把所有倍率（含代理费率）恢复成内置默认？\n\n" +
+                   "这会丢掉全部自定义格子，且立刻对后续请求生效。")) return;
+      const r = await api("/v1/admin/quota", { method: "DELETE" });
+      show(r);
+      if (r.status === 200 && r.body) {
+        renderRateEditor(r.body);
+        renderQuotaReadOnly(r.body);
+      }
+    });
+
+    if (d.warnings && d.warnings.length) {
+      const w = el("div", "warnbox");
+      w.style.border = "1px solid #4a3a12";
+      w.style.borderRadius = "8px";
+      w.style.padding = "8px";
+      w.style.marginTop = "10px";
+      w.appendChild(el("b", null, "定价提示（不阻止保存）："));
+      d.warnings.forEach((x) => w.appendChild(el("div", null, "· " + x)));
+      box.appendChild(w);
+    }
+
+    if (d.history && d.history.length) {
+      const det = el("details");
+      det.appendChild(el("summary", null, "最近修改（" + d.history.length + " 条）"));
+      const ht = el("table");
+      d.history.slice().reverse().forEach((h) => {
+        const tr2 = el("tr");
+        tr2.appendChild(el("td", "mono", String(h.at).replace("T", " ").slice(0, 19)));
+        tr2.appendChild(el("td", null, h.action === "reset" ? "恢复默认" : "修改"));
+        tr2.appendChild(el("td", null, h.actor || ""));
+        tr2.appendChild(el("td", null, h.detail || ""));
+        ht.appendChild(tr2);
+      });
+      det.appendChild(ht);
+      box.appendChild(det);
+    }
+  }
+
+  // 保存：只提交改动过的格子（未改的不动）；空串表示恢复该格默认
+  async function saveRates(opts) {
+    const proxyOnly = !!(opts && opts.proxyOnly);
+    const rates = {};
+    let n = 0;
+    if (!proxyOnly) {
+      for (const k of Object.keys(rateEdits)) {
+        const [p, e] = k.split("|");
+        const v = rateEdits[k];
+        if (!rates[p]) rates[p] = {};
+        rates[p][e] = v === "" ? null : Number(v);
+        n++;
+      }
+      if (n === 0) {
+        $("#listStatus").textContent = "没有改动需要保存";
+        return;
+      }
+    }
+    const pin = $("#proxyRateIn");
+    const pv = Number(pin.value);
+    const proxyChanged = Number.isFinite(pv) && rateSnapshot &&
+      pv !== Number(rateSnapshot.proxy.rate_per_mib);
+    if (proxyOnly && !proxyChanged) {
+      $("#listStatus").textContent = "代理费率没有变化";
+      return;
+    }
+    const body = {};
+    if (n > 0) body.rates = rates;
+    if (proxyChanged) body.proxy_rate = pv;
+
+    const r = await api("/v1/admin/quota", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    show(r);
+    if (r.status === 200 && r.body) {
+      renderRateEditor(r.body);
+      renderQuotaReadOnly(r.body);
+      $("#listStatus").appendChild(document.createTextNode(
+        "　已生效：后续请求按新系数计费（已发出的响应不重算）"));
+    }
+  }
+
+  // 只读说明（端点含义 / 预授权上限 / 代理 / 公共入口）
+  function renderQuotaReadOnly(d) {
+    const box = $("#quota");
+    box.textContent = "";
     const dl = el("dl", "kv");
     [["unit", "单位"], ["formula", "计算式"], ["note", "说明"]].forEach(([k, label]) => {
       if (d[k] === undefined) return;
@@ -893,14 +1139,10 @@
       });
       box.appendChild(t);
     }
-
     if (d.preauth_max) {
       box.appendChild(el("h3", null, "预授权上限（调用前至少要留这么多配额）"));
       kvInto(box, d.preauth_max, null);
     }
-
-    // 代理是唯一不按"端点 × 平台"计费的出口，单独一段说明。
-    // 不显示它的话，管理员核对用量时只会看到 used 涨了却对不上任何系数。
     if (d.proxy) {
       box.appendChild(el("h3", null, "媒体代理（按体积计费，不乘平台系数）"));
       const pdl = el("dl", "kv");
@@ -917,7 +1159,6 @@
       prow("说明", P.note);
       box.appendChild(pdl);
     }
-
     if (d.public) {
       box.appendChild(el("h3", null, "公共入口"));
       const qdl = el("dl", "kv");
@@ -934,27 +1175,6 @@
       qrow("提供账单", P.ledger_available === false ? "否（共享账号）" : String(P.ledger_available));
       qrow("说明", P.note);
       box.appendChild(qdl);
-    }
-
-    if (d.platforms) {
-      box.appendChild(el("h3", null, "各平台系数（消耗 = 系数 × 条数 × 账号倍率）"));
-      const t = el("table");
-      const tr = el("tr");
-      ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
-      t.appendChild(tr);
-      Object.keys(d.platforms).sort().forEach((p) => {
-        const row = el("tr");
-        row.appendChild(el("td", null, p));
-        ["info", "links", "detail", "batch_links"].forEach((k) => {
-          const v = d.platforms[p][k];
-          const cell = el("td", "mono");
-          if (v && typeof v === "object") cell.textContent = "不支持";
-          else cell.textContent = v === undefined ? "—" : String(v);
-          row.appendChild(cell);
-        });
-        t.appendChild(row);
-      });
-      box.appendChild(t);
     }
   }
 

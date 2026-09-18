@@ -2,6 +2,8 @@ package quota
 
 import (
 	"errors"
+	"math"
+	"strings"
 	"testing"
 
 	"vidlink/internal/core"
@@ -180,5 +182,171 @@ func TestCoefficients(t *testing.T) {
 	// 抖音不支持批量，报价里不应出现
 	if _, ok := r[EndpointBatchLinks]; ok {
 		t.Error("批量不支持抖音，报价里不应包含它")
+	}
+}
+
+// --- 可编辑倍率（覆盖层） ---
+
+// TestOverridesLayerOverDefaults：覆盖层优先，清除后回到内置默认。
+func TestOverridesLayerOverDefaults(t *testing.T) {
+	tb := DefaultTable()
+	v := 3.0
+	tb.SetOverride(EndpointLinks, core.PlatformDouyin, &v)
+	if got, _ := tb.Coefficient(EndpointLinks, core.PlatformDouyin); got != 3 {
+		t.Errorf("覆盖后应为 3，得到 %v", got)
+	}
+	// 通用档被覆盖 → 未单列的平台跟着变
+	d := 2.0
+	tb.SetOverride(EndpointLinks, "", &d)
+	if got, _ := tb.Coefficient(EndpointLinks, core.Platform("weibo")); got != 2 {
+		t.Errorf("未知平台应走通用档覆盖值 2，得到 %v", got)
+	}
+	// 清除覆盖 → 回到内置默认
+	tb.SetOverride(EndpointLinks, core.PlatformDouyin, nil)
+	tb.SetOverride(EndpointLinks, "", nil)
+	if got, _ := tb.Coefficient(EndpointLinks, core.PlatformDouyin); got != 1.1 {
+		t.Errorf("清除后应为内置默认 1.1，得到 %v", got)
+	}
+	if n := len(tb.Overrides()); n != 0 {
+		t.Errorf("覆盖层应为空，得到 %+v", tb.Overrides())
+	}
+	// 出厂默认不受影响（可复现）
+	if len(tb.Defaults()) != len(AllEndpoints) {
+		t.Errorf("出厂默认应覆盖四个端点，得到 %+v", tb.Defaults())
+	}
+}
+
+// TestMaxCoefficientFollowsOverrides：预授权上限必须跟着改价走。
+//
+// 否则降价之后老上限仍然误伤低余额账号，涨价则会漏掉预授权。
+func TestMaxCoefficientFollowsOverrides(t *testing.T) {
+	tb := DefaultTable()
+	if got := tb.MaxCoefficient(EndpointLinks); got != 1.1 {
+		t.Fatalf("默认 links 上限应为 1.1，得到 %v", got)
+	}
+	v := 7.5
+	tb.SetOverride(EndpointLinks, core.PlatformKuaishou, &v)
+	if got := tb.MaxCoefficient(EndpointLinks); got != 7.5 {
+		t.Errorf("覆盖后上限应为 7.5，得到 %v", got)
+	}
+	tb.SetOverride(EndpointLinks, core.PlatformKuaishou, nil)
+	if got := tb.MaxCoefficient(EndpointLinks); got != 1.1 {
+		t.Errorf("清除后上限应回到 1.1，得到 %v", got)
+	}
+}
+
+// TestValidateCell：接口与前端共用的校验口径。
+func TestValidateCell(t *testing.T) {
+	ok := []struct {
+		ep Endpoint
+		p  core.Platform
+		v  float64
+	}{
+		{EndpointLinks, core.PlatformDouyin, 0},
+		{EndpointLinks, core.PlatformDouyin, MaxRate},
+		{EndpointBatchLinks, core.PlatformBilibili, 0.75},
+	}
+	for _, c := range ok {
+		if err := ValidateCell(c.ep, c.p, c.v); err != nil {
+			t.Errorf("%s/%s=%v 应合法：%v", c.p, c.ep, c.v, err)
+		}
+	}
+	bad := []struct {
+		ep Endpoint
+		p  core.Platform
+		v  float64
+	}{
+		{EndpointLinks, core.PlatformDouyin, -0.1},
+		{EndpointLinks, core.PlatformDouyin, MaxRate + 0.1},
+		{EndpointBatchLinks, core.PlatformDouyin, 1}, // 平台能力问题
+		{Endpoint("parse"), core.PlatformDouyin, 1},  // 未知端点
+	}
+	for _, c := range bad {
+		if err := ValidateCell(c.ep, c.p, c.v); err == nil {
+			t.Errorf("%s/%s=%v 应被拒", c.p, c.ep, c.v)
+		}
+	}
+	if err := ValidateCell(EndpointLinks, core.PlatformDouyin, math.NaN()); err == nil {
+		t.Error("NaN 应被拒")
+	}
+}
+
+// TestWarningsDetectBrokenInvariants：不变量只提示不阻止，但必须提示得到。
+func TestWarningsDetectBrokenInvariants(t *testing.T) {
+	tb := DefaultTable()
+	for _, w := range tb.Warnings() {
+		t.Errorf("出厂默认不该有告警：%q", w)
+	}
+	// detail 改成和 links 一样 → 支配问题
+	v := 1.0
+	tb.SetOverride(EndpointDetail, core.PlatformBilibili, &v)
+	if !hasWarning(tb.Warnings(), "支配") {
+		t.Errorf("应提示 links 被支配：%v", tb.Warnings())
+	}
+	// detail 改得比 info+links 还贵 → 打包折扣消失
+	v = 5.0
+	tb.SetOverride(EndpointDetail, core.PlatformBilibili, &v)
+	if !hasWarning(tb.Warnings(), "打包折扣") {
+		t.Errorf("应提示折扣消失：%v", tb.Warnings())
+	}
+	// 某端点设成 0 → 不扣配额提示；设成很大 → 手滑提示
+	v = 0
+	tb.SetOverride(EndpointInfo, core.PlatformBilibili, &v)
+	if !hasWarning(tb.Warnings(), "不扣配额") {
+		t.Errorf("应提示 0 值：%v", tb.Warnings())
+	}
+	v = 50
+	tb.SetOverride(EndpointInfo, core.PlatformBilibili, &v)
+	if !hasWarning(tb.Warnings(), "手滑") {
+		t.Errorf("应提示过大的值：%v", tb.Warnings())
+	}
+}
+
+func hasWarning(ws []string, sub string) bool {
+	for _, w := range ws {
+		if strings.Contains(w, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestProxyRateIsIndependent：代理费率与平台系数完全无关（不许被它们带偏）。
+func TestProxyRateIsIndependent(t *testing.T) {
+	tb := DefaultTable()
+	base := ProxyCost(3<<20, 1) // 3 MiB
+	if base != 1.5 {
+		t.Fatalf("3 MiB 应扣 1.5，得到 %v", base)
+	}
+	for _, e := range AllEndpoints {
+		for _, p := range AllPlatforms {
+			v := 50.0
+			tb.SetOverride(e, p, &v)
+		}
+	}
+	if got := ProxyCost(3<<20, 1); got != base {
+		t.Errorf("改平台系数后代理计费不该变：%v → %v", base, got)
+	}
+	tb.SetProxyRate(2)
+	if got := ProxyCostAt(3<<20, tb.ProxyRate(), 1); got != 6 {
+		t.Errorf("代理费率改成 2 后 3 MiB 应扣 6，得到 %v", got)
+	}
+}
+
+// TestPlatformVocabulary：对外名字与内部键的映射。
+func TestPlatformVocabulary(t *testing.T) {
+	if quota := PlatformName(""); quota != PlatformDefault {
+		t.Errorf("通用档对外名 = %q，想要 %q", quota, PlatformDefault)
+	}
+	if p, ok := NormalizePlatform(PlatformDefault); !ok || p != "" {
+		t.Errorf("default 应映射到内部通用键，得到 %q/%v", p, ok)
+	}
+	for _, name := range []string{"bilibili", "douyin", "kuaishou", "xiaohongshu"} {
+		if _, ok := NormalizePlatform(name); !ok {
+			t.Errorf("%s 应被认识", name)
+		}
+	}
+	if _, ok := NormalizePlatform("weibo"); ok {
+		t.Error("未收录的平台名不该被接受（否则价目表会攒下死行）")
 	}
 }

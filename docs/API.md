@@ -1,18 +1,45 @@
 # vidlink API 文档
 
+> 本文是**唯一的人读接口文档**：所有端点、请求/响应示例、错误码都在这里。
+> 机器可读规格是 [`openapi.yaml`](openapi.yaml)，计费倍率见 [`配额倍率表.md`](配额倍率表.md)。
+> 仓库：<https://github.com/wzmwayne/vidlink>（AGPL-3.0）
+
+## 官方测试实例
+
+| | |
+| --- | --- |
+| 地址 | **<https://vl.wzml.cc.cd>** |
+| 凭据 | 公共 Key `vl_public`（免注册、每 IP 每日配额，见 [§3.8a](#38a-公共-keyvl_public--免注册试用)） |
+| 说明 | 它跑在一台树莓派上，可能限流、随时变动或下线；**正式使用请自部署**（单文件二进制约 7 MB、常驻内存约 8 MB） |
+
+**本文所有路径都是相对路径**，示例统一用 `$BASE` 变量——把它换成本文运行的服务地址即可：
+
+```bash
+# 官方测试实例
+export BASE=https://vl.wzml.cc.cd
+# 或者：自部署（默认监听 :8080）
+export BASE=http://127.0.0.1:8080
+
+export KEY=vl_xxx        # 你的账号 Key（没有就用公共 Key：export KEY=vl_public）
+export ADMIN=vl_admin_xxx # 管理 Key（服务端 VIDLINK_ADMIN_KEY 配的那个）
+```
+
 - **版本**：`v1`（`GET /v1/version` 的 `api_version`）
-- **基地址**：`http://<host>:<port>`（默认 `:8080`）
 - **格式**：请求与响应一律 UTF-8 JSON（`Content-Type: application/json; charset=utf-8`）
 - **计量单位**：**配额**（quota）。配额是管理员分配给账号的**用量额度**，
-  与金额、支付无关。倍率说明见 [`配额倍率表.md`](配额倍率表.md)。
+  与金额、支付无关。倍率说明见 [`配额倍率表.md`](配额倍率表.md)；
+  倍率可以在运行期用管理接口改（[§3.9.5](#395-putdelete-v1adminquota--改计费倍率)），
+  所以**以 `/v1/usage` 返回的实时值为准**。
 - **运行模式**：账户模式（默认）与**免校验模式**（`VL_EASE=true`）。
   后者没有 Key、账号、配额与管理接口，见 [§2.9](#29-免校验模式vl_easetrue)。
+- **页面**：`$BASE/` 图形化解析页，`$BASE/admin` 管理面板（填管理 Key）。
 
 ## 目录
 
 1. [快速开始](#1-快速开始)
 2. [通用约定](#2-通用约定)
 3. [端点详解](#3-端点详解)
+   - 含公共 Key、每日签到、配额流水、管理面（账号 / 统计 / **计费倍率可编辑** / 流水）与媒体代理
 4. [数据模型](#4-数据模型)
 5. [各平台差异](#5-各平台差异)
 6. [典型场景](#6-典型场景)
@@ -27,7 +54,7 @@
 
 ```bash
 curl -H "X-API-Key: $KEY" \
-  "http://127.0.0.1:8080/v1/links?url=https://v.douyin.com/xxxx/"
+  "$BASE/v1/links?url=https://v.douyin.com/xxxx/"
 ```
 
 ```json
@@ -54,10 +81,10 @@ curl -H "X-API-Key: $KEY" \
 
 ```bash
 VL_EASE=true ./vidlink          # 免校验模式
-curl 'http://127.0.0.1:8080/v1/links?url=...'   # 不带任何凭据
+curl '$BASE/v1/links?url=...'   # 不带任何凭据
 ```
 
-用浏览器打开 `http://127.0.0.1:8080/` 会得到一个**图形化解析页**：
+用浏览器打开 `$BASE/` 会得到一个**图形化解析页**：
 填链接、选清晰度、点按钮即可，结果按直链 / 请求头 / 视频轨 / 音频轨 / 字幕 / 图集 /
 原始 JSON 分区渲染，支持批量（5~20 条）与一键复制。页面由服务端内嵌，
 不引用任何外部资源，做的事与 curl 完全一致。
@@ -248,6 +275,9 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 > 内网服务、或你完全控制调用方的场景。
 
 ## 3. 端点详解
+
+> 下面按"公开 → 计量 → 账号 → 管理 → 运维"排列；所有路径都是**相对路径**，
+> 示例统一用 `$BASE`（见文首定义）。
 
 ### 3.1 `GET /v1/version` · 公开
 
@@ -448,7 +478,7 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 ```
 
 ```bash
-curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
+curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 ```
 
 | 情况 | 响应 |
@@ -620,8 +650,8 @@ curl -X POST -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/checkin
 带 `id=`（句柄）或 `key=`（明文 Key）则只读那个账号。
 
 ```bash
-curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?limit=100'
-curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980&type=set'
+curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?limit=100'
+curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980&type=set'
 ```
 
 ```json
@@ -643,9 +673,74 @@ curl -H "X-API-Key: $ADMIN" 'http://127.0.0.1:8080/v1/admin/ledger?id=acc_1f2e3d
 
 #### `GET /v1/admin/quota` · 不消耗配额
 
-配额系数全貌（只读）：计量公式、各端点说明、预授权上限、各平台系数。
-改系数需要改代码并重新部署——系数是**共享参数**，影响所有账号，
-见 [`配额倍率表.md`](配额倍率表.md) 的"怎么改"。
+计费倍率全貌：当前**生效值**、覆盖层（改过的格子）、出厂默认、
+预授权上限、校验范围、定价告警与最近修改历史。
+
+```json
+{
+  "unit": "配额",
+  "formula": "消耗 = 端点系数(端点, 平台) × 条数 × 账号倍率",
+  "endpoints": {"info": "仅元信息…", "links": "仅直链…", "detail": "…", "batch_links": "…"},
+  "platforms": {"bilibili": {"info":0.5,"links":1.0,"detail":1.2,"batch_links":0.75},
+                "douyin":   {"info":0.75,"links":1.1,"detail":1.5,
+                             "batch_links":{"unsupported":true,"reason":"抖音按 IP 维度限流…"}}},
+  "default_platform": {"info":0.5,"links":1.0,"detail":1.2,"batch_links":0.75},
+  "preauth_max": {"info":0.75,"links":1.1,"detail":1.5,"batch_links":0.75},
+  "overrides": {"links": {"douyin": 1.5}},
+  "defaults":  {"links": {"default": 1.0, "douyin": 1.1}},
+  "source": "file", "path": "data/rates.json", "updated_at": "2026-09-18T22:10:00+08:00",
+  "limits": {"min_rate": 0, "max_rate": 100},
+  "warnings": ["detail(1.2) ≤ info+links(1.5)：打包折扣消失"],
+  "history": [{"at": "2026-09-18T22:10:00+08:00", "action": "update", "actor": "admin",
+               "detail": "douyin/links: 1.1 → 1.5"}],
+  "proxy": {"rate": "0.5 配额/MiB", "rate_per_mib": 0.5, "unit_bytes": 1048576,
+            "platform_factor": false, "formula": "…", "note": "…"},
+  "public": {"enabled": true, "key": "vl_public", "daily_per_ip": 25, "...": "..."},
+  "note": "系数只影响后续调用，已发生的用量不重算；单个账号的调整请改该账号的 multiplier"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `platforms` | **当前生效值**（覆盖 → 通用档 → 出厂默认逐层回退后的结果） |
+| `default_platform` | 通用档（未单列的平台走它） |
+| `overrides` / `defaults` | 改过的格子 / 出厂默认值，面板据此标出"哪一格被改过" |
+| `source` | `defaults`（无覆盖）或 `file`（从倍率文件加载） |
+| `preauth_max` | 各端点的预授权上限，**改价后立刻重算** |
+| `warnings` | 定价提示（如"detail 比 links 还便宜"），**只提示不阻止** |
+| `history` | 最近 50 条变更（`action` = `update` / `reset`；`actor` 恒为 `admin`，因为管理面只有一个固定 Key，没有多管理员身份） |
+
+#### `PUT /v1/admin/quota` · 改计费倍率 · 不消耗配额
+
+**逐格合并**：只提交要动的格子，其余保持不变；值为 `null` 表示**清除该格**、
+回到出厂默认。任何一格非法 → 整请求 `400`，不会部分生效。
+
+```bash
+# 抖音 links 改成 1.5；快手的 info 恢复出厂默认；代理费率改成 0.6
+curl -X PUT -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"rates":{"douyin":{"links":1.5},"kuaishou":{"info":null}},"proxy_rate":0.6}' \
+  "$BASE/v1/admin/quota"
+```
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `rates` | 否 | `平台 → 端点 → 倍率\|null`。平台取值：`bilibili` / `douyin` / `kuaishou` / `xiaohongshu` / `default`（通用档）；端点：`info` / `links` / `detail` / `batch_links` |
+| `proxy_rate` | 否 | 代理费率（配额/MiB，`0` 表示代理不扣配额，所有账号同价、**不乘平台系数**） |
+
+- 范围 `0 ~ 100`（`max_rate` 是防手滑，不是运营判断）；
+- **抖音 × `batch_links` 不能设**（平台能力问题，不是价格）→ `400`；
+- 两项都省缺 → `400`（没有要改的东西）；
+- 成功 `200`，响应与 `GET` 同形（面板一次往返即可重渲染）；
+- 改动**只影响后续请求**：已经预授权的请求按旧价结算；
+- 落盘失败（磁盘满/只读）→ `500`，内存已回滚；倍率文件损坏会**拒绝启动**
+  （宁可起不来，也不带着半个价目表跑）；
+- 存储：`data/rates.json`（`VIDLINK_RATES_PATH`，原子写、权限 600），只存
+  "改过的格子"，出厂默认仍在代码里，所以重置只是丢掉覆盖层。
+
+#### `DELETE /v1/admin/quota` · 恢复出厂默认 · 不消耗配额
+
+清空全部覆盖（含代理费率），返回与 `GET` 同形的结果。管理面板上的
+「恢复内置默认」按钮就是它。想只改一个值请用上面的 `PUT`。
 
 ### 3.10 运维端点
 
@@ -720,7 +815,9 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
 - `HEAD` 不产生响应体，**不计费**；
 - 提前中断**不退**（按声明长度计费是"这次占用了多少出口带宽"的度量）；
 - 计费精度 0.0001 配额（约 105 字节）；
-- **所有账号同一费率**（0.5 配额/MiB，可用 `VIDLINK_PROXY_RATE` 调整）；
+- **所有账号同一费率**（默认 0.5 配额/MiB，可用 `PUT /v1/admin/quota` 的
+  `proxy_rate` 或首次部署时的 `VIDLINK_PROXY_RATE` 调整）；
+  **永不参与平台系数**——把平台系数改到天上也不会影响代理计费；
   1 GB ≈ 512 配额，70 MB 的视频 ≈ 35 配额；
 - `GET /v1/usage` 的 `proxy` 字段与 `GET /v1/admin/quota` 的 `proxy` 字段都会给出这条口径；
 - 倍率为 `0` 的账号（免费账号）依然是 0 配额，但调用次数照常累计。
@@ -838,7 +935,7 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
 ```bash
 KEY=vl_xxx
 j=$(curl -s -H "X-API-Key: $KEY" \
-  "http://127.0.0.1:8080/v1/links?url=https://www.bilibili.com/video/BV1xx411c7mD&quality=1080")
+  "$BASE/v1/links?url=https://www.bilibili.com/video/BV1xx411c7mD&quality=1080")
 
 v=$(echo "$j" | python3 -c 'import sys,json;print(json.load(sys.stdin)["url"])')
 a=$(echo "$j" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("audio_url",""))')
@@ -851,7 +948,7 @@ ffmpeg -i v.m4s -i a.m4s -c copy out.mp4
 ### 6.2 挑一条"树莓派能播"的流
 
 ```bash
-curl -s -H "X-API-Key: $KEY" "http://127.0.0.1:8080/v1/detail?url=$URL" |
+curl -s -H "X-API-Key: $KEY" "$BASE/v1/detail?url=$URL" |
 python3 -c '
 import sys, json
 d = json.load(sys.stdin)
@@ -868,7 +965,7 @@ curl -s -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"urls":["https://v.douyin.com/a/","https://www.bilibili.com/video/BV1xx",
                "https://v.kuaishou.com/b/","https://www.xiaohongshu.com/explore/c",
                "https://b23.tv/d/"],"quality":"720"}' \
-  http://127.0.0.1:8080/v1/batch/links |
+  $BASE/v1/batch/links |
 python3 -c '
 import sys, json
 r = json.load(sys.stdin)
@@ -882,11 +979,11 @@ for it in r["results"]:
 
 ```bash
 curl -s -D- -o /dev/null -H "X-API-Key: $KEY" \
-  "http://127.0.0.1:8080/v1/links?url=$URL" | grep -i x-quota
+  "$BASE/v1/links?url=$URL" | grep -i x-quota
 # X-Quota-Consumed: 1
 # X-Quota-Remaining: 99
 
-curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/usage
+curl -s -H "X-API-Key: $KEY" $BASE/v1/usage
 ```
 
 ### 6.5 管理：补配额、给活动账号减半
@@ -894,11 +991,11 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/usage
 ```bash
 # 补 100 配额
 curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
-  -d '{"add_quota":100}' http://127.0.0.1:8080/v1/admin/accounts/vl_xxx
+  -d '{"add_quota":100}' $BASE/v1/admin/accounts/vl_xxx
 
 # 该账号按 0.5 倍消耗（活动 / 内部）
 curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
-  -d '{"multiplier":0.5}' http://127.0.0.1:8080/v1/admin/accounts/vl_xxx
+  -d '{"multiplier":0.5}' $BASE/v1/admin/accounts/vl_xxx
 ```
 
 ---
@@ -957,7 +1054,9 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | PATCH | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
 | DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
 | GET | `/v1/admin/stats` | 管理 Key | — |
-| GET | `/v1/admin/quota` | 管理 Key | — |
+| GET | `/v1/admin/quota` | 管理 Key | —（计费倍率全貌） |
+| PUT | `/v1/admin/quota` | 管理 Key | —（改倍率：逐格合并，null 恢复默认） |
+| DELETE | `/v1/admin/quota` | 管理 Key | —（恢复出厂默认） |
 | GET | `/v1/admin/ledger` | 管理 Key | —（总账单 / 指定账号） |
 
 其他文档：

@@ -277,8 +277,10 @@ func (s *Server) writeQuotaError(w http.ResponseWriter, err error) {
 	case errors.As(err, &pub):
 		writeErrorStatus(w, http.StatusTooManyRequests, "public_quota_exhausted",
 			fmt.Sprintf("今日免费额度已用完（每 IP 每日 %.4g）：本次需要 %.2f，剩余 %.2f；"+
-				"额度过期后自动重置。需要更多配额请向管理员申请独立 Key。",
-				s.publicQ.Limit(), pub.Need, pub.Have))
+				"额度过期后自动重置。需要更多配额请向管理员申请独立 Key。"+
+				"另外：与其换 IP 刷额度，不如自己部署一个——单个静态二进制约 7 MB、"+
+				"常驻内存约 8 MB，树莓派/旧手机都能跑，见 %s",
+				s.publicQ.Limit(), pub.Need, pub.Have, repoURL))
 	case errors.As(err, &insuf):
 		writeErrorStatus(w, http.StatusTooManyRequests, "quota_exhausted",
 			fmt.Sprintf("配额已用尽：本次最多需要 %.2f，当前剩余 %.2f；"+
@@ -637,6 +639,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			"multiplier": acct.Multiplier,
 			"daily":      snap,
 			"rates":      s.allRates(),
+			"rates_note": ratesNote,
 			"proxy": map[string]any{
 				"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRate()),
 				"rate_per_mib":    s.proxyRate(),
@@ -665,6 +668,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		"calls":      acct.Calls,
 		"multiplier": acct.Multiplier,
 		"rates":      s.allRates(),
+		"rates_note": ratesNote,
 		// 代理按体积计费，与上面的平台系数表不同源，单独给一条
 		"proxy": map[string]any{
 			"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRate()),
@@ -705,6 +709,16 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 // 这样将来改名（配额→积分→品牌名）只改这一个常量，
 // 不需要动 API 契约，也不要求所有客户改代码。
 const unitName = "配额"
+
+// repoURL 是项目仓库；文案里用它指向"自己部署"的说明。
+const repoURL = "https://github.com/wzmwayne/vidlink"
+
+// ratesNote 说明系数是**当前部署**的实时值。
+//
+// 用户文档里印的是仓库默认值，而部署者可以随时改价——不写这句话，
+// 用户会拿文档里的数字来对账，然后以为被多扣了。
+const ratesNote = "系数由部署者配置，这里是当前部署的生效值；" +
+	"仓库里的默认值可能与之不同。管理接口见 " + repoURL + "/blob/master/docs/API.md"
 
 // allRates 返回四个平台各端点的完整系数。
 func (s *Server) allRates() map[string]any {

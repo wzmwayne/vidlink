@@ -102,6 +102,16 @@
   .tipbox img { width: 240px; max-width: 60vw; border-radius: 10px; border: 1px solid var(--line); }
   .tipbox .grow { flex: 1 1 240px; }
   .pubnote { border-color: #1d3d24; background: #16211a; color: #86d99a; }
+  /* 头部开源提示：常驻、不折叠——它承担"这是什么、别乱刷、去哪看文档"三件事 */
+  .noticebox {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 14px; font-size: 13px;
+  }
+  .noticebox .row1 { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .noticebox a { color: var(--accent); text-decoration: none; }
+  .noticebox a:hover { text-decoration: underline; }
+  .noticebox .hint { margin-top: 6px; }
+  .noticebox code { font-family: var(--mono); }
   footer code { font-family: var(--mono); }
   @media (max-width: 560px) { .kv { grid-template-columns: 84px 1fr; } }
 </style>
@@ -118,6 +128,27 @@
 </header>
 
 <main>
+  <!-- 开源提示：谁来都要先看到"这是什么、文档在哪、别拿换 IP 当本事" -->
+  <div class="noticebox" id="ossNote">
+    <div class="row1">
+      <b>vidlink</b>
+      <span class="pill">开源 · AGPL-3.0</span>
+      <a href="https://github.com/wzmwayne/vidlink" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
+      <a href="https://github.com/wzmwayne/vidlink/blob/master/docs/API.md" target="_blank" rel="noopener noreferrer">接口文档</a>
+      <a href="https://github.com/wzmwayne/vidlink/blob/master/docs/openapi.yaml" target="_blank" rel="noopener noreferrer">OpenAPI 规格</a>
+    </div>
+    <div class="hint">
+      官方测试实例 <code>https://vl.wzml.cc.cd</code>（公共 Key <code>vl_public</code> 可直接试；
+      它跑在一台树莓派上，可能限流或随时变动，正式使用请自部署）。
+    </div>
+    <div class="hint">
+      <b>别用换 IP 的方式刷额度</b>：公共 Key 是「每 IP 每日配额」，刷出来的量远不如自己部署——
+      整个服务就是一个约 7 MB 的静态二进制、常驻内存约 8 MB，树莓派 / 旧手机 / 路由器都能跑，
+      仓库里有部署说明。有这个时间，不如把本项目集成进你自己的 Go 程序。
+    </div>
+    <div class="hint" id="ratesNote"></div>
+  </div>
+
   <div class="warnbox hidden" id="easeNote"
        style="border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:14px">
     免校验模式：本页直接调用解析接口，<b>不需要 API Key</b>，也<b>不计量配额</b>
@@ -327,8 +358,9 @@
   </details>
 
   <footer>
-    接口文档 <code>docs/API.md</code> · 服务端 <code>vidlink</code> ·
-    本页由服务端内嵌，无任何外部资源
+    <a href="https://github.com/wzmwayne/vidlink" target="_blank" rel="noopener noreferrer">vidlink</a> ·
+    <a href="https://github.com/wzmwayne/vidlink/blob/master/docs/API.md" target="_blank" rel="noopener noreferrer">接口文档</a> ·
+    本页由服务端内嵌：**页面不加载任何外部资源**（上面的链接是可点击外链，点开才离开本站）
   </footer>
 </main>
 
@@ -1003,7 +1035,8 @@
         box.appendChild(dl2);
       }
       if (d.rates) {
-        box.appendChild(el("h2", null, "各端点系数（消耗 = 系数 × 条数 × 你的倍率）"));
+        if (d.rates_note) $("#ratesNote").textContent = d.rates_note;
+        box.appendChild(el("h2", null, "各端点系数（消耗 = 系数 × 条数 × 你的倍率，实时值）"));
         const t = el("table");
         const tr = el("tr");
         ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
