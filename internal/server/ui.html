@@ -344,9 +344,11 @@
   };
   let proxyEnabled = false;
   let webuiMode = "account";     // 由 /v1/health 告知
-  // 账号倍率：代理按体积计费时要乘它（1 配额/MiB × 倍率）。
+  // 账号倍率与代理费率：代理按体积计费（体积 MiB × 费率 × 倍率）。
+  // 费率来自 /v1/usage（后端唯一口径），前端不写死数字。
   // 免校验模式下保持 null —— 那时没有账户，任何"预计消耗"都是假的。
   let myMultiplier = null;
+  let myProxyRate = null;        // 配额/MiB，由 /v1/usage 的 proxy.rate_per_mib 告知
   const KEY_STORE = "vidlink_key";
   let APIKEY = "";               // 账户模式下的 Key；免校验模式恒为空
   let PUBLIC = null;             // /v1/health 告知的公共 Key（没有公共入口时为 null）
@@ -515,8 +517,8 @@
   const MIB = 1024 * 1024;
 
   function proxyCost(size) {
-    if (myMultiplier === null || !size) return null;
-    return Math.round((size / MIB) * myMultiplier * 10000) / 10000;
+    if (myMultiplier === null || myProxyRate === null || !size) return null;
+    return Math.round((size / MIB) * myProxyRate * myMultiplier * 10000) / 10000;
   }
 
   function fmtUnits(v) {
@@ -528,7 +530,7 @@
     const c = proxyCost(size);
     if (c === null) return "经服务端代理下载（自动补 Referer/UA）";
     return "经服务端代理下载（自动补 Referer/UA）；按体积计费：" +
-      fmtUnits(size / MIB) + " MiB × 1 配额/MiB × 账号倍率 " + myMultiplier +
+      fmtUnits(size / MIB) + " MiB × " + myProxyRate + " 配额/MiB × 账号倍率 " + myMultiplier +
       " ≈ " + fmtUnits(c) + " 配额";
   }
 
@@ -946,6 +948,8 @@
       add("累计调用", d.calls + " 次");
       add("账号倍率", d.multiplier);
       if (typeof d.multiplier === "number") myMultiplier = d.multiplier;
+      // 代理费率由后端给出（唯一口径）；拿不到就别显示预估，不猜数字
+      myProxyRate = (d.proxy && typeof d.proxy.rate_per_mib === "number") ? d.proxy.rate_per_mib : 1;
 
       add("单位", d.unit);
       box.appendChild(dl);
@@ -1022,14 +1026,15 @@
         rp.appendChild(el("td", null, "媒体代理"));
         const pc = el("td", "mono");
         pc.colSpan = 4;
-        const pr = (d.proxy && d.proxy.rate) || "1 配额/MiB";
+        const pr = (d.proxy && d.proxy.rate) || "0.5 配额/MiB";
         pc.textContent = pr + " × 账号倍率 " + (d.multiplier === undefined ? "" : d.multiplier) +
           "（按传输体积，不乘平台系数）";
         rp.appendChild(pc);
         t.appendChild(rp);
         box.appendChild(t);
         const pnote = el("div", "hint");
-        pnote.textContent = "媒体代理按体积计费：实扣 = 传输体积(MiB) × 1 × 你的账号倍率；" +
+        pnote.textContent = "媒体代理按体积计费：实扣 = 传输体积(MiB) × " +
+          ((d.proxy && d.proxy.rate_per_mib) || 0.5) + " × 你的账号倍率（所有账号同一费率）；" +
           "上游给了长度就先扣后传（不够直接 429），长度未知时按实际传输量扣。" +
           "直连下载不消耗配额——能直连就别走代理。";
         box.appendChild(pnote);
@@ -1152,7 +1157,8 @@
         $("#easeNote").classList.remove("hidden");
       } else {
         $("#muxCostNote").textContent = "注意：本模式下取完整信息按端点系数扣配额；" +
-          "代理下载按**体积**扣（1 配额/MiB × 你的账号倍率），直连下载不消耗配额。";
+          "代理下载按**体积**扣（" + (myProxyRate === null ? "0.5" : myProxyRate) +
+          " 配额/MiB × 你的账号倍率，所有账号同一费率），直连下载不消耗配额。";
         $("#authsec").classList.remove("hidden");
         $("#usagesec").classList.remove("hidden");
         $("#ledgersec").classList.remove("hidden");
@@ -1731,10 +1737,12 @@
     const a = ((tracks || {}).audios || [])[Number($("#muxAq").value) || 0];
     if (v && a && v.size && a.size) {
       const mib = (v.size + a.size) / (1024 * 1024);
-      box.textContent = "代理按体积计费：1 配额/MiB × 账号倍率 " + m + "；本次两轨约 " +
+      box.textContent = "代理按体积计费：" + (myProxyRate === null ? 0.5 : myProxyRate) +
+        " 配额/MiB × 账号倍率 " + m + "；本次两轨约 " +
         fmtUnits(mib) + " MiB ≈ " + fmtUnits(proxyCost(v.size + a.size)) + " 配额（实际以响应头为准）。";
     } else {
-      box.textContent = "代理按体积计费：1 配额/MiB × 账号倍率 " + m +
+      box.textContent = "代理按体积计费：" + (myProxyRate === null ? 0.5 : myProxyRate) +
+        " 配额/MiB × 账号倍率 " + m +
         "；上游没给体积，实际消耗以响应头 X-Quota-Consumed 为准。";
     }
   }

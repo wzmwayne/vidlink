@@ -79,12 +79,11 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 		// 代理是唯一不按"端点 × 平台"计费的配额出口，必须单独说明，
 		// 否则管理员核对用量时会以为它漏记了。
 		"proxy": map[string]any{
-			"rate":            "1 配额/MiB",
-			"rate_per_mib":    1,
-			"public_rate":     s.publicProxyRate(),
+			"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRate()),
+			"rate_per_mib":    s.proxyRate(),
 			"unit_bytes":      quota.ProxyUnitBytes,
 			"platform_factor": false,
-			"formula":         "实扣 = 传输体积(MiB) × 费率 × 账号倍率（标准 1，公共 Key 见 public_rate）",
+			"formula":         "实扣 = 传输体积(MiB) × 费率 × 账号倍率（费率对所有账号相同）",
 			"note": "媒体代理按传输体积计费，不乘平台系数（它与上游解析成本无关）。" +
 				"上游声明了长度时先扣后传，长度未知时传完按实际字节扣；" +
 				"提前中断不退。",
@@ -94,7 +93,6 @@ func (s *Server) handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 			"enabled":          s.cfg.PublicKey != "",
 			"key":              s.cfg.PublicKey,
 			"daily_per_ip":     s.publicQ.Limit(),
-			"proxy_rate":       s.publicProxyRate(),
 			"accounting":       "不使用账本余额；用量与调用次数仍累计到公共账号上",
 			"ledger_available": false,
 			"note": "公共 Key 是共享的，额度按「每 IP 每日」计算，过期自动重置；" +

@@ -638,12 +638,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			"daily":      snap,
 			"rates":      s.allRates(),
 			"proxy": map[string]any{
-				"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRateFor(acct)),
-				"rate_per_mib":    s.proxyRateFor(acct),
+				"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRate()),
+				"rate_per_mib":    s.proxyRate(),
 				"unit_bytes":      quota.ProxyUnitBytes,
 				"platform_factor": false,
 				"note": fmt.Sprintf("媒体代理按传输体积计费：实扣 = 体积(MiB) × %.4g × 账号倍率"+
-					"（公共 Key 的代理费率低于标准费率）", s.proxyRateFor(acct)),
+					"（所有账号同一费率）", s.proxyRate()),
 			},
 			"limits": map[string]any{
 				"per_key_concurrency": s.gate.Options().PerKey,
@@ -667,11 +667,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		"rates":      s.allRates(),
 		// 代理按体积计费，与上面的平台系数表不同源，单独给一条
 		"proxy": map[string]any{
-			"rate":            "1 配额/MiB",
-			"rate_per_mib":    1,
+			"rate":            fmt.Sprintf("%.4g 配额/MiB", s.proxyRate()),
+			"rate_per_mib":    s.proxyRate(),
 			"unit_bytes":      quota.ProxyUnitBytes,
 			"platform_factor": false,
-			"note":            "媒体代理按传输体积计费：实扣 = 体积(MiB) × 1 × 你的账号倍率",
+			"note": fmt.Sprintf("媒体代理按传输体积计费：实扣 = 体积(MiB) × %.4g × 你的账号倍率"+
+				"（所有账号同一费率）", s.proxyRate()),
 		},
 		"limits": map[string]any{
 			"per_key_concurrency": s.gate.Options().PerKey,

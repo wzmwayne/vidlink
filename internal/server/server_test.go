@@ -96,7 +96,7 @@ func newTestEnv(t *testing.T, mutate func(*config.Config), exts ...core.Extracto
 		AdminKey:          "vl_admin_test", // 管理凭据是配置项，不是账本里的账号
 		PublicKey:         "vl_public",     // 公共入口：Key 公开、按 IP 每日限额
 		PublicDailyQuota:  25,
-		PublicProxyRate:   quota.PublicProxyRate,
+		ProxyRate:         quota.ProxyRate,
 		RateLimitRPM:      0, // 默认不限流；测限流的用例自己打开
 		CORSOrigins:       []string{"*"},
 		Service:           service.DefaultOptions(),
@@ -1753,7 +1753,8 @@ func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
 		// 代理通道：必须把 Key 拼进 URL，否则账户模式下 /v1/proxy 直接 403
 		`withKey("/v1/proxy?url="`,
 		// 代理按体积计费：预估展示 + 读响应头拿实际值（前端不编数字）
-		`id="muxCost"`, `proxyCost`, `X-Quota-Consumed`, `1 配额/MiB`,
+		`id="muxCost"`, `proxyCost`, `X-Quota-Consumed`, `配额/MiB`,
+		`rate_per_mib`, // 费率来自接口，前端不写死
 		// 直连失败时的提示要指向那个复选框，而不是自动改走代理
 		`使用服务端代理下载`,
 	} {
@@ -1885,7 +1886,7 @@ func TestUIScriptsParse(t *testing.T) {
 
 // --- 媒体代理的按体积配额 ---
 
-// TestProxyChargesBySize：代理按传输体积扣配额（1 配额/MiB × 账号倍率）。
+// TestProxyChargesBySize：代理按传输体积扣配额（统一费率 0.5 配额/MiB × 账号倍率）。
 //
 // 这是代理与其它端点的根本区别：解析端点按"端点 × 平台"定价，
 // 而代理搬的是任意 CDN 的字节，成本只与体积线性相关。
@@ -1905,35 +1906,35 @@ func TestProxyChargesBySize(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("代理应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
-	if got := w.Header().Get("X-Quota-Consumed"); got != "3" {
-		t.Errorf("X-Quota-Consumed = %q，想要 3", got)
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1.5" {
+		t.Errorf("X-Quota-Consumed = %q，想要 1.5（3 MiB × 0.5）", got)
 	}
-	if got := w.Header().Get("X-Quota-Remaining"); got != "97" {
-		t.Errorf("X-Quota-Remaining = %q，想要 97", got)
+	if got := w.Header().Get("X-Quota-Remaining"); got != "98.5" {
+		t.Errorf("X-Quota-Remaining = %q，想要 98.5", got)
 	}
-	if got, _ := env.store.Get(env.userKey); got.Quota != 97 || got.Used != 3 || got.Calls != 1 {
-		t.Errorf("账本 = quota %v / used %v / calls %v，想要 97 / 3 / 1", got.Quota, got.Used, got.Calls)
+	if got, _ := env.store.Get(env.userKey); got.Quota != 98.5 || got.Used != 1.5 || got.Calls != 1 {
+		t.Errorf("账本 = quota %v / used %v / calls %v，想要 98.5 / 1.5 / 1", got.Quota, got.Used, got.Calls)
 	}
 
-	// ② 倍率 0.5：同样的 3 MiB → 1.5 配额（账号倍率生效）
+	// ② 倍率 0.5：同样的 3 MiB → 0.75 配额（账号倍率生效）
 	half := 0.5
 	if _, err := env.store.Update(env.userKey, account.Patch{Multiplier: &half}); err != nil {
 		t.Fatal(err)
 	}
 	w = do(h, http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL), userHdr(env.userKey))
-	if got := w.Header().Get("X-Quota-Consumed"); got != "1.5" {
-		t.Errorf("半倍率下 X-Quota-Consumed = %q，想要 1.5", got)
+	if got := w.Header().Get("X-Quota-Consumed"); got != "0.75" {
+		t.Errorf("半倍率下 X-Quota-Consumed = %q，想要 0.75", got)
 	}
-	if got, _ := env.store.Get(env.userKey); got.Quota != 95.5 {
-		t.Errorf("配额 = %v，想要 95.5", got.Quota)
+	if got, _ := env.store.Get(env.userKey); got.Quota != 97.75 {
+		t.Errorf("配额 = %v，想要 97.75", got.Quota)
 	}
 
 	// ③ 平台系数不参与：换一个"平台"（这里用抖音的解析端点系数 1.1）
 	//    作对照，代理的计价必须与它无关 —— 3 MiB 仍是 1.5（倍率 0.5）。
-	if got := quota.ProxyCost(size, 0.5); got != 1.5 {
-		t.Errorf("quota.ProxyCost(3MiB, 0.5) = %v，想要 1.5", got)
+	if got := quota.ProxyCost(size, 0.5); got != 0.75 {
+		t.Errorf("quota.ProxyCost(3MiB, 0.5) = %v，想要 0.75", got)
 	}
-	if got := quota.ProxyCost(size, 1.1); got != 3.3 {
+	if got := quota.ProxyCost(size, 1.1); got != 1.65 {
 		t.Errorf("quota.ProxyCost 只该乘账号倍率：%v", got)
 	}
 }
@@ -1965,9 +1966,9 @@ func TestProxyRangeChargesOnlyTheRange(t *testing.T) {
 	if w.Code != http.StatusPartialContent {
 		t.Fatalf("应透传 206，得到 %d", w.Code)
 	}
-	// 1024 字节 ≈ 0.00098 MiB → round4 到 0.001（计费精度到万分之一配额）
-	if got := w.Header().Get("X-Quota-Consumed"); got != "0.001" {
-		t.Errorf("X-Quota-Consumed = %q，想要 0.001（按 1KB 而不是 64MB）", got)
+	// 1024 字节 ≈ 0.00098 MiB × 0.5 → round4 到 0.0005（精度到万分之一配额）
+	if got := w.Header().Get("X-Quota-Consumed"); got != "0.0005" {
+		t.Errorf("X-Quota-Consumed = %q，想要 0.0005（按 1KB 而不是 64MB）", got)
 	}
 	if got, _ := env.store.Get(env.userKey); got.Quota < 99.99 {
 		t.Errorf("配额 = %v，不该按整部片子扣", got.Quota)
@@ -2046,8 +2047,8 @@ func TestProxyUnknownLengthChargesActual(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("应 200，得到 %d", w.Code)
 	}
-	if got, _ := env.store.Get(env.userKey); got.Used != 2 {
-		t.Errorf("未知长度时按实际字节扣：used=%v，想要 2", got.Used)
+	if got, _ := env.store.Get(env.userKey); got.Used != 1 {
+		t.Errorf("未知长度时按实际字节扣：used=%v，想要 1（2 MiB × 0.5）", got.Used)
 	}
 }
 
@@ -2254,7 +2255,7 @@ func TestLedgerUIWiring(t *testing.T) {
 		`id="ledgersec"`, `id="ledgerType"`, `id="ledgerRefresh"`, `loadLedger`,
 		`"/v1/ledger" + qs`,
 		// 各端点系数表里必须有代理那一行（口径与平台系数不同）
-		`媒体代理`, `1 配额/MiB`,
+		`媒体代理`, `配额/MiB`,
 	} {
 		if !strings.Contains(ui, want) {
 			t.Errorf("解析页缺少 %q", want)
@@ -2415,22 +2416,22 @@ func TestPublicKeyCanUseProxyFromDailyQuota(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("公共 Key 代理应 200，得到 %d（%s）", w.Code, w.Body.String())
 	}
-	// 公共 Key 的代理费率更低：2 MiB × 0.2 = 0.4
-	if got := w.Header().Get("X-Quota-Consumed"); got != "0.4" {
-		t.Errorf("X-Quota-Consumed = %q，想要 0.4（公共费率 0.2/MiB）", got)
+	// 统一费率：2 MiB × 0.5 = 1 配额
+	if got := w.Header().Get("X-Quota-Consumed"); got != "1" {
+		t.Errorf("X-Quota-Consumed = %q，想要 1（2 MiB × 0.5）", got)
 	}
-	if got := w.Header().Get("X-Quota-Remaining"); got != "24.6" {
-		t.Errorf("X-Quota-Remaining = %q，想要 24.6", got)
+	if got := w.Header().Get("X-Quota-Remaining"); got != "24" {
+		t.Errorf("X-Quota-Remaining = %q，想要 24", got)
 	}
-	if pub, _ := env.store.Get(env.srv.cfg.PublicKey); pub.Used != 0.4 {
-		t.Errorf("公共账号用量应累计为 0.4，得到 %v", pub.Used)
+	if pub, _ := env.store.Get(env.srv.cfg.PublicKey); pub.Used != 1 {
+		t.Errorf("公共账号用量应累计为 1，得到 %v", pub.Used)
 	}
-	// 普通账号同一份流量按标准费率 1/MiB 扣
+	// **所有账号同一费率**：普通账号同一份流量扣得一样多
 	other := newTestEnv(t, func(c *config.Config) { c.ProxySrv.Enabled = true }, defaultStub())
 	wo := do(other.handler(), http.MethodGet, "/v1/proxy?url="+url.QueryEscape(upstream.URL),
 		userHdr(other.userKey))
-	if got := wo.Header().Get("X-Quota-Consumed"); got != "2" {
-		t.Errorf("普通账号 X-Quota-Consumed = %q，想要 2（标准费率）", got)
+	if got := wo.Header().Get("X-Quota-Consumed"); got != "1" {
+		t.Errorf("普通账号 X-Quota-Consumed = %q，想要 1（与公共 Key 同价）", got)
 	}
 }
 

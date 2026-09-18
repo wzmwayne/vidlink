@@ -233,7 +233,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 | **只有直链** |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
 | POST | `/v1/batch/links` | Key | 0.75/条 | 批量直链，5~20 条，**无抖音** |
-| GET | `/v1/proxy?url=` | Key | **1/MiB × 账号倍率** | 流式媒体代理（ease 模式默认开启，账户模式默认关闭） |
+| GET | `/v1/proxy?url=` | Key | **0.5/MiB × 账号倍率** | 流式媒体代理（ease 模式默认开启，账户模式默认关闭） |
 | GET | `/admin` | 公开（页面壳） | — | **管理面板**：填管理 Key 后管理账号（`VL_WEBUI` 开启且非 ease 模式） |
 | GET/POST | `/v1/admin/accounts` | 管理 Key | — | 账号列表 / 创建账号（免校验模式下不存在） |
 | GET/PATCH/DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — | 查 / 改 / 删账号（可用明文 Key 或账号句柄 `acc_…`） |
@@ -257,8 +257,12 @@ X-Request-Id: 91c0651a168bd9acaf6f85b2225d0c9f
 ```
 
 - **只在实际成功时扣**：上游超时、内容不存在、限流、参数错误都不扣；批量只按成功条数扣；
-- **媒体代理例外**：它按**传输体积**计费——`实扣 = 体积(MiB) × 1 × 账号倍率`，
-  **不乘平台系数**（代理搬的是任意 CDN 的字节，与"哪家平台解析更贵"无关）。
+- **媒体代理例外**：它按**传输体积**计费——`实扣 = 体积(MiB) × 0.5 × 账号倍率`，
+  **不乘平台系数**（代理搬的是任意 CDN 的字节，与"哪家平台解析更贵"无关），
+  **所有账号同一费率**（分档定价只会让"这次要花多少"变成查表的题）。
+  0.5 这个数的依据：1 GB ≈ 512 配额、70 MB 视频 ≈ 35 配额；
+  代理的真实成本是服务端出口带宽（家里上行 + 隧道），而解析一次只花上游几十 KB，
+  1/MiB 会让"下一条片子"贵过"解析一百次"。
   上游给了 `Content-Length` 就先扣后传（不够直接 `429`，一个字节都不发）；
   长度未知（chunked）才边传边限、传完按实际字节扣。提前中断不退。
   计费精度到万分之一配额（约 105 字节）；
@@ -368,7 +372,7 @@ curl -H "X-API-Key: vl_public" \
 
 | 行为 | 说明 |
 | --- | --- |
-| 额度口径 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），端点系数与其他账号相同（info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条）；**代理按 0.2 配额/MiB**（`VIDLINK_PUBLIC_PROXY_RATE`，标准费率是 1）→ 每天约 25 条直链，或约 125 MiB 代理流量 |
+| 额度口径 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`），端点系数与其他账号相同（info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条）；代理同样是统一费率 **0.5 配额/MiB** → 每天约 25 条直链，或约 50 MiB 代理流量 |
 | 用完了 | `429 public_quota_exhausted`，提示去申请独立 Key；额度跨天自动重置（本地时区零点） |
 | 没带 Key | `403` 的 message 里**直接给出公共 Key**，而不是一句"缺少 API Key" |
 | 账单 | 公共 Key **读不了** `/v1/ledger`（共享账号，流水混有所有访客），`/v1/usage` 返回的是"本 IP 今天"的额度 |
@@ -532,7 +536,7 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
 | `VIDLINK_PUBLIC_KEY` | `vl_public` | 公共账号的 Key（公开、免注册试用）；**留空 = 不提供公共入口** |
 | `VIDLINK_PUBLIC_DAILY_QUOTA` | `25` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
-| `VIDLINK_PUBLIC_PROXY_RATE` | `0.2` | 公共 Key 的代理费率（配额/MiB）；标准账号固定 1 |
+| `VIDLINK_PROXY_RATE` | `0.5` | 媒体代理费率（配额/MiB），**所有账号同价**；调大抑制代理用量，调小鼓励使用 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
 | `VIDLINK_RATE_LIMIT_RPM` | `120` | 每 IP 每分钟请求上限；`0` = 不限 |
 | `VIDLINK_PER_KEY_CONCURRENCY` | `1` | 同一个 Key 的同时请求数 |

@@ -618,14 +618,6 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// publicProxyRate 返回公共 Key 的代理费率（配额/MiB），带配置回退。
-func (s *Server) publicProxyRate() float64 {
-	if r := s.cfg.PublicProxyRate; r > 0 {
-		return r
-	}
-	return quota.PublicProxyRate
-}
-
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"status":      "ok",
@@ -645,7 +637,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		body["public"] = map[string]any{
 			"key":          s.cfg.PublicKey,
 			"daily_per_ip": s.publicQ.Limit(),
-			"proxy_rate":   s.publicProxyRate(),
 			"ledger":       false,
 		}
 	}

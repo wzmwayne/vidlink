@@ -421,7 +421,7 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 
 | 项 | 行为 |
 | --- | --- |
-| 额度 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`）；端点系数与普通账号相同，**代理费率更低：0.2 配额/MiB**（`VIDLINK_PUBLIC_PROXY_RATE`） |
+| 额度 | **每 IP 每日 25 配额**（`VIDLINK_PUBLIC_DAILY_QUOTA`）；端点系数与普通账号相同，代理也是统一费率 **0.5 配额/MiB** → 约 50 MiB 代理流量 |
 | 响应头 | `X-Quota-Consumed` 是本次消耗，`X-Quota-Remaining` 是**本 IP 今天**的剩余 |
 | 超限 | `429 public_quota_exhausted`，message 提示申请独立 Key；额度按本地时区零点重置 |
 | 没带 Key | `403` 的 message 里直接给出公共 Key 与每日额度 |
@@ -710,7 +710,7 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
 **配额**：代理是唯一不按"端点 × 平台"计费的出口，它按**传输体积**算：
 
 ```
-实扣 = 传输体积(MiB) × 1 × 账号倍率          # 不乘平台系数
+实扣 = 传输体积(MiB) × 0.5 × 账号倍率        # 统一费率，不乘平台系数
 ```
 
 - 上游声明了长度（`Content-Length`；Range 请求时它就是这一段的长度）→ **先扣后传**：
@@ -720,6 +720,8 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
 - `HEAD` 不产生响应体，**不计费**；
 - 提前中断**不退**（按声明长度计费是"这次占用了多少出口带宽"的度量）；
 - 计费精度 0.0001 配额（约 105 字节）；
+- **所有账号同一费率**（0.5 配额/MiB，可用 `VIDLINK_PROXY_RATE` 调整）；
+  1 GB ≈ 512 配额，70 MB 的视频 ≈ 35 配额；
 - `GET /v1/usage` 的 `proxy` 字段与 `GET /v1/admin/quota` 的 `proxy` 字段都会给出这条口径；
 - 倍率为 `0` 的账号（免费账号）依然是 0 配额，但调用次数照常累计。
 - **默认值跟随运行模式**：免校验模式默认开启（浏览器内混流遇到要求 Referer/UA 的

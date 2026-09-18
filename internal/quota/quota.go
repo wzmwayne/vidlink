@@ -69,19 +69,25 @@ const defaultPlatformKey core.Platform = ""
 // 前者的出口带宽是后者的几百倍。按体积是唯一与真实成本同向的计法。
 const ProxyUnitBytes = 1 << 20
 
-// PublicProxyRate 是**公共 Key** 的代理费率（配额/MiB）。
+// ProxyRate 是媒体代理的**统一费率**：0.5 配额/MiB。
 //
-// 比标准费率（1/MiB）低得多：公共入口是给人试的，而代理吃的是服务端
-// 出口带宽——0.2 意味着"每日 25 配额"能换约 125 MiB 流量，
-// 既够试完一整条短视频，又不会把出口带宽变成免费资源。
-const PublicProxyRate = 0.2
+// 所有账号一个价（公共 Key 也一样）——分档定价在这个规模上没有意义，
+// 只会让"这次要花多少"变成需要查表的题。0.5 这个数是这样定的：
+//
+//   - 心智模型仍然简单：**1 GB ≈ 512 配额**，70 MB 的视频 ≈ 35 配额；
+//   - 代理的真实成本是**服务端出口带宽**（家里的上行 + Cloudflare 隧道），
+//     而解析一次只花上游几十到几百 KB。1/MiB 会让"下一条片子"贵过
+//     "解析一百次"，0.5 更贴近两者的实际成本比；
+//   - 公共入口每天 25 配额 ≈ 50 MB：够试完一条短视频，又不足以把
+//     出口带宽变成免费资源。
+const ProxyRate = 0.5
 
-// ProxyCost 计算媒体代理一次传输的配额消耗（标准费率 1 配额/MiB）。
+// ProxyCost 计算媒体代理一次传输的配额消耗（统一费率 ProxyRate）。
 //
 // 倍率为 0 的账号（免费账号）仍然是 0，与该账号在其他端点上的语义一致：
 // 不扣配额，但调用次数照样累计。
 func ProxyCost(bytes int64, accountMultiplier float64) float64 {
-	return ProxyCostAt(bytes, 1, accountMultiplier)
+	return ProxyCostAt(bytes, ProxyRate, accountMultiplier)
 }
 
 // ProxyCostAt 用指定费率计算代理消耗（公共 Key 用 PublicProxyRate）。

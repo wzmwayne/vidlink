@@ -233,7 +233,7 @@ func (s *Server) chargeProxyDeclared(w http.ResponseWriter, r *http.Request, dec
 	if !ok {
 		return true // 免校验模式：没有账户，也就没有配额
 	}
-	units := quota.ProxyCostAt(declared, s.proxyRateFor(acct), acct.Multiplier)
+	units := quota.ProxyCostAt(declared, s.proxyRate(), acct.Multiplier)
 	detail := fmt.Sprintf("proxy %.4g MiB（按体积）", float64(declared)/float64(quota.ProxyUnitBytes))
 
 	// 公共账号：额度在每 IP 日限额里，账本只记用量（见 consumePublicQuota）
@@ -257,10 +257,10 @@ func (s *Server) chargeProxyDeclared(w http.ResponseWriter, r *http.Request, dec
 		var insuf account.ErrQuotaExhausted
 		if errors.As(err, &insuf) {
 			writeErrorStatus(w, http.StatusTooManyRequests, "quota_exhausted",
-				fmt.Sprintf("配额不足：本次代理需要 %.2f（%.1f MiB，按 1 配额/MiB × 账号倍率 %.2f），"+
+				fmt.Sprintf("配额不足：本次代理需要 %.2f（%.1f MiB，按 %.4g 配额/MiB × 账号倍率 %.2f），"+
 					"当前剩余 %.2f；配额由管理员分配，请联系管理员调整",
 					insuf.Need, float64(declared)/float64(quota.ProxyUnitBytes),
-					acct.Multiplier, insuf.Have))
+					s.proxyRate(), acct.Multiplier, insuf.Have))
 			return false
 		}
 		s.log.Error("代理配额扣减失败", "request_id", requestID(r.Context()),
@@ -281,7 +281,7 @@ func (s *Server) chargeProxyActual(r *http.Request, written int64) {
 	if !ok {
 		return
 	}
-	units := quota.ProxyCostAt(written, s.proxyRateFor(acct), acct.Multiplier)
+	units := quota.ProxyCostAt(written, s.proxyRate(), acct.Multiplier)
 	if units <= 0 {
 		return
 	}
@@ -315,18 +315,15 @@ func (s *Server) proxyAccount(r *http.Request) (account.Account, bool) {
 	return accountFrom(r.Context())
 }
 
-// proxyRateFor 返回这个账号的代理费率（配额/MiB）。
+// proxyRate 返回媒体代理的费率（配额/MiB）。
 //
-// 公共 Key 用更低的一档（默认 0.2）：它是给人试的入口，而代理吃的是
-// 服务端出口带宽，两者不该同一个价。
-func (s *Server) proxyRateFor(acct account.Account) float64 {
-	if acct.PublicAccount {
-		if r := s.cfg.PublicProxyRate; r > 0 {
-			return r
-		}
-		return quota.PublicProxyRate
+// **所有账号一个价**：代理的成本是服务端出口带宽，与账号身份无关；
+// 分档只会让"这次要花多少"变成需要查表的题。
+func (s *Server) proxyRate() float64 {
+	if r := s.cfg.ProxyRate; r > 0 {
+		return r
 	}
-	return 1
+	return quota.ProxyRate
 }
 
 // proxyBudgetBytes 按账户剩余配额折算出本次最多能传的字节数。
@@ -348,7 +345,7 @@ func (s *Server) proxyBudgetBytes(r *http.Request) int64 {
 	if allowance <= 0 {
 		return 0
 	}
-	rate := s.proxyRateFor(acct)
+	rate := s.proxyRate()
 	affordable := int64(allowance / (acct.Multiplier * rate) * float64(quota.ProxyUnitBytes))
 	if affordable < 0 {
 		return 0

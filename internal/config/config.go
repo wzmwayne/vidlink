@@ -85,15 +85,15 @@ type Config struct {
 	// PublicDailyQuota 是公共账号每个 IP 每天的配额（默认 25）。
 	//
 	// 口径与其他端点一致：info 0.5 / links 1.0 / detail 1.2 / batch 0.75 每条。
-	// **代理是例外**：公共 Key 的代理费率更低（PublicProxyRate，默认 0.2 配额/MiB），
-	// 所以 25 配额约等于每天 25 条直链，或约 125 MiB 代理流量。
+	// **代理是例外**：按体积计费（ProxyRate，默认 0.5 配额/MiB，所有账号同价），
+	// 所以 25 配额约等于每天 25 条直链，或约 50 MiB 代理流量。
 	PublicDailyQuota float64
 
-	// PublicProxyRate 是公共 Key 的代理费率（配额/MiB，默认 0.2）。
+	// ProxyRate 是媒体代理的费率（配额/MiB，默认 0.5，**所有账号同价**）。
 	//
-	// 与标准费率（1/MiB）分开配置：公共入口是给人试的，代理吃的是服务端
-	// 出口带宽，费率该能单独调低（或调回 1）而不影响普通账号。
-	PublicProxyRate float64
+	// 代理的成本是服务端出口带宽，与账号身份无关，所以只有一个数。
+	// 调大 = 抑制代理用量（带宽紧张时），调小 = 鼓励用代理。
+	ProxyRate float64
 
 	// RateLimitRPM 是每 IP 每分钟请求上限；<=0 表示不限。
 	RateLimitRPM int
@@ -300,7 +300,7 @@ func Load() (*Config, error) {
 		AdminKey:           env("VIDLINK_ADMIN_KEY", ""),
 		PublicKey:          env("VIDLINK_PUBLIC_KEY", "vl_public"),
 		PublicDailyQuota:   envFloat("VIDLINK_PUBLIC_DAILY_QUOTA", publicq.DefaultDaily),
-		PublicProxyRate:    envFloat("VIDLINK_PUBLIC_PROXY_RATE", quota.PublicProxyRate),
+		ProxyRate:          envFloat("VIDLINK_PROXY_RATE", quota.ProxyRate),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
 		Proxy:              env("VIDLINK_PROXY", ""),
