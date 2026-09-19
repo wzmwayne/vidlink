@@ -240,9 +240,23 @@ func TestResetKeyUIIsWired(t *testing.T) {
 		`复制新 Key`, `old_handle`, `handle`,
 		// 公共账号说明 Key 来自配置，不给按钮
 		`VIDLINK_PUBLIC_KEY`,
+		// 结果渲染到列表外的固定容器——塞进账号卡片会被紧接着的刷新抹掉，
+		// 用户就只能在原始 JSON 里找 Key（这正是修之前的症状）
+		`id="resetOut"`, `function showResetResult(`, `$("#resetOut")`,
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("管理面板的重置 Key 接线缺少 %q", want)
 		}
+	}
+	// 顺序：先渲染结果，再刷新列表；反过来会把刚渲染的内容冲掉
+	i := strings.Index(src, "showResetResult(a, d);")
+	if i < 0 {
+		t.Fatal("重置分支里没有调用 showResetResult")
+	}
+	if !strings.Contains(src[i:], "await loadAccounts();") {
+		t.Error("重置分支应在渲染结果之后再刷新列表")
+	}
+	if strings.Contains(src, "card.insertBefore(box") {
+		t.Error("重置结果不该插进会被刷新重建的账号卡片里")
 	}
 }

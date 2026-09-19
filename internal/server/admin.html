@@ -221,6 +221,10 @@
       </div>
       <span class="status" id="listStatus" style="align-self:center"></span>
     </div>
+    <!-- 重置 Key 的结果放在这里，而不是塞进账号卡片里：
+         卡片是每次刷新都重建的，塞进去会被下一次 renderAccounts 抹掉
+         （实测就是这样：Key 只在响应 JSON 里出现，用户看不到） -->
+    <div id="resetOut" class="hidden"></div>
     <div id="accounts"></div>
     <div class="hint">
       所有修改都用账号<b>句柄</b>（<span class="mono">acc_…</span>）寻址，不需要明文 Key；
@@ -900,26 +904,8 @@ function vlSignUrl(prefix, key, url, ts) {
           show(r);
           if (r.status !== 200) { setKeyState("重置 Key 失败：" + errText(r), true); return; }
           const d = r.body || {};
+          showResetResult(a, d);      // 先渲染结果，再刷新列表（刷新会重建卡片）
           await loadAccounts();
-          const card = btn.closest(".acct");
-          if (card && d.key) {
-            // 明文只出现这一次：摆在这张卡片最上方，给一键复制，并写清旧句柄。
-            const box = el("div", "warnbox");
-            box.style.cssText = "border:1px solid #4a3a12;border-radius:8px;padding:8px;margin-top:8px";
-            box.appendChild(el("div", null, "新 Key（只显示这一次，请立即保存）："));
-            const line = el("div", "mono", d.key);
-            line.style.cssText = "font-size:15px;word-break:break-all;margin:6px 0";
-            box.appendChild(line);
-            const copy = el("button", null, "复制新 Key");
-            copy.addEventListener("click", async () => {
-              try { await navigator.clipboard.writeText(d.key); copy.textContent = "已复制"; }
-              catch (_) { copy.textContent = "复制失败，请手动选中"; }
-            });
-            box.appendChild(copy);
-            box.appendChild(el("div", "hint", (d.notice || "") +
-              "（旧句柄 " + (d.old_handle || "") + " → 新句柄 " + (d.handle || "") + "）"));
-            card.insertBefore(box, card.firstChild);
-          }
           setKeyState("Key 已重置（新句柄 " + (d.handle || "") + "）", false);
           return;
         }
@@ -935,6 +921,41 @@ function vlSignUrl(prefix, key, url, ts) {
     } finally {
       btn.disabled = false;
     }
+  }
+
+  // showResetResult 把"重置后的新 Key"渲染到 #resetOut。
+  //
+  // 为什么不放进账号卡片：卡片每次 loadAccounts/renderAccounts 都会重建，
+  // 往卡片里插节点会被紧接着的刷新抹掉——用户就只会在原始 JSON 里找 Key。
+  // 放在列表外的固定容器里，刷新多少次都还在。
+  function showResetResult(a, d) {
+    const box = $("#resetOut");
+    box.textContent = "";
+    box.classList.remove("hidden");
+    box.className = "warnbox";
+    box.style.cssText = "border:1px solid #4a3a12;border-radius:8px;padding:10px;margin:10px 0";
+
+    box.appendChild(el("div", null, "账号 " + (a.name || a.id) + "（" + a.id + "）的 Key 已重置"));
+    if (d.key) {
+      box.appendChild(el("div", null, "新 Key（只显示这一次，请立即保存）："));
+      const line = el("div", "mono", d.key);
+      line.style.cssText = "font-size:15px;word-break:break-all;margin:6px 0;user-select:all";
+      box.appendChild(line);
+      const bars = el("div", "btns");
+      const copy = el("button", "primary", "复制新 Key");
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(d.key); copy.textContent = "已复制"; }
+        catch (_) { copy.textContent = "复制失败，请手动选中"; }
+      });
+      bars.appendChild(copy);
+      const close = el("button", null, "我已保存，收起");
+      close.addEventListener("click", () => { box.classList.add("hidden"); box.textContent = ""; });
+      bars.appendChild(close);
+      box.appendChild(bars);
+    }
+    box.appendChild(el("div", "hint",
+      (d.notice || "") + "（旧句柄 " + (d.old_handle || "") + " → 新句柄 " + (d.handle || "") + "）"));
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
   // ---------- 新建账号 ----------
