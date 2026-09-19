@@ -107,6 +107,10 @@ func TestSplitID(t *testing.T) {
 		{"553300", "553300", ""},
 		{"553300_33921", "553300", "33921"},
 		{" 553300_33921 ", "553300", "33921"},
+		// 15 位的单集 ID 是真实存在的：早期写死 "≤12 位" 会把合法请求判成 bad_input
+		{"566524_118450987697353", "566524", "118450987697353"},
+		// 短 ID 也放行：不做"长度看起来像不像"的猜测
+		{"553_33921", "553", "33921"},
 	}
 	for _, c := range ok {
 		m, e, err := splitID(c.in)
@@ -118,10 +122,29 @@ func TestSplitID(t *testing.T) {
 			t.Errorf("splitID(%q) = (%q,%q)，应为 (%q,%q)", c.in, m, e, c.movie, c.episode)
 		}
 	}
-	for _, bad := range []string{"", "abc", "553300_", "553300_abc", "553_33921"} {
+	for _, bad := range []string{"", "abc", "553300_", "553300_abc", "553300_12a34"} {
 		if _, _, err := splitID(bad); err == nil {
 			t.Errorf("splitID(%q) 应当报错", bad)
 		}
+	}
+}
+
+// TestCheckLinkID：links 必须指定到单集，info/detail 不受此限。
+func TestCheckLinkID(t *testing.T) {
+	e := offlineExtractor(t)
+	if err := e.CheckLinkID("553300"); err == nil {
+		t.Fatal("裸影片 ID 取流应报错（不知道要给哪一集）")
+	} else if !strings.Contains(err.Error(), "单集 ID") || !strings.Contains(err.Error(), "/v1/info") {
+		t.Errorf("报错应说明怎么拿单集 ID：%v", err)
+	}
+	if err := e.CheckLinkID("553300_33921"); err != nil {
+		t.Errorf("影片 ID_单集 ID 应放行：%v", err)
+	}
+	if err := e.CheckLinkID("566524_118450987697353"); err != nil {
+		t.Errorf("长单集 ID 也应放行：%v", err)
+	}
+	if err := e.CheckLinkID("abc"); err == nil {
+		t.Error("非数字应报错")
 	}
 }
 

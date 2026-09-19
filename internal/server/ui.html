@@ -1229,11 +1229,22 @@ function vlSignUrl(prefix, key, url, ts) {
         card.appendChild(el("div", "hint", "主演：" + it.actors.slice(0, 6).join(" / ")));
       }
       const btns = el("div", "btns");
-      const b1 = el("button", "primary", "取直链");
-      b1.addEventListener("click", () => { useTarget(it); run("links"); });
-      const b2 = el("button", null, "详情");
-      b2.addEventListener("click", () => { useTarget(it); run("detail"); });
-      btns.appendChild(b1); btns.appendChild(b2);
+      // 剧集型平台（荐片）的"取直链"必须先选集：光有影片 ID 不知道该给哪一集，
+      // 服务端也会明确拒绝。所以这里直接把主按钮做成「详情（选集）」。
+      const needsEpisode = it.platform === "jianpian";
+      if (needsEpisode) {
+        const b0 = el("button", "primary", "详情（选集）");
+        b0.title = "荐片要先选线路与集：详情里会列出线路与选集（含可直接解析的 parse_id）";
+        b0.addEventListener("click", () => { useTarget(it); run("detail"); });
+        btns.appendChild(b0);
+      } else {
+        const b1 = el("button", "primary", "取直链");
+        b1.addEventListener("click", () => { useTarget(it); run("links"); });
+        btns.appendChild(b1);
+      }
+      const b2 = el("button", null, needsEpisode ? "看元信息" : "详情");
+      b2.addEventListener("click", () => { useTarget(it); run(needsEpisode ? "info" : "detail"); });
+      btns.appendChild(b2);
       card.appendChild(btns);
       box.appendChild(card);
     });

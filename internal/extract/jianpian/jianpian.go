@@ -106,6 +106,24 @@ func (e *Extractor) Parse(context.Context, *core.URL) (*core.Video, error) {
 		"荐片不支持链接解析：请用 platform=jianpian&id=<影片ID>（先用 /v1/search 搜到影片 ID）")
 }
 
+// CheckLinkID 实现 core.LinkIDChecker：**取流必须指定到单集**。
+//
+// 道理很简单：一部剧有十几条线路、几十集，光有影片 ID 无法回答"你要哪一集"。
+// 默默给第 1 集是最糟的选择——用户以为拿到了他点的那一集，直到播出来才发现不对。
+func (e *Extractor) CheckLinkID(id string) error {
+	movieID, episodeID, err := splitID(id)
+	if err != nil {
+		return err
+	}
+	if episodeID == "" {
+		return core.BadInput(core.PlatformJianpian,
+			"取直链必须指定到单集：用 id=%s_<单集ID>；单集 ID 见 "+
+				"GET /v1/info?platform=jianpian&id=%s 的 series.episodes[].id"+
+				"（或直接用同一处给的 parse_id）", movieID, movieID)
+	}
+	return nil
+}
+
 // ParseID 按解析 ID 解析。荐片的解析 ID 有两种形态：
 //
 //	553300          影片 ID：默认取首选（VIP）线路的第 1 集
@@ -525,7 +543,7 @@ func splitID(raw string) (movieID, episodeID string, err error) {
 		return "", "", core.BadInput(core.PlatformJianpian,
 			"荐片影片 ID 必须是数字：%q（格式：<影片ID> 或 <影片ID>_<单集ID>）", raw)
 	}
-	if episodeID != "" && !isNumericID(episodeID) {
+	if episodeID != "" && !isDigits(episodeID, maxIDLen) {
 		return "", "", core.BadInput(core.PlatformJianpian,
 			"单集 ID 必须是数字：%q（格式：<影片ID> 或 <影片ID>_<单集ID>）", raw)
 	}
@@ -572,8 +590,20 @@ func (e *Extractor) imageURL(ctx context.Context, src string) string {
 
 // --- 工具 ---
 
+// ID 只要求"全数字"，**不设过短的假设**：实测既有 5 位的单集 ID（33921），
+// 也有 15 位的（118450987697353）。早期版本写死 ≤12 位，直接把合法 ID 判成
+// bad_input——这正是"用经验给外部数据设上限"的典型事故。
+const (
+	minIDLen = 1
+	maxIDLen = 32
+)
+
 func isNumericID(s string) bool {
-	if len(s) < 4 || len(s) > 12 {
+	return isDigits(s, maxIDLen)
+}
+
+func isDigits(s string, max int) bool {
+	if len(s) < minIDLen || len(s) > max {
 		return false
 	}
 	for i := 0; i < len(s); i++ {

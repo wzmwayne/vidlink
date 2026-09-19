@@ -415,11 +415,21 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLinks 是 links 档：只给直链，不给任何内容元信息。
+//
+// 取流前先让平台校验 ID 是否"足够具体"（core.LinkIDChecker）：
+// 荐片一部剧有很多集，只给影片 ID 不知道该给哪一集——这种请求必须在
+// 发上游之前就失败，否则用户会以为拿到的第 1 集就是他点的那一集。
 func (s *Server) handleLinks(w http.ResponseWriter, r *http.Request) {
 	target, platform, id, err := parseInput(r)
 	if err != nil {
 		writeError(w, core.BadInput("", "%v", err))
 		return
+	}
+	if platform != "" {
+		if err := s.svc.CheckLinkID(platform, id); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	v, err := s.resolve(r, target, platform, id)
 	if err != nil {

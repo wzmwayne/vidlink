@@ -44,6 +44,17 @@ type SearchExtractor interface {
 	Search(ctx context.Context, q SearchQuery) (*SearchResult, error)
 }
 
+// LinkIDChecker 是可选能力：校验"取流"（/v1/links）用的 ID 是否足够具体。
+//
+// 为什么需要它：荐片一部剧有很多集，只给影片 ID 根本无法确定要哪一集。
+// 与其默默给第 1 集（用户会以为自己拿到的是他点的那一集），不如明确要求
+// `<影片ID>_<单集ID>`——单集 ID 由 /v1/info 的 series.episodes[].id/parse_id 给出。
+//
+// 只约束 links：info/detail 本来就是"先看清单再决定"的档位，接受影片 ID。
+type LinkIDChecker interface {
+	CheckLinkID(id string) error
+}
+
 // URL 是归一化后的输入地址。
 //
 // 之所以不直接用 *url.URL：解析前需要先"展开短链 + 提取文案中的链接"，

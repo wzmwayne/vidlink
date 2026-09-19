@@ -137,6 +137,20 @@ func (s *Service) ParseByID(ctx context.Context, platform, id string) (*core.Vid
 	})
 }
 
+// CheckLinkID 让平台校验"取流用的 ID"是否合法（未实现该能力的平台一律放行）。
+//
+// 放在服务层而不是 handler 里：这样任何调用方（HTTP、CLI、测试）都走同一份规则。
+func (s *Service) CheckLinkID(platform, id string) error {
+	ext, ok := s.reg.ByName(core.Platform(platform))
+	if !ok {
+		return nil // 未知平台由后续解析路径给出更准确的报错
+	}
+	if chk, ok := ext.(core.LinkIDChecker); ok {
+		return chk.CheckLinkID(id)
+	}
+	return nil
+}
+
 // Search 按关键词搜索某个平台的内容。
 //
 // 只有实现了 core.SearchExtractor 的平台可搜；未实现时返回 Unsupported，

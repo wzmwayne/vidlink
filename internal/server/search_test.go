@@ -331,6 +331,9 @@ func TestUISeriesSelectionWiring(t *testing.T) {
 		`lastAct === "links" || lastAct === "info" || lastAct === "detail"`,
 		// 选集 = 把 parse_id 填进表单再取直链
 		`$("#vid").value = ep.parse_id || ep.id`,
+		// 剧集型平台的搜索卡片主按钮是「详情（选集）」：光有影片 ID 取不了流
+		`const needsEpisode = it.platform === "jianpian"`,
+		`"详情（选集）"`,
 	} {
 		if !strings.Contains(ui, want) {
 			t.Errorf("解析页缺少 %q", want)
@@ -510,5 +513,52 @@ console.log(JSON.stringify(out));
 	}
 	if got.SameHost != "https://a.example/x/y" {
 		t.Errorf("绝对路径应相对主机解析：%q", got.SameHost)
+	}
+}
+
+// linkIDStub 实现 ByIDExtractor + LinkIDChecker：模拟"取流必须指定到单集"的平台。
+type linkIDStub struct{ name core.Platform }
+
+func (s linkIDStub) Name() core.Platform  { return s.name }
+func (s linkIDStub) Hosts() []string      { return []string{"linkid.test"} }
+func (s linkIDStub) Match(*core.URL) bool { return false }
+
+func (s linkIDStub) ParseID(context.Context, string) (*core.Video, error) {
+	return &core.Video{
+		Platform: s.name, ID: "553300", Title: "t",
+		Videos: []core.Stream{{URL: "https://cdn.example/x.mp4"}},
+	}, nil
+}
+
+func (s linkIDStub) Parse(context.Context, *core.URL) (*core.Video, error) {
+	return nil, core.NotFound(s.name, "stub 不按链接解析")
+}
+
+func (s linkIDStub) CheckLinkID(id string) error {
+	if !strings.Contains(id, "_") {
+		return core.BadInput(s.name, "取直链必须指定到单集：用 id=<影片ID>_<单集ID>")
+	}
+	return nil
+}
+
+// TestLinksRequiresFullIDWhenPlatformSaysSo：links 会先让平台校验 ID；
+// info/detail 不受这条限制（它们本来就是"先看清单"的档位）。
+func TestLinksRequiresFullIDWhenPlatformSaysSo(t *testing.T) {
+	env := newTestEnv(t, nil, linkIDStub{name: core.PlatformJianpian})
+	h := env.handler()
+
+	w := do(h, http.MethodGet, "/v1/links?platform=jianpian&id=553300", userHdr(env.userKey))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("裸影片 ID 取流应 400，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if _, msg, _ := errBody(t, w); !strings.Contains(msg, "单集") {
+		t.Errorf("报错应说明必须指定单集：%s", msg)
+	}
+	// 未带 key 的调用会先被鉴权挡掉，这里只关心校验本身
+	if w := do(h, http.MethodGet, "/v1/links?platform=jianpian&id=553300_33921", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Errorf("影片 ID_单集 ID 应放行，得到 %d（%s）", w.Code, w.Body.String())
+	}
+	if w := do(h, http.MethodGet, "/v1/detail?platform=jianpian&id=553300", userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Errorf("detail 不该被这条规则限制，得到 %d", w.Code)
 	}
 }
