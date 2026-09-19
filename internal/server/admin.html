@@ -890,7 +890,7 @@ function vlSignUrl(prefix, key, url, ts) {
           const typed = prompt("重置 " + (a.name || a.id) + " 的 Key：\n\n" +
             "· 留空 → 由服务端随机生成一个 256 位 Key（推荐）\n" +
             "· 也可以手填（会自动补 vl_ 前缀）\n\n" +
-            "旧 Key 会立刻失效；配额、用量、倍率、签到状态全部保留。");
+            "旧 Key 会立刻失效；配额、用量、倍率、签到状态全部保留，历史账单会并入新账号。");
           if (typed === null) return;               // 用户取消
           const want = typed.trim();
           if (want && !confirm("确认把 Key 重置为你填写的这个值？\n\n" +

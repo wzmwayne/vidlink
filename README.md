@@ -257,7 +257,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET | `/admin` | 公开（页面壳） | — | **管理面板**：填管理 Key 后管理账号（`VL_WEBUI` 开启且非 ease 模式） |
 | GET/POST | `/v1/admin/accounts` | 管理 Key | — | 账号列表 / 创建账号（免校验模式下不存在） |
 | GET/PATCH/DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — | 查 / 改 / 删账号（可用明文 Key 或账号句柄 `acc_…`） |
-| POST | `/v1/admin/accounts/{key\|id}/reset_key` | 管理 Key | — | **重置账号 Key**（手填或随机；配额与用量保留，旧 Key 立刻失效） |
+| POST | `/v1/admin/accounts/{key\|id}/reset_key` | 管理 Key | — | **重置账号 Key**（手填或随机；配额/用量保留、历史账单并入新账号，旧 Key 立刻失效） |
 | GET | `/v1/admin/stats` | 管理 Key | — | 运行统计 |
 | GET | `/v1/admin/quota` | 管理 Key | — | 配额系数全貌（只读） |
 | GET | `/v1/admin/ledger` | 管理 Key | — | 配额流水：不带条件=总账单，`?account=`（或 `?id=`）指定账号 |

@@ -156,3 +156,83 @@ func TestAdminResetKeyEndToEnd(t *testing.T) {
 		t.Errorf("流水里应有一笔写明旧句柄的重置记录：%+v", led.Entries)
 	}
 }
+
+// TestResetKeyMovesBillsToNewAccount：重置之后，按**新 Key** 查自己的流水，
+// 必须能看到重置之前的创建与消耗（账单跟着账号走）。
+func TestResetKeyMovesBillsToNewAccount(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	adm := userHdr(env.adminKey)
+
+	w := doJSON(h, http.MethodPost, "/v1/admin/accounts",
+		`{"key":"vl_billme","name":"账单归属","quota":50}`, adm)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("建号失败：%d %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Account struct {
+			ID string `json:"id"`
+		} `json:"account"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+
+	// 重置前消耗一笔，并确认它出现在自己的流水里
+	if _, err := env.store.Consume("vl_billme", 3, "重置前的消耗"); err != nil {
+		t.Fatal(err)
+	}
+
+	w = doJSON(h, http.MethodPost, "/v1/admin/accounts/"+created.Account.ID+"/reset_key", `{}`, adm)
+	if w.Code != http.StatusOK {
+		t.Fatalf("重置失败：%d %s", w.Code, w.Body.String())
+	}
+	var got resetKeyResp
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.Notice, "历史账单") {
+		t.Errorf("notice 应说明账单归属：%q", got.Notice)
+	}
+
+	// 新 Key 查自己的流水：应看到"重置前的消耗"与创建记录
+	w = do(h, http.MethodGet, "/v1/ledger?limit=50", userHdr(got.Key))
+	if w.Code != http.StatusOK {
+		t.Fatalf("查流水失败：%d %s", w.Code, w.Body.String())
+	}
+	var led struct {
+		Entries []struct {
+			Type   string `json:"type"`
+			Detail string `json:"detail"`
+		} `json:"entries"`
+		Totals map[string]struct {
+			Count int64   `json:"count"`
+			Units float64 `json:"units"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &led); err != nil {
+		t.Fatal(err)
+	}
+	var sawCreate, sawOldConsume bool
+	for _, e := range led.Entries {
+		if e.Type == "create" {
+			sawCreate = true
+		}
+		if e.Type == "consume" && strings.Contains(e.Detail, "重置前的消耗") {
+			sawOldConsume = true
+		}
+	}
+	if !sawCreate || !sawOldConsume {
+		t.Errorf("新 Key 名下应能看到重置前的流水：create=%v 旧消耗=%v（%+v）", sawCreate, sawOldConsume, led.Entries)
+	}
+	if got := led.Totals["consume"].Units; got != -3 {
+		t.Errorf("累计消耗应跨重置合并：%v，应为 -3", got)
+	}
+
+	// 管理面按新句柄查也一样
+	w = do(h, http.MethodGet, "/v1/admin/ledger?account="+got.Handle+"&limit=50", adm)
+	if w.Code != http.StatusOK {
+		t.Fatalf("管理面查流水失败：%d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "重置前的消耗") {
+		t.Error("管理面按新句柄也应看到重置前的流水")
+	}
+}

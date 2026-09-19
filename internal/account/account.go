@@ -58,6 +58,16 @@ type Account struct {
 	// 因此这里不存在 admin 字段：一个 Key 要么是账本里的普通账号，
 	// 要么是服务级的管理 Key，二者互不蕴含、互不派生。
 
+	// KeyHistory 是这个账号**用过的旧 Key**（不含当前 Key）。
+	//
+	// 为什么要记：账单是按 Key 记的（流水里存 Key、汇总按 Key 分桶），
+	// 而重置 Key 之后，那些历史账单仍然属于**同一个账号**——
+	// 查流水与汇总时必须把历史 Key 一起算进来，否则管理员看到的
+	// "这个账号花了多少"会凭空少掉一大截。
+	//
+	// 不含当前 Key，也不含任何秘密以外的信息；随账号快照一起落盘、一起回放。
+	KeyHistory []string `json:"key_history,omitempty"`
+
 	// ID 是账号的**公开句柄**，由 Key 派生（见 Handle），不是独立秘密。
 	//
 	// 为什么需要它：管理面要在**不接触明文 Key** 的前提下定位账号。
@@ -171,6 +181,13 @@ var ErrNotFound = errors.New("账号不存在")
 
 // ErrDuplicate 账号已存在。
 var ErrDuplicate = errors.New("账号已存在")
+
+// ErrHandleTaken 表示 Key 派生的**句柄（acc_…）**已被别的账号占用。
+//
+// 句柄是外键：面板、流水、日志都按它寻址，两个账号撞到同一个句柄会让
+// 索引互相覆盖。Key 不同而句柄相同在密码学上几乎不可能（SHA-256 截断），
+// 但"几乎不可能"不等于"不用查"——查一次的成本是一次 map 查找。
+var ErrHandleTaken = errors.New("账号句柄已被占用")
 
 // Store 是账号账本。
 //
@@ -631,11 +648,16 @@ func (s *Store) Create(a Account) (Account, error) {
 	if a.Key == "" {
 		return Account{}, errors.New("Key 不能为空")
 	}
+	// 句柄由 Key 派生，调用方传什么都不作数（保持"ID == Handle(Key)"这条不变量）
+	a.ID = Handle(a.Key)
+	// 查重两条路：明文 Key 与它派生的**句柄（acc）**。
+	// 只查 Key 不够——句柄是外键，撞了就互相覆盖（见 ErrHandleTaken）。
 	if _, dup := s.accounts[a.Key]; dup {
 		return Account{}, ErrDuplicate
 	}
-	// 句柄由 Key 派生，调用方传什么都不作数（保持"ID == Handle(Key)"这条不变量）
-	a.ID = Handle(a.Key)
+	if _, dup := s.byHandle[a.ID]; dup {
+		return Account{}, ErrHandleTaken
+	}
 	now := s.now()
 	a.CreatedAt, a.UpdatedAt = now, now
 	if a.Multiplier < 0 {
@@ -845,12 +867,19 @@ func (s *Store) ResetKey(oldKey, newKey string) (Account, error) {
 		// 包含"新旧相同"这种情况：那个 Key 已经被占着。
 		return Account{}, ErrDuplicate
 	}
+	newHandle := Handle(newKey)
+	if _, taken := s.byHandle[newHandle]; taken {
+		// 句柄（acc）也要查重：它是外键，撞了 byHandle 就互相覆盖。
+		return Account{}, ErrHandleTaken
+	}
 
 	before := *a
 	oldHandle := a.ID
 	cp := *a
 	cp.Key = newKey
-	cp.ID = Handle(newKey)
+	cp.ID = newHandle
+	// 旧 Key 计入历史：账单跟着账号走，重置不该让管理员"少看到一大截消耗"。
+	cp.KeyHistory = appendKeyHistory(a.KeyHistory, oldKey)
 	cp.UpdatedAt = s.now()
 
 	delete(s.accounts, oldKey)
@@ -861,7 +890,8 @@ func (s *Store) ResetKey(oldKey, newKey string) (Account, error) {
 	e := Entry{
 		Time: cp.UpdatedAt, Type: EntrySet, Key: newKey, ID: cp.ID, Name: cp.Name,
 		Units: 0, Balance: cp.Quota, Used: cp.Used, Calls: cp.Calls,
-		Detail: fmt.Sprintf("重置 Key（旧句柄 %s → 新句柄 %s；配额与用量保留）", oldHandle, cp.ID),
+		Detail: fmt.Sprintf("重置 Key（旧句柄 %s → 新句柄 %s；配额/用量保留，历史账单已并入本账号）",
+			oldHandle, cp.ID),
 	}
 	s.ledgerAdd(e)
 	// 一次性写两条：旧 Key 的墓碑（回放时删掉它）+ 新 Key 的快照。
@@ -877,6 +907,27 @@ func (s *Store) ResetKey(oldKey, newKey string) (Account, error) {
 		return Account{}, err
 	}
 	return cp, nil
+}
+
+// maxKeyHistory 是账号保留的旧 Key 上限。
+//
+// 只用于"账单归属"这一件事，超过上限就丢最旧的：一个被反复重置的账号
+// 不该让快照无限变大；丢掉的旧 Key 对应的流水仍在文件里，只是不再自动并入。
+const maxKeyHistory = 32
+
+// appendKeyHistory 追加一个旧 Key（去重、限量，最新在后）。
+func appendKeyHistory(history []string, oldKey string) []string {
+	out := make([]string, 0, len(history)+1)
+	for _, k := range history {
+		if k != "" && k != oldKey {
+			out = append(out, k)
+		}
+	}
+	out = append(out, oldKey)
+	if n := len(out) - maxKeyHistory; n > 0 {
+		out = out[n:]
+	}
+	return out
 }
 
 // --- 配额计量 ---

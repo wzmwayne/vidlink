@@ -330,11 +330,16 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 		DailyGrant: grant, GrantCap: cap, Note: req.Note,
 	})
 	if err != nil {
-		if errors.Is(err, account.ErrDuplicate) {
+		switch {
+		case errors.Is(err, account.ErrDuplicate):
 			writeError(w, core.BadInput("", "该 Key 已存在"))
-			return
+		case errors.Is(err, account.ErrHandleTaken):
+			writeError(w, core.BadInput("", "该 Key 派生的账号句柄 %s 已被占用"+
+				"（不同 Key 撞到同一句柄，概率极低，但句柄是外键，撞了会互相覆盖）：请换一个 Key",
+				account.Handle(key)))
+		default:
+			writeError(w, core.E(core.KindInternal, "", "admin", "创建账号失败", err))
 		}
-		writeError(w, core.E(core.KindInternal, "", "admin", "创建账号失败", err))
 		return
 	}
 
@@ -516,6 +521,10 @@ func (s *Server) handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
 			writeError(w, core.NotFound("", "账号不存在"))
 		case errors.Is(err, account.ErrDuplicate):
 			writeError(w, core.BadInput("", "新 Key 已被占用（或与原 Key 相同），请换一个"))
+		case errors.Is(err, account.ErrHandleTaken):
+			writeError(w, core.BadInput("", "新 Key 派生的账号句柄 %s 已被占用"+
+				"（不同 Key 撞到同一句柄，概率极低，但句柄是外键，撞了会互相覆盖）：请换一个 Key",
+				account.Handle(newKey)))
 		default:
 			writeError(w, core.E(core.KindInternal, "", "admin", "重置 Key 失败", err))
 		}
@@ -528,11 +537,11 @@ func (s *Server) handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
 		"handle":     a.ID,  // 句柄随 Key 派生，一并给出，免得调用方自己算
 		"old_handle": acct.ID,
 		"notice": "旧 Key 已立刻失效；请立即保存新 Key，它只会出现这一次。" +
-			"账本里重置之前的历史流水挂在旧句柄下，需要时可用它查询",
+			"配额、用量与此前的历史账单都并入新账号（按新 Key / 新句柄即可查到全部流水）",
 	}
 	if !generated && prefixed {
 		resp["notice"] = fmt.Sprintf("你指定的 Key 没有 %s 前缀，已自动补成下面这个值；"+
-			"旧 Key 已立刻失效，请保存新 Key（只会出现这一次）", keyPrefix)
+			"旧 Key 已立刻失效，请保存新 Key（只会出现这一次）；历史账单已并入新账号", keyPrefix)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

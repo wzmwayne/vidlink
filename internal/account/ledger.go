@@ -129,10 +129,11 @@ func (s *Store) ledgerLocked(q LedgerQuery) ([]Entry, map[EntryType]Totals) {
 	if limit > MaxLedgerLimit {
 		limit = MaxLedgerLimit
 	}
+	keys := s.accountKeys(q.Key)
 	out := make([]Entry, 0, min(limit, 64))
 	for i := len(s.entries) - 1; i >= 0 && len(out) < limit; i-- {
 		e := s.entries[i]
-		if q.Key != "" && e.Key != q.Key {
+		if len(keys) > 0 && !containsKey(keys, e.Key) {
 			continue
 		}
 		if q.Type != "" && e.Type != q.Type {
@@ -144,18 +145,63 @@ func (s *Store) ledgerLocked(q LedgerQuery) ([]Entry, map[EntryType]Totals) {
 }
 
 func (s *Store) totalsLocked(q LedgerQuery) map[EntryType]Totals {
-	src := s.totalsAll
-	if q.Key != "" {
-		src = s.totalsByKey[q.Key]
-	}
-	out := make(map[EntryType]Totals, len(src))
-	for k, v := range src {
-		if q.Type != "" && k != q.Type {
-			continue
+	// 汇总同样要跨"这个账号用过的所有 Key"合并：
+	// 账号换过钥匙之后，累计消耗仍然是这个账号的，不能凭空变少。
+	var srcs []map[EntryType]Totals
+	if keys := s.accountKeys(q.Key); len(keys) > 0 {
+		for _, k := range keys {
+			if t := s.totalsByKey[k]; t != nil {
+				srcs = append(srcs, t)
+			}
 		}
-		out[k] = v
+	} else {
+		srcs = []map[EntryType]Totals{s.totalsAll}
+	}
+	out := make(map[EntryType]Totals, 8)
+	for _, src := range srcs {
+		for k, v := range src {
+			if q.Type != "" && k != q.Type {
+				continue
+			}
+			cur := out[k]
+			cur.Count += v.Count
+			cur.Units += v.Units
+			out[k] = cur
+		}
 	}
 	return out
+}
+
+// accountKeys 返回"这次查询该匹配哪些 Key"：
+//
+//	q.Key == ""            → nil（不过滤，总账单）
+//	账号存在                → 当前 Key + KeyHistory（账单跟着账号走）
+//	账号不存在（已删除等）  → 只按传入的 Key 匹配，历史流水仍可按旧 Key 查到
+//
+// 调用方必须已持有读锁或写锁（它会读 s.accounts）。
+func (s *Store) accountKeys(key string) []string {
+	if key == "" {
+		return nil
+	}
+	out := []string{key}
+	if a, ok := s.accounts[key]; ok {
+		for _, k := range a.KeyHistory {
+			if k != "" && k != key {
+				out = append(out, k)
+			}
+		}
+	}
+	return out
+}
+
+// containsKey 判断 Key 是否在集合里（历史长度有上限，线性查找足够）。
+func containsKey(keys []string, key string) bool {
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // --- 内部：写入与回放 ---
