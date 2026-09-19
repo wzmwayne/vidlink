@@ -283,7 +283,9 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 ```
 
 - 上游超时、内容不存在、限流、参数错误：**不扣**；
-- 批量：只按**成功条数**扣；
+- 批量：只按**成功条数**扣；搜索同样按**返回条数**扣（默认 0.25/条，
+  搜不到就是 0）；
+- 代理按**传输体积**扣（0.5 配额/MiB，不乘平台系数）；
 - 解析开始前会按该端点的**最贵档位**做一次上限检查，不够就 `429`；
   真正扣减仍按实际平台结算，不会多扣。
 
@@ -703,6 +705,58 @@ curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 > 流水与账号快照共用一个账本文件、共用一次 `fsync`，重启一起回放，所以历史不会丢。
 > 接口只承诺"最近 N 条 + 全量汇总"，更早的逐条记录可以直接读账本文件。
 
+### 3.8c 搜索 `GET /v1/search` · 需 Key · 0.25/条 · 免校验模式下不计量
+
+按关键词搜内容。返回的是**元信息 + id**，**不含任何直链**——
+搜索是入口，取直链仍走 `links` / `detail`（这正是它能按条计价的前提）。
+
+```
+GET /v1/search?platform=bilibili&keyword=猫&limit=3
+```
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `platform` | ✅ | `bilibili` \| `jianpian`；其它平台 `400` 并说明原因（见下） |
+| `keyword` | ✅ | 关键词，1~64 字符（别名 `q`） |
+| `page` | ❌ | 页码，默认 1，1~50 |
+| `limit` | ❌ | 每页条数，默认 20，1~50（**按实际返回条数计价**） |
+
+```json
+{
+  "platform": "jianpian", "keyword": "太空", "page": 1, "limit": 20,
+  "count": 20, "total": 2940, "has_more": true, "next": "page=2&limit=20",
+  "cost": 5,
+  "items": [{
+    "platform": "jianpian", "type": "series", "id": "553300",
+    "title": "太空部队", "desc": "…", "cover": "https://img…/a.jpg",
+    "score": 8, "year": 2020, "category": "电视剧", "latest": "第10集",
+    "actors": ["史蒂夫·卡瑞尔"],
+    "detail": "GET /v1/detail?platform=jianpian&id=553300"
+  }]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `cost` | 本次实际扣减（= 0.25 × `count` × 账号倍率）；空结果不出现该字段 |
+| `count` / `total` | 本次条数 / 平台声明的匹配总数（平台可能截断，如 B 站上限 1000） |
+| `has_more` / `next` | 是否还有下一页，以及下一页的现成参数 |
+| `items[].id` | **拿去 detail/links 的那个 ID**（B 站 bvid；荐片影片 ID） |
+| `items[].detail` | 现成的下一步调用提示（不用自己拼 URL） |
+
+平台支持（2026-09 实测，过难放弃的都写明原因，`/v1/platforms` 里同样给出）：
+
+| 平台 | 支持 | 原因 |
+| --- | --- | --- |
+| `bilibili` | ✅ | B 站 `search/type` 匿名可用；风控时自动换 WBI 签名通道重试 |
+| `jianpian` | ✅ | 荐片 `search/videoV2`（10 条/页，取 20/50 条由服务端拼页） |
+| `douyin` | ❌ | 需要登录态（未登录实测 `status_code=2483`） |
+| `kuaishou` | ❌ | 反爬校验（实测 `result=400002` + 滑块验证） |
+| `xiaohongshu` | ❌ | 需要 `x-s`/`x-s-common`/`x-rap-param` 全套签名与登录态 |
+
+> 缓存：同一 `(平台, 关键词, 页, 条数)` 10 分钟内命中服务端缓存（省上游），
+> 但**缓存命中照样按条计费**——缓存省的是上游请求，不是客户的额度。
+
 ### 3.9 管理端点 `/v1/admin/*` · 需固定管理 Key · 免校验模式下不存在
 
 > `VL_EASE=true` 时管理面整体不注册，所有 `/v1/admin/*` 返回 `404`。
@@ -796,6 +850,36 @@ curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 删除账号（写删除墓碑，重启不会复活）。路径参数同样可以用明文 Key 或句柄 `id`。
 
 删掉任何账号（包括唯一那个）都不会影响管理面本身——管理 Key 不在账本里。
+
+#### `POST /v1/admin/accounts/{key}/reset_key` · 重置指定账号的 Key
+
+把某个账号的 Key 换成新值：**换锁不换房子**——配额、用量、倍率、
+签到状态、备注、创建时间全部保留，旧 Key 立刻失效。
+
+```
+POST /v1/admin/accounts/acc_1f2e…/reset_key
+{"key": "vl_客户自定义的key"}     # 省略整个 body（或 {"key": ""}）= 服务端随机生成
+```
+
+```json
+{
+  "account": {"id": "acc_9a8b…", "key": "vl_n********7d21", "name": "客户甲", "quota": 7.5},
+  "key": "vl_n5f3…（明文，只在这一次响应里出现）",
+  "handle": "acc_9a8b…",
+  "old_handle": "acc_1f2e…",
+  "notice": "旧 Key 已立刻失效；请立即保存新 Key，它只会出现这一次。账本里重置之前的历史流水挂在旧句柄下，需要时可用它查询"
+}
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 手填还是随机 | 不传 `key` → 生成 256 位随机 Key（推荐，避免弱 Key）；手填会自动补 `vl_` 前缀并如实回报 |
+| 旧的立刻失效 | 在账本的同一把锁内完成切换，不存在"两把钥匙都能开"的窗口 |
+| 明文只回一次 | 与建号一致；此后所有接口只回掩码。Key 是长期凭据，进了日志/历史/截屏就等于泄漏 |
+| 句柄会变 | 句柄由 Key 派生（`acc_` + Key 的 SHA-256 截断），所以重置后句柄也变，响应里给出新旧句柄 |
+| 历史流水 | 账本是追加写的，重置**不会**删掉历史；但那之前的流水挂在**旧句柄**下（重置那一笔写明了旧句柄） |
+| 公共账号 | `400`：它的 Key 来自配置项 `VIDLINK_PUBLIC_KEY`，改账本副本只会造成"面板显示一个值、实际生效另一个值" |
+| 冲突 | 目标 Key 已被占用（含"新旧相同"）→ `400` |
 
 #### `GET /v1/admin/stats`
 
@@ -1238,6 +1322,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/v1/ledger` | Key | —（自己的流水） |
 | GET | `/v1/sign` | Key | —（换一条 30 秒签名，给 URL 用） |
 | POST | `/v1/checkin` | Key | —（每日签到领配额） |
+| GET | `/v1/search?platform=&keyword=` | Key | 0.25/条（默认 20 条，可 `page`/`limit`） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 |
@@ -1249,6 +1334,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
 | PATCH | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
 | DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — |
+| POST | `/v1/admin/accounts/{key\|id}/reset_key` | 管理 Key | —（换 Key，配额与用量保留） |
 | GET | `/v1/admin/stats` | 管理 Key | — |
 | GET | `/v1/admin/quota` | 管理 Key | —（计费倍率全貌） |
 | PUT | `/v1/admin/quota` | 管理 Key | —（改倍率：逐格合并，null 恢复默认） |

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -39,6 +40,10 @@ func (s *Server) adminRoutes() []routeSpec {
 			handler: s.handleAdminPatchAccount},
 		{method: http.MethodDelete, path: "/v1/admin/accounts/{key}", admin: true,
 			handler: s.handleAdminDeleteAccount},
+		// 重置 Key：换锁不换房子（配额/用量/倍率全保留，旧 Key 立刻失效）。
+		// 用 POST 而不是 PATCH：这不是"改一个字段"，而是签发一把新钥匙并作废旧的。
+		{method: http.MethodPost, path: "/v1/admin/accounts/{key}/reset_key", admin: true,
+			handler: s.handleAdminResetKey},
 		{method: http.MethodGet, path: "/v1/admin/stats", admin: true,
 			handler: s.handleAdminStats},
 		{method: http.MethodGet, path: "/v1/admin/quota", admin: true,
@@ -436,6 +441,100 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+// resetKeyRequest 是新 Key：留空表示由服务端随机生成。
+//
+// 用指针是为了区分"没提这个字段"（=随机）与"明确给了空串"（也是随机）——
+// 两种都按随机处理，但字段名写清楚能让调用方少猜。
+type resetKeyRequest struct {
+	Key *string `json:"key"`
+}
+
+// handleAdminResetKey 重置某个账号的 Key。
+//
+// 三条设计约束：
+//
+//   - **手填或随机**：不传 `key` 就生成 256 位随机 Key（避免管理员用弱 Key）；
+//     手填时与建号同规则（统一 `vl_` 前缀、长度上限），且不能与现有 Key 冲突。
+//   - **旧 Key 立刻失效**：在账本同一把锁内完成切换，不存在"两把钥匙都能开"的窗口。
+//   - **明文只回一次**：与建号一致——此后所有接口只回掩码。这条不是洁癖：
+//     Key 是长期凭据，出现在日志/浏览器历史/截屏里就等于泄漏。
+func (s *Server) handleAdminResetKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	acct, ok := s.accounts.Resolve(r.PathValue("key"))
+	if !ok {
+		writeError(w, core.NotFound("", "账号不存在"))
+		return
+	}
+	// 公共账号的 Key 来自配置（VIDLINK_PUBLIC_KEY），改账本里的副本只会造成
+	// "面板显示一个 Key、实际生效另一个 Key"的分裂状态。
+	if pub := strings.TrimSpace(s.cfg.PublicKey); pub != "" && acct.Key == pub {
+		writeError(w, core.BadInput("", "公共账号的 Key 来自配置项 VIDLINK_PUBLIC_KEY，"+
+			"不能用这个接口重置：请改配置后重启（改账本副本会造成“面板显示一个值、实际生效另一个值”）"))
+		return
+	}
+
+	var req resetKeyRequest
+	if err := decodeStrictJSON(w, r, &req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, core.BadInput("", "请求体不合法: %v", err))
+		return
+	}
+
+	newKey := ""
+	generated := true
+	prefixed := false
+	if req.Key != nil {
+		if v := strings.TrimSpace(*req.Key); v != "" {
+			generated = false
+			newKey = v
+			if len(newKey) > maxAPIKeyLen {
+				writeError(w, core.BadInput("", "Key 最长 %d 个字符（当前 %d）", maxAPIKeyLen, len(newKey)))
+				return
+			}
+			if !strings.HasPrefix(newKey, keyPrefix) {
+				newKey = keyPrefix + newKey
+				prefixed = true
+			}
+		}
+	}
+	if generated {
+		var err error
+		newKey, err = newAPIKey()
+		if err != nil {
+			writeError(w, core.E(core.KindInternal, "", "admin", "生成 Key 失败", err))
+			return
+		}
+	}
+
+	a, err := s.accounts.ResetKey(acct.Key, newKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, account.ErrNotFound):
+			writeError(w, core.NotFound("", "账号不存在"))
+		case errors.Is(err, account.ErrDuplicate):
+			writeError(w, core.BadInput("", "新 Key 已被占用（或与原 Key 相同），请换一个"))
+		default:
+			writeError(w, core.E(core.KindInternal, "", "admin", "重置 Key 失败", err))
+		}
+		return
+	}
+
+	resp := map[string]any{
+		"account":    accountViewOf(a.Public()),
+		"key":        a.Key, // 明文只在这里出现一次
+		"handle":     a.ID,  // 句柄随 Key 派生，一并给出，免得调用方自己算
+		"old_handle": acct.ID,
+		"notice": "旧 Key 已立刻失效；请立即保存新 Key，它只会出现这一次。" +
+			"账本里重置之前的历史流水挂在旧句柄下，需要时可用它查询",
+	}
+	if !generated && prefixed {
+		resp["notice"] = fmt.Sprintf("你指定的 Key 没有 %s 前缀，已自动补成下面这个值；"+
+			"旧 Key 已立刻失效，请保存新 Key（只会出现这一次）", keyPrefix)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {

@@ -672,7 +672,8 @@ function vlSignUrl(prefix, key, url, ts) {
       const note = el("div", "warnbox");
       note.style.cssText = "border:1px solid #4a3a12;border-radius:8px;padding:8px;margin-top:8px";
       note.textContent = "公共账号：Key 公开（" + (a.key || "") + "），配额按「每 IP 每日限额」计算，" +
-        "不使用这里的余额；停用它即关闭公共入口。用量与调用次数照常累计，供你观察免费流量。";
+        "不使用这里的余额；停用它即关闭公共入口。用量与调用次数照常累计，供你观察免费流量。" +
+        "它的 Key 来自配置项 VIDLINK_PUBLIC_KEY，改配置后重启即可，不能用「重置 Key」改。";
       card.appendChild(note);
       card.appendChild(opsBlock(a, () => {
         const only = el("div", "acct-acts");
@@ -749,6 +750,7 @@ function vlSignUrl(prefix, key, url, ts) {
       acts.appendChild(mk(a.disabled ? "启用账号" : "停用账号", "toggle"));
       acts.appendChild(mk("查看详情", "get"));
       acts.appendChild(mk("查看流水", "ledger"));
+      acts.appendChild(mk("重置 Key", "resetkey"));
       const del = mk("删除账号", "del", "danger");
       del.style.marginLeft = "auto";
       acts.appendChild(del);
@@ -877,6 +879,48 @@ function vlSignUrl(prefix, key, url, ts) {
         case "ledger": {
           $("#ledgerWho").value = id;
           await loadLedger();
+          return;
+        }
+        case "resetkey": {
+          // 手填或随机：留空 = 服务端生成 256 位随机 Key（推荐，避免弱 Key）。
+          const typed = prompt("重置 " + (a.name || a.id) + " 的 Key：\n\n" +
+            "· 留空 → 由服务端随机生成一个 256 位 Key（推荐）\n" +
+            "· 也可以手填（会自动补 vl_ 前缀）\n\n" +
+            "旧 Key 会立刻失效；配额、用量、倍率、签到状态全部保留。");
+          if (typed === null) return;               // 用户取消
+          const want = typed.trim();
+          if (want && !confirm("确认把 Key 重置为你填写的这个值？\n\n" +
+              "旧 Key 会立刻失效，正在用旧 Key 的调用方需要换成新 Key。")) return;
+          setKeyState("正在重置 Key…", false);
+          const r = await api("/v1/admin/accounts/" + encodeURIComponent(id) + "/reset_key", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(want ? { key: want } : {}),
+          });
+          show(r);
+          if (r.status !== 200) { setKeyState("重置 Key 失败：" + errText(r), true); return; }
+          const d = r.body || {};
+          await loadAccounts();
+          const card = btn.closest(".acct");
+          if (card && d.key) {
+            // 明文只出现这一次：摆在这张卡片最上方，给一键复制，并写清旧句柄。
+            const box = el("div", "warnbox");
+            box.style.cssText = "border:1px solid #4a3a12;border-radius:8px;padding:8px;margin-top:8px";
+            box.appendChild(el("div", null, "新 Key（只显示这一次，请立即保存）："));
+            const line = el("div", "mono", d.key);
+            line.style.cssText = "font-size:15px;word-break:break-all;margin:6px 0";
+            box.appendChild(line);
+            const copy = el("button", null, "复制新 Key");
+            copy.addEventListener("click", async () => {
+              try { await navigator.clipboard.writeText(d.key); copy.textContent = "已复制"; }
+              catch (_) { copy.textContent = "复制失败，请手动选中"; }
+            });
+            box.appendChild(copy);
+            box.appendChild(el("div", "hint", (d.notice || "") +
+              "（旧句柄 " + (d.old_handle || "") + " → 新句柄 " + (d.handle || "") + "）"));
+            card.insertBefore(box, card.firstChild);
+          }
+          setKeyState("Key 已重置（新句柄 " + (d.handle || "") + "）", false);
           return;
         }
         case "del": {

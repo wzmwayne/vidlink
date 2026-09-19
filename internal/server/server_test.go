@@ -2033,7 +2033,9 @@ func TestAdminPanelStaysSelfContained(t *testing.T) {
 			t.Errorf("管理面板引用了外部资源: %q", forbidden)
 		}
 	}
-	if len(body) > 60*1024 {
+	// 上限 70KB：面板一个外链都不放（上面刚查过），体积随功能增长是正常的；
+	// 加"重置 Key"（按钮 + 分支 + 明文一次性展示/复制）后从 60KB 抬到 70KB。
+	if len(body) > 70*1024 {
 		t.Errorf("管理面板过大（%d 字节），内嵌资源应保持精简", len(body))
 	}
 

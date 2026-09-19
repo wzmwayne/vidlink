@@ -315,8 +315,10 @@ func TestDocsListEveryEndpoint(t *testing.T) {
 	for _, path := range []string{
 		"/v1/version", "/v1/health", "/v1/platforms", "/healthz", "/readyz",
 		"/v1/usage", "/v1/info", "/v1/links", "/v1/detail", "/v1/batch/links",
+		"/v1/search",
 		"/v1/checkin", "/v1/ledger", "/v1/sign",
 		"/v1/admin/accounts", "/v1/admin/stats", "/v1/admin/quota", "/v1/admin/ledger",
+		"/v1/admin/accounts/{key}/reset_key",
 		"/v1/admin/sign",
 		"/v1/proxy", "/tip.png",
 	} {

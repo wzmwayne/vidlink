@@ -317,11 +317,26 @@ func (s *Store) persist(a *Account) error { return s.appendAccount(a, nil) }
 // 而快照与流水本来就是同一次业务动作的两面，分两次写只会引入
 // "一个成功一个失败"的中间态——那时账本与流水就对不上了。
 func (s *Store) appendAccount(a *Account, e *Entry) error {
+	if a == nil {
+		return s.appendRecords(nil, e)
+	}
+	return s.appendRecords([]*Account{a}, e)
+}
+
+// appendRecords 是 appendAccount 的多记录版本。
+//
+// 为什么需要"一次写多条"：重置 Key 落盘时要同时写**旧 Key 的墓碑**与
+// **新 Key 的快照**。分两次写就会留下"只写了墓碑"或"只写了快照"的中间态，
+// 回放出来要么账号凭空消失，要么两把钥匙都能开——账本必须一次落定。
+func (s *Store) appendRecords(as []*Account, e *Entry) error {
 	if s.f == nil {
 		return nil
 	}
 	var buf []byte
-	if a != nil {
+	for _, a := range as {
+		if a == nil {
+			continue
+		}
 		b, err := json.Marshal(a)
 		if err != nil {
 			return err
@@ -804,6 +819,64 @@ func (s *Store) Delete(key string) error {
 		return err
 	}
 	return nil
+}
+
+// ResetKey 把账号的 Key 换成新值（newKey 不能为空，由调用方决定是手填还是随机）。
+//
+// 语义是**换锁不换房子**：配额、用量、倍率、签到状态、备注、创建时间全部保留，
+// 只有"哪把钥匙能开"变了；旧 Key 在同一个锁内立刻失效——同一把锁不能有两把钥匙。
+//
+// 句柄（ID）由 Key 派生（见 Handle），所以重置后句柄也会变，并随返回值一起给出。
+// 这带来一个必须讲清楚的后果：**账本里的历史流水挂在旧 Key/旧句柄下**，
+// 新句柄只从这次重置之后的记录开始累积。重置那一笔写明了旧句柄，因此
+// 管理员仍可按旧句柄查回历史（账本本来就是追加写的，不会丢）。
+func (s *Store) ResetKey(oldKey, newKey string) (Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.accounts[oldKey]
+	if !ok {
+		return Account{}, ErrNotFound
+	}
+	if newKey == "" {
+		return Account{}, errors.New("新 Key 不能为空")
+	}
+	if _, taken := s.accounts[newKey]; taken {
+		// 包含"新旧相同"这种情况：那个 Key 已经被占着。
+		return Account{}, ErrDuplicate
+	}
+
+	before := *a
+	oldHandle := a.ID
+	cp := *a
+	cp.Key = newKey
+	cp.ID = Handle(newKey)
+	cp.UpdatedAt = s.now()
+
+	delete(s.accounts, oldKey)
+	delete(s.byHandle, oldHandle)
+	s.accounts[newKey] = &cp
+	s.byHandle[cp.ID] = newKey
+
+	e := Entry{
+		Time: cp.UpdatedAt, Type: EntrySet, Key: newKey, ID: cp.ID, Name: cp.Name,
+		Units: 0, Balance: cp.Quota, Used: cp.Used, Calls: cp.Calls,
+		Detail: fmt.Sprintf("重置 Key（旧句柄 %s → 新句柄 %s；配额与用量保留）", oldHandle, cp.ID),
+	}
+	s.ledgerAdd(e)
+	// 一次性写两条：旧 Key 的墓碑（回放时删掉它）+ 新 Key 的快照。
+	tombstone := &Account{Key: oldKey, Deleted: true, Disabled: true,
+		CreatedAt: before.CreatedAt, UpdatedAt: cp.UpdatedAt}
+	if err := s.appendRecords([]*Account{tombstone, &cp}, &e); err != nil {
+		// 落盘失败回滚：宁可"没重置"，也不能出现"内存里换了、文件里没换"
+		delete(s.accounts, newKey)
+		delete(s.byHandle, cp.ID)
+		s.accounts[oldKey] = &before
+		s.byHandle[oldHandle] = oldKey
+		s.ledgerDrop()
+		return Account{}, err
+	}
+	return cp, nil
 }
 
 // --- 配额计量 ---

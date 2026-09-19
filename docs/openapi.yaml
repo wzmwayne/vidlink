@@ -154,6 +154,43 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/Usage" } } }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /v1/search:
+    get:
+      tags: [计量]
+      summary: 按关键词搜索（bilibili / jianpian）：元信息 + ID，不含直链
+      description: |
+        按 **返回条数** 计价（默认 0.25/条，与 info 的半价）；空结果不扣。
+        返回的 items[].id 才是拿去 /v1/detail、/v1/links 的 ID。
+        不支持搜索的平台返回 400 并说明原因，见 /v1/platforms 的 search/search_reason。
+      operationId: search
+      parameters:
+        - name: platform
+          in: query
+          required: true
+          schema: { type: string, enum: [bilibili, jianpian] }
+        - name: keyword
+          in: query
+          required: true
+          description: 关键词（1~64 字符）；别名 q
+          schema: { type: string, maxLength: 64 }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 1 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResult" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/Quota" }
+
   /v1/info:
     get:
       tags: [计量]
@@ -440,6 +477,36 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/admin/accounts/{key}/reset_key:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        description: 账号的明文 Key，或公开句柄 id（acc_…）
+        schema: { type: string }
+    post:
+      tags: [管理]
+      summary: 重置账号 Key（手填或随机；配额与用量保留，旧 Key 立刻失效）
+      description: |
+        不传请求体（或 `{"key": ""}`）= 服务端生成 256 位随机 Key。
+        明文 Key **只在这一次响应里出现**；句柄由 Key 派生，因此会变，
+        响应里给出 handle / old_handle。公共账号（VIDLINK_PUBLIC_KEY）拒绝重置。
+      operationId: adminResetAccountKey
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResetKeyRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResetKeyResult" }
+        "400": { $ref: "#/components/responses/BadInput" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /v1/admin/stats:
     get:
       tags: [管理]
@@ -612,7 +679,52 @@ components:
       in: query
       required: false
       description: 平台标识（与 id 一起使用）
-      schema: { type: string, enum: [douyin, bilibili, kuaishou, xiaohongshu] }
+      schema: { type: string, enum: [douyin, bilibili, kuaishou, xiaohongshu, jianpian] }
+    SearchResult:
+      type: object
+      properties:
+        platform: { type: string }
+        keyword: { type: string }
+        page: { type: integer }
+        limit: { type: integer }
+        count: { type: integer }
+        total: { type: integer, description: 平台声明的匹配总数（可能被截断） }
+        has_more: { type: boolean }
+        next: { type: string, description: 下一页的现成参数 }
+        cost: { type: number, description: 本次扣减 = 0.25 × count × 账号倍率；空结果不出现 }
+        cached: { type: boolean }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              platform: { type: string }
+              type: { type: string, enum: [video, series, movie] }
+              id: { type: string, description: 拿去 detail/links 的 ID }
+              title: { type: string }
+              desc: { type: string }
+              cover: { type: string }
+              url: { type: string }
+              score: { type: number }
+              year: { type: integer }
+              category: { type: string }
+              latest: { type: string }
+              actors: { type: array, items: { type: string } }
+              detail: { type: string, description: 现成的下一步调用提示 }
+    ResetKeyRequest:
+      type: object
+      properties:
+        key:
+          type: string
+          description: 新 Key（可省 vl_ 前缀，服务端自动补）；留空 = 随机生成
+    ResetKeyResult:
+      type: object
+      properties:
+        account: { $ref: "#/components/schemas/Account" }
+        key: { type: string, description: 明文新 Key，只在这里出现一次 }
+        handle: { type: string }
+        old_handle: { type: string }
+        notice: { type: string }
     ContentID:
       name: id
       in: query
