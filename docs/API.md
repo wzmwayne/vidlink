@@ -1190,7 +1190,14 @@ VIDLINK_PROXY_ALLOW_HOSTS=upos-sz-mirrorcos.bilivideo.com,https://upos-sz-mirror
 - 直链带 `Referer` 防盗链要求，必须透传 `headers`；
 - 视频与音频分离，`needs_mux: true` 时要先混流；
 - 直链有效期约 2 小时；
-- **画面内的强制水印无法去除**（平台侧烧进画面，业界普遍如此）。
+- **画面内的强制水印无法去除**（平台侧烧进画面，业界普遍如此）；
+- **番剧（PGC）支持 ep 链接**：`/bangumi/play/ep733316` 可直接解析（也支持
+  `platform=bilibili&id=ep733316` 与 BV / av 链接）。实现是"入口走 PGC、
+  取流复用普通通道"：先按 `ep_id` 查季信息拿到该集的 `bvid/cid`，
+  再走原来的 `view → playurl`。实测匿名最高 **1080P**，且是整集（不是试看）；
+  会员/付费/未放送的集数会返回 `403` 并说明原因。
+  **季链接（`ss…`）会被拒绝**：一部番几百集，猜"第 1 集"是错的——
+  请用具体一集的地址。
 
 ### 抖音
 

@@ -249,7 +249,7 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | POST | `/v1/checkin` | Key | — | **每日签到领配额**（每天一次，`daily_grant`/`grant_cap` 由管理员设置） |
 | GET | `/v1/usage` | Key | — | 自己的用量；`checkin.enabled` 明确告知**可否签到** |
 | GET | `/v1/search?platform=&keyword=` | Key | **0.25/条** | 按关键词搜索（默认 20 条、可翻页），只给元信息 + ID，直链再走 links/detail |
-| GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 | 元信息 + 档位列表，**无直链** |
+| GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 | 元信息 + 档位列表，**无直链**；B 站番剧用 `ep` 链接（季 `ss` 链接会提示改用 ep） |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 | **只有直链** |
 | GET | `/v1/detail?url=` | Key | 1.2 / 抖音 1.5 | 元信息 + 全部档位直链 |
 | POST | `/v1/batch/links` | Key | 0.75/条 | 批量直链，5~20 条，**无抖音** |
