@@ -397,3 +397,77 @@ func TestUpdateRejectsNegativeQuota(t *testing.T) {
 		t.Errorf("配额应为 0，得到 %v", got.Quota)
 	}
 }
+
+// TestByHandleIndex：句柄索引是签名凭据的认证路径，必须与账本永远一致。
+//
+// 索引是派生数据的缓存，风险全在"创建/删除/回放三处漏了一处"，
+// 所以这里把三种变化都走一遍，并且额外验证：回放时**以 Key 重算的句柄**
+// 为准（账本里那个 id 字段即使被人手改成垃圾也不影响）。
+func TestByHandleIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.jsonl")
+
+	s, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"vl_alpha", "vl_beta", "vl_gamma"} {
+		if _, err := s.Create(Account{Key: k, Quota: 10, Multiplier: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, k := range []string{"vl_alpha", "vl_beta", "vl_gamma"} {
+		a, ok := s.ByHandle(Handle(k))
+		if !ok || a.Key != k {
+			t.Fatalf("ByHandle(%s) = %+v, ok=%v，想要 Key=%q", Handle(k), a, ok, k)
+		}
+		if len(a.ID) != 20 {
+			t.Fatalf("句柄长度 = %d，想要 20（%q）", len(a.ID), a.ID)
+		}
+	}
+	if err := s.Delete("vl_beta"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ByHandle(Handle("vl_beta")); ok {
+		t.Error("账号已删除，句柄索引里不该还留着")
+	}
+	if _, ok := s.ByHandle(""); ok {
+		t.Error("空句柄不该命中任何账号")
+	}
+	if _, ok := s.ByHandle("acc_0000000000000000"); ok {
+		t.Error("不存在的句柄不该命中")
+	}
+	_ = s.Close()
+
+	// 回放：把 id 字段写成垃圾，句柄仍应按 Key 重算出来
+	raw := `{"key":"vl_delta","id":"acc_死数据","quota":5,"multiplier":1}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(raw); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	s2, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("回放失败: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	if a, ok := s2.ByHandle(Handle("vl_delta")); !ok || a.ID != Handle("vl_delta") {
+		t.Fatalf("回放后按句柄找不到 vl_delta：%+v ok=%v", a, ok)
+	}
+	if _, ok := s2.ByHandle("acc_死数据"); ok {
+		t.Error("账本里的 id 字段不可信，不该被当成句柄索引")
+	}
+	for _, k := range []string{"vl_alpha", "vl_gamma"} {
+		if _, ok := s2.ByHandle(Handle(k)); !ok {
+			t.Errorf("回放后按句柄找不到 %s", k)
+		}
+	}
+	if _, ok := s2.ByHandle(Handle("vl_beta")); ok {
+		t.Error("回放后已删除账号的句柄不该复活")
+	}
+}

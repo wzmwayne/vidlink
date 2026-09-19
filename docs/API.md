@@ -39,7 +39,7 @@ export ADMIN=vl_admin_xxx # 管理 Key（服务端 VIDLINK_ADMIN_KEY 配的那�
 1. [快速开始](#1-快速开始)
 2. [通用约定](#2-通用约定)
 3. [端点详解](#3-端点详解)
-   - 含公共 Key、每日签到、配额流水、管理面（账号 / 统计 / **计费倍率可编辑** / 流水）与媒体代理
+   - 含签名凭据（`/v1/sign`）、公共 Key、每日签到、配额流水、管理面（账号 / 统计 / **计费倍率可编辑** / 流水 / 管理签名）与媒体代理
 4. [数据模型](#4-数据模型)
 5. [各平台差异](#5-各平台差异)
 6. [典型场景](#6-典型场景)
@@ -53,7 +53,9 @@ export ADMIN=vl_admin_xxx # 管理 Key（服务端 VIDLINK_ADMIN_KEY 配的那�
 ### 一条链接 → 直链
 
 ```bash
-curl -H "X-API-Key: $KEY" \
+# 推荐的传法：现算一张签名放进请求头（§2.2）。下面这条用仓库里的示例脚本，
+# 等价于手写 HMAC-SHA256；临时试用也可以直接 -H "X-API-Key: vl_public"。
+curl -H "X-API-Key: $(sh examples/sign.sh "$KEY")" \
   "$BASE/v1/links?url=https://v.douyin.com/xxxx/"
 ```
 
@@ -64,6 +66,9 @@ curl -H "X-API-Key: $KEY" \
   "headers": {"Referer": "https://www.douyin.com/", "User-Agent": "..."}
 }
 ```
+
+更完整的客户端示例（Python / Node / Shell 三份）见 §2.2 末的
+[现成示例代码](#现成示例代码可直接跑仓库里就有的六个文件)。
 
 ### 四个计量端点怎么选
 
@@ -130,23 +135,134 @@ www.bilibili.com/video/BV1294y1Y7tU/             ← 从地址栏/分享面板�
 
 ### 2.2 鉴权
 
-除公开端点外，所有请求都要带 API Key，三种传法等价：
+除公开端点外，所有请求都要带凭据。**推荐的传法是签名**：它只有几十秒有效期，
+即便泄漏（请求日志、截屏、抓包、聊天记录、浏览器历史）也换不来长期访问；
+明文 Key 是长期有效的，只建议在本地临时试一下时用，而且**只能走请求头**。
 
-| 方式 | 示例 |
-| --- | --- |
-| 请求头（推荐） | `X-API-Key: vl_xxx` |
-| Bearer | `Authorization: Bearer vl_xxx` |
-| 查询参数 | `?key=vl_xxx`（会进访问日志与浏览器历史，仅测试用） |
+| 传法 | 示例 | 有效期 | 建议 |
+| --- | --- | --- | --- |
+| 签名 + 请求头 | `-H "X-API-Key: acc_<句柄>.<时间戳>.<签名>"` | 约 30 秒 | ✅ **推荐**（vidlink 自己的两个页面就是这么发的） |
+| 签名 + URL | `?key=acc_<句柄>.<时间戳>.<签名>` | 约 30 秒 | ✅ **推荐**（`<a>`/`<video>`/原生下载加不了请求头，这是唯一可行的传法） |
+| 明文 Key + 请求头 | `-H "X-API-Key: vl_xxx"` | 长期 | ⚠️ 简单场景、本地调试 |
+| 明文 Key + Bearer | `-H "Authorization: Bearer vl_xxx"` | 长期 | ⚠️ 同上 |
+| 明文 Key + URL | `?key=<明文 Key>` | — | ❌ **会被拒**（`403 key_format`） |
+
+换句话说：**凭据进 URL 就必须是签名**；请求头里两种都收，按形态识别。
+服务端与两个内嵌页面都不依赖明文 Key 的传递。
+
+#### 签名凭据怎么算
+
+```
+凭据 = 句柄 . 时间戳 . 签名
+句柄 = "acc_" + hex(SHA-256(Key))[:16]           （16 位小写十六进制）
+时间戳 = unix 秒，写成 8 位小写十六进制（如 68a3e658）
+签名 = hex(HMAC-SHA256(Key, "句柄|时间戳hex"))    完整 64 位，不截断
+```
+
+例（`Key = vl_demo_key`，`时间戳 = 0x68a3e658`）：
+
+```
+acc_17090c89a1ca6ee3.68a3e658.35c1daf1f0dfefd2bb15906d25ff8e6e5dfaf2ce9757749b7ccbcb0c4a2a46c9
+```
+
+服务器怎么校验（**不需要反推、也不需要遍历**）：
+
+1. 读出票面的时间戳（明文的），算 `|服务器时间 − 时间戳| ≤ 30` 秒；
+2. 用该句柄对应账号的 Key 把 `句柄|时间戳hex` 重新算一遍 HMAC 比对（一次正向计算）。
+
+时间戳与句柄都在签名原料里，所以改期、换句柄都会对不上；
+没有 Key 则算不出签名。容差与有效期由 `VIDLINK_SIG_TTL` 控制（默认 30 秒）。
+
+两种拿到签名的方式，任选：
+
+```bash
+# A. 问服务端要（最省事）：GET /v1/sign 见 §3.6a
+Q=$(curl -s -H "X-API-Key: $KEY" "$BASE/v1/sign" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')
+curl "$BASE/v1/links?url=$URL&$Q"
+
+# B. 本机自己签（少一次往返；三个示例脚本见下）
+sh examples/sign.sh "$KEY" "" acc_ /v1/links
+```
+
+#### 现成示例代码（可直接跑，仓库里就有的六个文件）
+
+| 文件 | 语言 / 依赖 | 作用 |
+| --- | --- | --- |
+| `examples/sign.py` | Python 3（仅标准库） | 生成签名凭据、拼 URL |
+| `examples/sign.js` | Node 18+ / 浏览器（零依赖） | 同上（**页面内嵌的就是这套实现**） |
+| `examples/sign.sh` | POSIX sh + openssl | 同上 |
+| `examples/parse.py` | Python 3 | 完整解析客户端：`info`/`links`/`detail`、用量、代理下载 |
+| `examples/parse.js` | Node 18+ | 同上 |
+| `examples/parse.sh` | sh + curl | 同上（不需要 jq） |
+
+```bash
+export VIDLINK_BASE=https://vl.wzml.cc.cd
+export VIDLINK_KEY=vl_xxx
+
+# 解析（三种语言，输出一致）
+python3 examples/parse.py --url 'https://www.bilibili.com/video/BV1xx411c7mD'
+node    examples/parse.js --url 'https://www.bilibili.com/video/BV1xx411c7mD' --endpoint info
+sh      examples/parse.sh --url 'https://www.bilibili.com/video/BV1xx411c7mD' --download out.mp4
+python3 examples/parse.py --usage          # 看自己的配额
+
+# 只要签名（三份实现输出逐字符相同，已由仓库测试保证）
+python3 examples/sign.py "$VIDLINK_KEY" 1755571800
+node    examples/sign.js "$VIDLINK_KEY" 1755571800
+sh      examples/sign.sh "$VIDLINK_KEY" 1755571800
+```
+
+最小内联版（不想打开文件时抄这段）：
+
+```python
+# Python：签名 + 调用
+import hashlib, hmac, time, urllib.request
+
+def credential(key, ts=None):
+    ts = ts or int(time.time())
+    h = "acc_" + hashlib.sha256(key.encode()).hexdigest()[:16]
+    th = "%08x" % ts
+    sig = hmac.new(key.encode(), ("%s|%s" % (h, th)).encode(), hashlib.sha256).hexdigest()
+    return "%s.%s.%s" % (h, th, sig)
+
+req = urllib.request.Request(BASE + "/v1/links?url=" + urllib.parse.quote(url),
+                             headers={"X-API-Key": credential(KEY)})
+print(json.load(urllib.request.urlopen(req)))
+```
+
+```js
+// 浏览器：页面已内嵌同一实现（VLSign），控制台里可直接用
+const cred = VLSign.credential("acc_", key);
+const r = await fetch(base + "/v1/links?url=" + encodeURIComponent(url),
+                      { headers: { "X-API-Key": cred } });
+console.log(await r.json());
+
+// <a download> / <video> 这种加不了请求头的场景：签名进 URL
+const href = VLSign.signUrl("acc_", key, "/v1/proxy?url=" + encodeURIComponent(direct));
+
+// Node：同一份文件也能直接 require（examples/sign.js 同时导出 CommonJS）
+const S = require("./examples/sign.js");
+console.log(S.credential("acc_", key));
+```
+
+失败一律 `403`，并且**不区分**"Key 不存在"与"Key 错误"（避免被用来枚举
+有效 Key）。签名相关的错误码另给，便于自查：
+
+| `error.kind` | 含义 | 怎么办 |
+| --- | --- | --- |
+| `key_format` | `?key=` 不是签名形态（例如放了明文 Key） | 改用请求头，或用 `GET /v1/sign` 换签名 |
+| `signature_expired` | 时间戳太旧 | 重新签发；脚本请每次现签（示例都是现签） |
+| `signature_future` | 时间戳在未来 | 用 `/v1/health` 的 `time` 对本机时钟 |
+| `signature_invalid` | 签名对不上 | Key 不对，或凭据被改过 |
+| `key_scope` | 拿管理签名打了解析接口（或反之） | 账号用 `acc_`，管理用 `adm_` |
+
+```json
+{"error": {"kind": "key_format", "message": "URL 里的 key 只能是签名凭据 …", "request_id": "..."}}
+```
 
 Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回一次**，
 之后所有接口只返回掩码；若丢失，请删除该账号并重建。
-
-失败一律 `403` + `kind: "forbidden"`，并且**不区分**"Key 不存在"与"Key 错误"
-（避免被用来枚举有效 Key）：
-
-```json
-{"error": {"kind": "forbidden", "message": "API Key 无效", "request_id": "..."}}
-```
+若创建时传入的 Key 没有 `vl_` 前缀，服务端会自动补上，并在响应里
+用 `notice` 说明最终值（已有账号的 Key 不会被改动）。
 
 无 Key 时额外返回 `WWW-Authenticate: Bearer realm="vidlink"`。
 
@@ -291,9 +407,14 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
 {
   "status": "ok", "version": "v0.88", "api_version": "v1",
   "uptime_sec": 3821, "requests": 10422, "errors": 37,
+  "time": 1755571820, "sign_ttl": 30,
   "cache": {"entries": 128, "hits": 9014, "misses": 1408, "coalesced": 52, "loads": 1408}
 }
 ```
+
+`time`（unix 秒）与 `sign_ttl`（秒）是给签名排障用的：报 `signature_expired`
+或 `signature_future` 时，用本机 `date +%s` 与 `time` 一减就知道时钟偏了多少
+（本机自己签名的场景下这是最常见的原因）。
 
 ### 3.3 `GET /v1/platforms` · 公开 · 不消耗配额
 
@@ -344,6 +465,47 @@ Key 由管理 Key 创建（见 §3.9）。**Key 的明文只在创建时返回�
              "batch_min": 5, "batch_max": 20}
 }
 ```
+
+### 3.6a `GET /v1/sign` · 需 Key · 不消耗配额 · 免校验模式下不存在
+
+用当前 Key 换一条**签名凭据**，专门给"浏览器原生请求"用——
+`<a download>`、`<video>`、混流器的 `fetch` 都加不了自定义请求头，
+只能把凭据放进 URL，而 URL 里只接受签名。
+
+```bash
+curl -H "X-API-Key: $KEY" "$BASE/v1/sign"
+```
+
+```json
+{
+  "key": "acc_17090c89a1ca6ee3.68a3e658.35c1daf1f0dfefd2bb15906d25ff8e6e5dfaf2ce9757749b7ccbcb0c4a2a46c9",
+  "query": "key=acc_17090c89a1ca6ee3.68a3e658.35c1da…",
+  "type": "account",
+  "ttl": 30,
+  "issued_at": 1755571800,
+  "expires_at": 1755571830,
+  "note": "签名有效期 30 秒，且不绑定具体请求…"
+}
+```
+
+用法：把 `query` 原样拼到任意需要 Key 的 URL 后面。
+
+```bash
+# 先换签名，再拼进 URL（<a>/<video> 场景）
+Q=$(curl -s -H "X-API-Key: $KEY" "$BASE/v1/sign" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')
+curl "$BASE/v1/usage?$Q"
+```
+
+三点须知：
+
+- **不绑定具体请求**：拿到这条签名的人在有效期内可以调用该账号的**任意**
+  接口，消耗记在该账号账上并出现在它的流水里。所以它只适合"马上要用"。
+- **有效期就是容差**：`|服务器时间 − 时间戳| ≤ ttl`（默认 30 秒，
+  `VIDLINK_SIG_TTL` 可调）。当服务端与验证端是同一台机器时不存在时钟偏差，
+  这个容差主要是留给"签发后隔一会儿才用"和"本机自己签"的场景。
+- **代理下载要留神续传**：浏览器对大文件的断点续传会用同一个 URL 再发一次
+  请求，如果已经超过有效期就会 `403 signature_expired`。大文件场景请把
+  `VIDLINK_SIG_TTL` 调大（如 300）。
 
 ### 3.7 三个计量端点
 
@@ -553,7 +715,7 @@ curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 | 请求里的 Key == `VIDLINK_ADMIN_KEY` | 放行 |
 | 是账本里的账号 Key（哪怕配额很高） | `403 forbidden` |
 | 没有配置 `VIDLINK_ADMIN_KEY` | `403 forbidden`，message 里点名该配置项 |
-| 传 Key 的方式 | 与业务端点一致：`X-API-Key` 头 / `Authorization: Bearer` / `?key=` |
+| 传 Key 的方式 | 明文走 `X-API-Key` / `Authorization: Bearer`；URL 里只收**管理签名** `?key=adm_…`（`GET /v1/admin/sign` 换取） |
 
 由此推出的两条性质：
 
@@ -590,6 +752,9 @@ curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 请求体里出现未知字段（例如老接口的 `admin`）会返回 `400`，而不是被静默忽略。
 
 - 不填 `key` 时自动生成 256 位随机 Key；
+- 填了 `key` 但**没有 `vl_` 前缀**时，服务端会自动补上，并在响应里用
+  `notice` 说明最终值（`key` 字段给的就是补好之后的那个）。已有账号的 Key
+  不会被改动——改 Key 等于把正在用的凭据作废；
 - `quota` = 初始配额；`multiplier` 缺省为 `1.0`（**不是 0**，0 是"不扣配额"）；
 - 响应 `201`：
 
@@ -647,11 +812,14 @@ curl -X POST -H "X-API-Key: $KEY" $BASE/v1/checkin
 #### `GET /v1/admin/ledger` · 不消耗配额
 
 配额流水：**不带条件就是总账单**（全部账号的汇总 + 最近流水），
-带 `id=`（句柄）或 `key=`（明文 Key）则只读那个账号。
+带 `account=`（句柄 `acc_…` 或明文 Key，`id=` 是同义的旧参数名）则只读那个账号。
+
+> 参数名不是 `key=`：那个名字在这里是"凭据"的意思，而 URL 里只收签名；
+> 用 `?key=<明文>` 会被当成一次认证尝试并因格式错误 `403`。
 
 ```bash
 curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?limit=100'
-curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980&type=set'
+curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?account=acc_1f2e3d4c5b6a7980&type=set'
 ```
 
 ```json
@@ -663,13 +831,40 @@ curl -H "X-API-Key: $ADMIN" '$BASE/v1/admin/ledger?id=acc_1f2e3d4c5b6a7980&type=
                "balance": 198.8, "detail": "管理员增加 100 配额"}],
   "totals": {"add": {"count": 1, "units": 100}},
   "unit": "配额", "types": {"…": "…"}, "limit_max": 500,
-  "note": "流水只保留最近若干条，汇总为全量口径；本接口不消耗配额。不带 id/key 即总账单"
+  "note": "流水只保留最近若干条，汇总为全量口径；本接口不消耗配额。不带 account/id 即总账单"
 }
 ```
 
-- `scope` 为 `all`（总账单）或 `account`；不带 `id`/`key` 时是前者；
-- 参数与用户接口一致（`limit` / `type`），另加 `id`（句柄 `acc_…`）或 `key`（明文 Key）；
+- `scope` 为 `all`（总账单）或 `account`；不带 `account`/`id` 时是前者；
+- 参数与用户接口一致（`limit` / `type`），另加 `account`（句柄 `acc_…` 或明文 Key；`id` 同义）；
 - 账号不存在 → `404`；不是管理 Key → `403`；免校验模式下整条路由不存在 → `404`。
+
+#### `GET /v1/admin/sign` · 不消耗配额
+
+用管理 Key 换一条**管理签名**（`adm_…`），给"URL 里需要凭据"的场景用：
+管理面板的接口直连链接就是这样生成的（页面本地算签名，链接约 30 秒有效）。
+
+```bash
+curl -H "X-API-Key: $ADMIN" "$BASE/v1/admin/sign"
+```
+
+```json
+{
+  "key": "adm_9c1f4e2ab7d35f60.68a3e658.2f7b…（64 位签名）",
+  "query": "key=adm_9c1f4e2ab7d35f60.68a3e658.2f7b…",
+  "type": "admin", "ttl": 30,
+  "issued_at": 1755571800, "expires_at": 1755571830
+}
+```
+
+```bash
+# 拿一条管理签名去打只读管理接口（URL 里没有明文管理 Key）
+Q=$(curl -s -H "X-API-Key: $ADMIN" "$BASE/v1/admin/sign" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')
+curl "$BASE/v1/admin/stats?$Q"
+```
+
+- 管理签名只能在 `/v1/admin/*` 上用；账号签名（`acc_`）打管理接口会 `403 key_scope`，反之亦然。
+- 句柄必须是由 `VIDLINK_ADMIN_KEY` 派生出来的那一个，否则 `403 key_invalid`（换了管理 Key，旧签名立刻失效）。
 
 #### `GET /v1/admin/quota` · 不消耗配额
 
@@ -1041,6 +1236,7 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/readyz` | 公开 | — |
 | GET | `/v1/usage` | Key | — |
 | GET | `/v1/ledger` | Key | —（自己的流水） |
+| GET | `/v1/sign` | Key | —（换一条 30 秒签名，给 URL 用） |
 | POST | `/v1/checkin` | Key | —（每日签到领配额） |
 | GET | `/v1/info?url=` | Key | 0.5 / 抖音 0.75 |
 | GET | `/v1/links?url=&quality=` | Key | 1.0 / 抖音 1.1 |
@@ -1057,7 +1253,8 @@ curl -s -X PATCH -H "X-API-Key: $ADMIN" -H "Content-Type: application/json" \
 | GET | `/v1/admin/quota` | 管理 Key | —（计费倍率全貌） |
 | PUT | `/v1/admin/quota` | 管理 Key | —（改倍率：逐格合并，null 恢复默认） |
 | DELETE | `/v1/admin/quota` | 管理 Key | —（恢复出厂默认） |
-| GET | `/v1/admin/ledger` | 管理 Key | —（总账单 / 指定账号） |
+| GET | `/v1/admin/ledger` | 管理 Key | —（总账单 / `?account=` 指定账号） |
+| GET | `/v1/admin/sign` | 管理 Key | —（换一条 30 秒管理签名） |
 
 其他文档：
 

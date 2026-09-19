@@ -31,3 +31,7 @@ coverage.out
 .idea/
 *.swp
 .DS_Store
+
+# Python 字节码：examples/ 里的脚本被 import 过就会生成
+__pycache__/
+*.pyc

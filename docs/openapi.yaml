@@ -265,6 +265,26 @@ paths:
         "400": { $ref: "#/components/responses/BadInput" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /v1/sign:
+    get:
+      tags: [账号]
+      summary: 用当前 Key 换一条签名凭据（给 URL 用，约 30 秒有效）
+      description: |
+        URL 里只接受签名凭据（明文 Key 只能走请求头）。凭据形态：
+        `acc_<16位句柄>.<8位hex时间戳>.<64位hex签名>`，其中
+        签名 = hex(HMAC-SHA256(Key, "句柄|时间戳hex"))，完整 64 位。
+        服务端校验时读出票面时间戳做减法（|now-ts| <= ttl），再正向复算一次
+        HMAC 比对 —— 不需要反推时间戳，也不需要遍历候选。**不消耗配额**。
+        签名不绑定具体请求：有效期内可调用该账号任意接口，消耗记在该账号上。
+      operationId: sign
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sign" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /v1/ledger:
     get:
       tags: [账号]
@@ -292,17 +312,20 @@ paths:
   /v1/admin/ledger:
     get:
       tags: [管理]
-      summary: 配额流水：总账单，或指定账号（id 句柄 / key 明文）
-      description: 不带 id/key 即总账单。**不消耗配额**。
+      summary: 配额流水：总账单，或指定账号（account 句柄 / 明文 Key）
+      description: |
+        不带 account/id 即总账单。**不消耗配额**。
+        参数名不是 `key`：`key` 在这个 API 里是"凭据"的意思，而 URL 里只收签名；
+        用 `?key=<明文>` 会被当成一次认证尝试并因格式错误 403。
       operationId: adminLedger
       parameters:
+        - name: account
+          in: query
+          description: 账号公开句柄 acc_… 或明文 Key
+          schema: { type: string }
         - name: id
           in: query
-          description: 账号公开句柄 acc_…
-          schema: { type: string }
-        - name: key
-          in: query
-          description: 账号明文 Key（与 id 二选一）
+          description: 与 account 同义（旧参数名）
           schema: { type: string }
         - name: limit
           in: query
@@ -486,6 +509,23 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/QuotaTable" } } }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /v1/admin/sign:
+    get:
+      tags: [管理]
+      summary: 用管理 Key 换一条管理签名（给管理接口链接用，约 30 秒有效）
+      description: |
+        返回 `adm_…` 凭据，只能在 `/v1/admin/*` 上使用；账号签名（acc_）打管理接口
+        会 403 key_scope，反之亦然。句柄必须由 VIDLINK_ADMIN_KEY 派生，
+        所以轮换管理 Key 会让旧签名立刻失效。**不消耗配额**。
+      operationId: adminSign
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sign" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /v1/proxy:
     get:
       tags: [运维]
@@ -534,7 +574,14 @@ components:
   securitySchemes:
     ApiKeyHeader: { type: apiKey, in: header, name: X-API-Key }
     BearerAuth: { type: http, scheme: bearer }
-    ApiKeyQuery: { type: apiKey, in: query, name: key }
+    # URL 里**只接受签名凭据**（明文 Key 会 403）：
+    #   acc_<16位句柄>.<8位hex时间戳>.<64位hex签名>（账号）/ adm_…（管理）
+    # 由 GET /v1/sign 或 GET /v1/admin/sign 签发，约 30 秒有效。
+    ApiKeyQuery:
+      type: apiKey
+      in: query
+      name: key
+      description: 签名凭据（acc_… / adm_…），不是明文 Key
 
   security:
     - ApiKeyHeader: []
@@ -690,6 +737,19 @@ components:
             batch_min: { type: integer, example: 5 }
             batch_max: { type: integer, example: 20 }
 
+    Sign:
+      type: object
+      description: 一条签名凭据（URL 里唯一允许的凭据形态）
+      properties:
+        key:
+          type: string
+          example: acc_17090c89a1ca6ee3.68a3e658.35c1daf1f0dfefd2bb15906d25ff8e6e5dfaf2ce9757749b7ccbcb0c4a2a46c9
+        query: { type: string, description: 可直接拼到 URL 后面的 `key=…` 形式 }
+        type: { type: string, enum: [account, admin] }
+        ttl: { type: integer, description: 时间容差与有效期（秒） }
+        issued_at: { type: integer, description: 票面时间戳（unix 秒） }
+        expires_at: { type: integer, description: issued_at + ttl }
+        note: { type: string }
     Usage:
       type: object
       description: |

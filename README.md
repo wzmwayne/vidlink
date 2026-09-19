@@ -60,15 +60,42 @@ curl -s -X POST -H "X-API-Key: $ADMIN" -H 'Content-Type: application/json' \
 
 # ② 用它的 Key 取一条能播的直链（1.0 配额；只想试试就直接用公共 Key vl_public）
 export KEY=vl_xxx
-curl -H "X-API-Key: $KEY" "$BASE/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7"
+
+# 推荐：现算一张签名放进请求头（明文 Key 不进网络；示例脚本见 examples/）
+curl -H "X-API-Key: $(sh examples/sign.sh "$KEY")" "$BASE/v1/links?url=https://www.bilibili.com/video/BV1GJ411x7h7"
 
 # ③ 查自己的配额与用量
-curl -H "X-API-Key: $KEY" "$BASE/v1/usage"
+curl -H "X-API-Key: $(sh examples/sign.sh "$KEY")" "$BASE/v1/usage"
 ```
 
 想用鼠标点：加 `VL_WEBUI=true` 启动，打开 `$BASE/`（解析页）与 `$BASE/admin`（管理面板）。
 批量、字幕/图集、浏览器内混流、代理下载、每日签到、配额流水、改计费倍率等
 都在 [docs/API.md](docs/API.md) 里。
+
+### 客户端示例（Python / JS / Shell，零依赖）
+
+`examples/` 里有六个可直接运行的文件，**都有测试在跑**（签名与 Go 侧逐字符比对、
+解析示例会真的打一个会验签的桩服务端），所以它们不会腐烂：
+
+```bash
+export VIDLINK_BASE=https://vl.wzml.cc.cd
+export VIDLINK_KEY=vl_xxx
+
+python3 examples/parse.py --url 'https://www.bilibili.com/video/BV1xx411c7mD'   # 直链
+node    examples/parse.js --url '...' --endpoint info                          # 元信息
+sh      examples/parse.sh --url '...' --download out.mp4                       # 代理下载
+python3 examples/parse.py --usage                                              # 我的配额
+
+python3 examples/sign.py "$VIDLINK_KEY"    # 只要签名（三份实现输出一致）
+node    examples/sign.js "$VIDLINK_KEY"
+sh      examples/sign.sh "$VIDLINK_KEY"
+```
+
+**为什么推荐签名而不是明文 Key**：明文 Key 是长期凭据，它一进 URL 就会留在
+浏览器历史、下载记录、隧道与反向代理日志、聊天记录与截屏里，泄漏一次就等于
+把账号交出去；签名只有 30 秒有效期，且签名本身不含秘密。vidlink 的两个内嵌
+页面（解析页、管理面板）就是这么发的——明文 Key 只存在本机浏览器里，
+**不进任何一次请求**。规则与算法见 [docs/API.md](docs/API.md) §2.2。
 
 ## 图形化页面（VL_WEBUI）
 
@@ -88,6 +115,7 @@ VL_WEBUI=false ./vidlink     # 任何模式下都能关掉
 | 页面本身 | 公开 | **公开**（否则用户没地方填 Key） |
 | 数据请求 | 无需凭据 | **页面里必须填 API Key** |
 | Key 存哪 | — | 只存在本机浏览器 `localStorage` |
+| 请求带什么 | — | **现算的签名**（明文 Key 不出本机） |
 | 页面内容 | 顶部提示"不校验、不计量" | 多出「API Key」与「账户与用量」两块 |
 
 账户模式下的用法：打开页面 → 在「API Key」里填入 Key → 保存。
@@ -96,8 +124,10 @@ VL_WEBUI=false ./vidlink     # 任何模式下都能关掉
 Key 无效或过期时会明确提示 403 并高亮输入框。
 
 > 页面本体不含任何数据与凭据，数据全靠页面里的 Key 去请求。
-> 账户模式下代理下载会把 Key 作为 `?key=` 附在下载链接上
-> （`<a>` / `<video>` 无法自定义请求头）——本机自用的取舍，别在公用机器上存 Key。
+> 账户模式下代理下载、混流取流走的是**签名**链接
+> （`?key=acc_<句柄>.<时间戳>.<签名>`，页面用纯 JS 现算，约 30 秒有效）——
+> `<a>` / `<video>` 无法自定义请求头，但 URL 里也**绝不放明文 Key**：
+> 明文 Key 会留在浏览器历史、下载记录与代理日志里，而它长期有效。
 
 ## 免校验模式（VL_EASE=true）
 
@@ -228,7 +258,9 @@ B 站这类平台返回的是 DASH 分离流（画面与声音两个文件）。
 | GET/PATCH/DELETE | `/v1/admin/accounts/{key\|id}` | 管理 Key | — | 查 / 改 / 删账号（可用明文 Key 或账号句柄 `acc_…`） |
 | GET | `/v1/admin/stats` | 管理 Key | — | 运行统计 |
 | GET | `/v1/admin/quota` | 管理 Key | — | 配额系数全貌（只读） |
-| GET | `/v1/admin/ledger` | 管理 Key | — | 配额流水：不带条件=总账单，`?id=`/`?key=` 指定账号 |
+| GET | `/v1/admin/ledger` | 管理 Key | — | 配额流水：不带条件=总账单，`?account=`（或 `?id=`）指定账号 |
+| GET | `/v1/sign` | Key | — | 换一条 30 秒**签名凭据**，给 URL（`<a>`/`<video>`）用 |
+| GET | `/v1/admin/sign` | 管理 Key | — | 换一条 30 秒管理签名，给管理接口链接用 |
 
 每个响应都带 `X-Request-Id`，错误体里也有同一个值，报障时直接提供即可定位：
 
@@ -405,7 +437,10 @@ Key 是公开的，谁都能用，所以它的配额不来自账本余额，而�
   （它的额度是每 IP 每日自动给的，不需要签到）。
 
 管理面板的账号卡片上有「应用签到」按钮（两个输入框：签到额度、停止增加界限），
-解析页的「账户与用量」里有「每日签到领配额」按钮，签完自动刷新余额。
+解析页的「账户与用量」里有个常驻的「签到」按钮（在「刷新用量」旁边），签完自动刷新余额；
+不可签时它变成「**强制签到**」——不绕过服务端规则，只是让服务端再确认一次，
+页面上的状态可能是旧的（刚过零点、管理员刚改了额度、换了 Key 还没刷新），
+所以这个按钮**永不禁用**。同区域还有一行「可否签到」，直接写清当前能不能签与原因。
 
 ### 配额流水（账单）
 
@@ -452,7 +487,8 @@ VL_WEBUI=true VIDLINK_ADMIN_KEY=... ./vidlink
 操作完不会自己收起来。
 
 管理面板不引用任何外部资源（离线/内网可用），它发出的每个请求都会自动带上
-管理 Key（内部请求走 `X-API-Key` 头，页面里的链接自动拼 `?key=`）。
+管理 Key（内部请求走 `X-API-Key` 头；页面里的链接拼的是**现算的签名**
+`adm_…`，约 30 秒有效，每 15 秒自动换新——URL 里不放明文管理 Key）。
 面板只在账户模式下存在：`VL_EASE=true` 时 `/admin` 是 404，
 因为那时没有账号体系可管理。
 
@@ -520,6 +556,7 @@ VIDLINK_COOKIE_DOUYIN=UIFID_TEMP=...; ttwid=...
 | `VIDLINK_ADMIN_KEY` | 空 | **管理接口的固定凭据**；留空 = `/v1/admin/*` 恒 403（没人能改账号），解析不受影响 |
 | `VIDLINK_PUBLIC_KEY` | `vl_public` | 公共账号的 Key（公开、免注册试用）；**留空 = 不提供公共入口** |
 | `VIDLINK_PUBLIC_DAILY_QUOTA` | `25` | 公共账号**每个 IP 每天**的配额；用完了 `429`，跨天自动重置 |
+| `VIDLINK_SIG_TTL` | `30s` | 签名凭据的时间容差与有效期（`5s`~`1h`）；URL 里只收签名，见 API 文档 §2.2 |
 | `VIDLINK_PROXY_RATE` | `0.5` | 媒体代理费率的**首次种子**（配额/MiB，所有账号同价）；文件存在后以文件为准 |
 | `VIDLINK_RATES_PATH` | `data/rates.json` | 计费倍率覆盖层的落盘路径（原子写）；留空 = 纯内存，重启即丢 |
 | `VIDLINK_ACCOUNTS_PATH` | `data/accounts.jsonl` | 账本落盘路径；**留空 = 纯内存，重启即丢** |
@@ -622,9 +659,15 @@ vidlink/
 │   ├── tier/                        三档出参裁剪（info / links / detail）
 │   ├── quota/                       配额消耗系数表（倍率）
 │   ├── account/                     账号账本：配额 / 倍率 / 用量 + JSONL 落盘
+│   │   └── credential.go            签名凭据：句柄派生 / 签发 / 定长解析 / 校验
 │   ├── gate/                        两道并发闸门（按 Key + 全局）
 │   └── server/                      HTTP 路由 / 中间件 / 管理面 / 流式代理
-│       └── ui.html                  免校验模式的图形化解析页（内嵌进二进制）
+│       ├── ui.html                  图形化解析页（内嵌进二进制）
+│       ├── admin.html               管理面板（内嵌进二进制）
+│       └── auth.go                  凭据解析：明文 Key / 签名 / 管理面
+├── examples/                        客户端示例（零依赖，随仓库发布、有测试跑）
+│   ├── sign.py   sign.js   sign.sh  生成签名凭据
+│   └── parse.py  parse.js  parse.sh 完整解析客户端（解析 / 用量 / 代理下载）
 ├── tools/douyin-mint/               （仅本地，未随仓库发布）抖音访客身份铸造
 └── docs/
     ├── API.md                       接口文档（人读）

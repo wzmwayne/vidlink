@@ -50,6 +50,10 @@ func (s *Server) adminRoutes() []routeSpec {
 			handler: s.handleAdminQuotaReset},
 		{method: http.MethodGet, path: "/v1/admin/ledger", admin: true,
 			handler: s.handleAdminLedger},
+		// 签发管理签名：管理面板要把接口链接给出去（右键复制、新标签页打开），
+		// 而 URL 里放明文管理 Key 等于把服务级凭据写进浏览器历史。
+		{method: http.MethodGet, path: "/v1/admin/sign", admin: true,
+			handler: s.handleAdminSign},
 	}
 }
 
@@ -270,6 +274,7 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 
 	key := strings.TrimSpace(req.Key)
 	generated := false
+	prefixed := false
 	if key == "" {
 		// 不填就自动生成，避免管理员用弱 Key
 		var err error
@@ -279,6 +284,20 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 			return
 		}
 		generated = true
+	} else {
+		if len(key) > maxAPIKeyLen {
+			writeError(w, core.BadInput("", "Key 最长 %d 个字符（当前 %d）", maxAPIKeyLen, len(key)))
+			return
+		}
+		if !strings.HasPrefix(key, keyPrefix) {
+			// 统一前缀：所有 Key 都以 vl_ 开头，与句柄（acc_/adm_）一眼可分。
+			//
+			// 只在新账号创建时补齐：账本里已有的 Key（例如早期的 `Tkey`）
+			// 绝不去改——改 Key 等于把正在用的凭据作废，那不是"规范化"，
+			// 是打断服务。补了前缀就如实告诉调用方最终值。
+			key = keyPrefix + key
+			prefixed = true
+		}
 	}
 
 	mult := 1.0 // 默认标准倍率；0 是有含义的取值（不扣配额），不能当默认值
@@ -317,9 +336,14 @@ func (s *Server) handleAdminCreateAccount(w http.ResponseWriter, r *http.Request
 	// 明文 Key 只在**创建这一次**返回。此后所有接口都只回掩码，
 	// 避免 Key 出现在日志、浏览器历史和运维截屏里。
 	resp := map[string]any{"account": accountViewOf(a)}
-	if generated {
+	switch {
+	case generated:
 		resp["key"] = a.Key
 		resp["notice"] = "请立即保存这个 Key，它只会出现这一次"
+	case prefixed:
+		resp["key"] = a.Key
+		resp["notice"] = fmt.Sprintf(
+			"你指定的 Key 没有 %s 前缀，已自动补成下面这个值；请以它为准（只会出现这一次）", keyPrefix)
 	}
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -452,5 +476,18 @@ func newAPIKey() (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("熵源不可用: %w", err)
 	}
-	return "vl_" + hex.EncodeToString(b[:]), nil
+	return keyPrefix + hex.EncodeToString(b[:]), nil
 }
+
+// keyPrefix 是所有账号 Key 的统一前缀。
+//
+// 它让"Key"与"句柄"在肉眼和日志里一眼可分：vl_ 开头是秘密，
+// acc_/adm_ 开头是公开句柄或签名凭据。传进管理接口的 Key 若没有它，
+// 创建时会自动补上（见 handleAdminCreateAccount）。
+const keyPrefix = "vl_"
+
+// maxAPIKeyLen 是手工指定 Key 的长度上限。
+//
+// Key 会进请求头、账本与日志，放任长度等于给了数据污染与响应头膨胀的入口。
+// 自动生成的 Key 是 67 字符，这个上限对人工输入的 Key 足够宽松。
+const maxAPIKeyLen = 128

@@ -152,9 +152,10 @@
     <div class="hint" id="keyState">未填写管理 Key。</div>
     <div class="hint">
       管理 Key 是<b>服务级固定凭据</b>，不是账号 Key：它不消耗配额、也不能用来解析视频；
-      反过来，任何账号都拿不到管理权限。填好之后本页所有请求都会自动带上它
-      （内部请求走 <span class="mono">X-API-Key</span> 头，页面里的链接自动拼
-      <span class="mono">?key=</span>）。
+      反过来，任何账号都拿不到管理权限。填好之后本页所有请求都会自动带上凭据，
+      而带的是<b>现算的签名</b>（<span class="mono">adm_…</span>，约 30 秒有效，
+      放在 <span class="mono">X-API-Key</span> 头；页面里的链接拼
+      <span class="mono">?key=</span> 也是同一种签名）——明文管理 Key 不进任何请求。
     </div>
   </section>
 
@@ -276,8 +277,10 @@
     <h2>管理接口</h2>
     <div class="btns" id="apiLinks"></div>
     <div class="hint">
-      点这些链接等于用浏览器直接发一次 GET，Key 由页面自动拼在 URL 上；
-      结果会显示在下面的响应框里（也可以右键在新标签页打开，用于给别的工具取数）。
+      点这些链接等于用浏览器直接发一次 GET；URL 里带的是页面现算的<b>签名</b>
+      （<span class="mono">adm_…</span>，约 30 秒有效，每 15 秒自动换新），
+      管理 Key 本身不进 URL。也可以右键在新标签页打开，用于给别的工具取数；
+      长期给别的工具用请把管理 Key 放在 <span class="mono">X-API-Key</span> 头里。
     </div>
   </section>
 
@@ -294,6 +297,147 @@
 </footer>
 
 <script>
+/* vl-crypto: 纯 JS 的 SHA-256 / HMAC-SHA256 与 URL 签名（零依赖、零外部加载）。
+ *
+ * 为什么自己实现而不是用 crypto.subtle：
+ *   1) 签名必须在浏览器里现算——明文 Key 绝不能拼进 URL，而每次下载都
+ *      先问服务端要一次签名又太绕（多一次往返、还得处理失败重试）；
+ *   2) crypto.subtle 只在**安全上下文**可用，而本项目经常跑在
+ *      http://192.168.x.x:8080 这种局域网明文地址上，那里它是 undefined；
+ *   3) 页面不允许加载任何外部资源，引 CDN 上的实现也不行。
+ * 纯 JS 版本哪儿都能跑，一次签名实测几十微秒，比一次网络往返便宜得多。
+ *
+ * 正确性由测试保证：internal/server/server_test.go 会把这一段脚本抽出来
+ * 交给 node 跑 RFC 4231 的 HMAC 向量与项目自己的黄金向量，
+ * 并与 Go 侧 account.SignAt 的产物逐字符比对。
+ */
+
+// SHA-256 轮常量：前 64 个质数立方根小数部分的前 32 位。
+const VL_K256 = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+// vlRo 是 32 位循环右移（>>> 是无符号右移，左移后必须再 >>> 0 收回 32 位）。
+function vlRo(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+
+function vlUtf8(s) { return new TextEncoder().encode(s); }
+
+function vlHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+// vlSha256 计算 SHA-256，返回 32 字节。
+function vlSha256(bytes) {
+  const len = bytes.length;
+  // 补位：0x80 + 若干个 0 + 8 字节大端比特长度，凑成 64 字节的整数倍。
+  const total = (((len + 9) + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  const view = new DataView(buf.buffer);
+  const bits = len * 8;
+  view.setUint32(total - 8, Math.floor(bits / 4294967296));
+  view.setUint32(total - 4, bits >>> 0);
+
+  const h = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ]);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      const s0 = vlRo(x, 7) ^ vlRo(x, 18) ^ (x >>> 3);
+      const s1 = vlRo(y, 17) ^ vlRo(y, 19) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h[0], b = h[1], c = h[2], d = h[3];
+    let e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = vlRo(e, 6) ^ vlRo(e, 11) ^ vlRo(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (hh + S1 + ch + VL_K256[i] + w[i]) >>> 0;
+      const S0 = vlRo(a, 2) ^ vlRo(a, 13) ^ vlRo(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i]);
+  return out;
+}
+
+// vlSha256Hex 返回 64 位小写十六进制（句柄就是它的前 16 位，见 vlSignUrl）。
+function vlSha256Hex(s) { return vlHex(vlSha256(vlUtf8(s))); }
+
+// vlHmacSha256 计算 HMAC-SHA256，返回 32 字节。
+//
+// 分成"字节版 + 字符串版"两层：字符串版只是 UTF-8 + 十六进制包装，
+// 测试可以直接喂 RFC 4231 的原始字节向量，不用绕 UTF-8 编码。
+function vlHmacSha256(keyBytes, msgBytes) {
+  let k = keyBytes;
+  if (k.length > 64) k = vlSha256(k);        // 超长 Key 先哈希（RFC 2104）
+  const block = new Uint8Array(64);
+  block.set(k);
+  const inner = new Uint8Array(64 + msgBytes.length);
+  const outer = new Uint8Array(64 + 32);
+  for (let i = 0; i < 64; i++) {
+    inner[i] = block[i] ^ 0x36;              // ipad
+    outer[i] = block[i] ^ 0x5c;              // opad
+  }
+  inner.set(msgBytes, 64);
+  outer.set(vlSha256(inner), 64);
+  return vlSha256(outer);
+}
+
+// vlHmacSha256Hex 计算 HMAC-SHA256，返回完整的 64 位小写十六进制。
+function vlHmacSha256Hex(key, msg) {
+  return vlHex(vlHmacSha256(vlUtf8(key), vlUtf8(msg)));
+}
+
+// vlCredentialAt 生成一条签名凭据（ts 显式传入，便于测试与"提前签发"）：
+//
+//   acc_<16位句柄>.<8位hex时间戳>.<64位签名>
+//   签名 = HMAC-SHA256(Key, "句柄|时间戳hex")，完整 64 位，不截断。
+//
+// 时间戳与句柄都在签名原料里：改期、换句柄都会对不上；而服务器只需
+// 读出票面时间做减法、再正向复算一次 HMAC，既不用反推也不用遍历。
+function vlCredentialAt(prefix, key, ts) {
+  // ts 省略时取当前秒：调用方（页面、示例）都不必自己算时间。
+  const t = ts === undefined ? Math.floor(Date.now() / 1000) : ts;
+  const handle = prefix + vlSha256Hex(key).slice(0, 16);
+  const tsHex = t.toString(16).padStart(8, "0");
+  return handle + "." + tsHex + "." + vlHmacSha256Hex(key, handle + "|" + tsHex);
+}
+
+// vlSignUrl 把签名凭据以 ?key= 拼到 URL 上；key 为空（免校验模式）时原样返回。
+// ts 省略时取当前秒；服务端允许 ±30 秒的时间偏差（VIDLINK_SIG_TTL）。
+function vlSignUrl(prefix, key, url, ts) {
+  if (!key) return url;
+  const t = ts === undefined ? Math.floor(Date.now() / 1000) : ts;
+  const cred = vlCredentialAt(prefix, key, t);
+  return url + (url.includes("?") ? "&" : "?") + "key=" + cred;
+}
+</script>
+
+<script>
 /*
  * 管理面板。
  *
@@ -307,7 +451,9 @@
  *
  * Key 的两种传递方式都在这里用到：
  *   - 页面发起的 fetch 统一走 X-API-Key 头（api()）；
- *   - 页面里的链接（新标签页打开/右键复制）只能拼查询参数（withKey()）。
+ *   - 页面里的链接（新标签页打开/右键复制）只能拼查询参数，而 URL 里
+ *     只允许**签名**（adm_…，由本页现算，见 vl-crypto 脚本块）。
+ *     明文管理 Key 是服务级凭据，绝不能进浏览器历史与隧道日志。
  */
 (() => {
   "use strict";
@@ -331,11 +477,22 @@
 
   // ---------- 基础设施 ----------
 
-  // withKey 把管理 Key 拼进 URL：只有 <a> 这类浏览器原生导航才需要它
-  // （不能给原生导航加自定义请求头），fetch 一律走 api()。
-  function withKey(url) {
-    if (!ADMINKEY) return url;
-    return url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(ADMINKEY);
+  // signedQuery 把**管理签名**拼进 URL：只有 <a> 这类浏览器原生导航才需要它
+  // （不能给原生导航加自定义请求头）。
+  //
+  // 签名由本页现算（vl-crypto 脚本块），有效期几十秒；即便链接被复制进
+  // 聊天记录或浏览器历史，过期之后也什么都换不来。
+  function signedQuery(url) {
+    return vlSignUrl("adm_", ADMINKEY, url);
+  }
+
+  // signedCredential 是本页**所有请求**用的凭据：现算的管理签名（不是管理 Key）。
+  //
+  // 管理 Key 是服务级凭据，长期有效；把它放进每一次请求，等于让它出现在
+  // 浏览器网络面板、反代日志与任何抓包里。签名只有几十秒，且不含秘密本身。
+  function signedCredential() {
+    if (!ADMINKEY) return "";
+    return vlCredentialAt("adm_", ADMINKEY, Math.floor(Date.now() / 1000));
   }
 
   // api 自动带上管理 Key —— 页面上每一个请求都经过它，
@@ -344,7 +501,8 @@
     const t0 = performance.now();
     const o = Object.assign({}, opts);
     o.headers = Object.assign({}, o.headers);
-    if (ADMINKEY) o.headers["X-API-Key"] = ADMINKEY;
+    const cred = signedCredential();
+    if (cred) o.headers["X-API-Key"] = cred;
     const res = await fetch(path, o);
     const text = await res.text();
     let body = null;
@@ -801,7 +959,8 @@
     return String(Math.round(n * 10000) / 10000);
   }
 
-  // GET /v1/admin/ledger —— 不带 who 即总账单，带了就是那个账号的
+  // GET /v1/admin/ledger —— 不带 who 即总账单，带了就是那个账号的。
+  // 参数名用 account（不是 key）：key 现在是"凭据"的意思，URL 里只收签名。
   async function loadLedger() {
     const box = $("#ledger");
     const tot = $("#ledgerTotals");
@@ -810,7 +969,7 @@
     const type = $("#ledgerType").value;
     let qs = "?limit=" + encodeURIComponent(limit);
     if (type) qs += "&type=" + encodeURIComponent(type);
-    if (who) qs += "&id=" + encodeURIComponent(who);
+    if (who) qs += "&account=" + encodeURIComponent(who);
     box.textContent = "加载中…";
     tot.textContent = "";
     const r = await api("/v1/admin/ledger" + qs);
@@ -1193,7 +1352,10 @@
     box.textContent = "";
     READONLY_APIS.forEach(([label, path]) => {
       const a = el("a", "btn", label + "  " + path);
-      a.href = withKey(path); // 自动拼上 ?key=…，右键复制即可给别的工具用
+      // 链接里的凭据是**现算的签名**（不是管理 Key）：右键复制或新标签页打开
+      // 都只带一张几十秒有效的票。签名很便宜（几十微秒），所以每次重算，
+      // 不需要缓存——定时器每 15 秒刷新一次，保证点开时它一定还没过期。
+      a.href = signedQuery(path);
       a.addEventListener("click", async (e) => {
         e.preventDefault();
         show(await api(path));
@@ -1201,6 +1363,17 @@
       box.appendChild(a);
     });
   }
+
+  // 链接是短时签名，放久了会过期：定期把 href 换成新的，避免"右键复制后
+  // 过一会儿点了打不开"。15 秒 < 30 秒有效期，留足余量。
+  setInterval(() => {
+    if (!ADMINKEY) return;
+    const as = $("#apiLinks").querySelectorAll("a");
+    as.forEach((a, i) => {
+      const item = READONLY_APIS[i];
+      if (item) a.href = signedQuery(item[1]);
+    });
+  }, 15000);
 
   // ---------- 身份与初始化 ----------
 

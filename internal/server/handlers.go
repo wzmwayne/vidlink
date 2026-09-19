@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,16 +31,7 @@ func accountFrom(ctx context.Context) (account.Account, bool) {
 	return a, ok
 }
 
-// resolveKey 从请求里取出 API Key。三种传法等价。
-func resolveKey(r *http.Request) string {
-	if k := r.Header.Get("X-API-Key"); k != "" {
-		return k
-	}
-	if k := r.URL.Query().Get("key"); k != "" {
-		return k
-	}
-	return bearer(r.Header.Get("Authorization"))
-}
+// 凭据解析统一在 auth.go：头部与 Bearer 是明文 Key，?key= 只接受签名凭据。
 
 // withAccount 完成认证、并发闸门与预授权，并把账号放进 context。
 //
@@ -87,13 +77,12 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 			return
 		}
 
-		key := resolveKey(r)
-		if key == "" {
+		value, src := credentialOf(r)
+		if value == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="vidlink"`)
 			// 没带 Key 的人最可能就是想试一下：直接把公共 Key 告诉他。
 			// 这比"缺少 API Key"有用得多——后者会让人以为必须先注册。
-			msg := "缺少 API Key：请通过 X-API-Key 头、Authorization: Bearer 头，" +
-				"或 ?key= 查询参数提供"
+			msg := missingKeyHint
 			if k := strings.TrimSpace(s.cfg.PublicKey); k != "" {
 				msg += fmt.Sprintf("；也可以直接用公共 Key「%s」免费试用（每 IP 每日 %.4g 配额）",
 					k, s.publicQ.Limit())
@@ -101,10 +90,9 @@ func (s *Server) withAccount(next http.Handler, specs []routeSpec) http.Handler 
 			writeError(w, core.Errf(core.KindForbidden, "", "auth", "%s", msg))
 			return
 		}
-		acct, ok := s.accounts.Get(key)
-		if !ok {
-			// 刻意不区分"Key 不存在"与"Key 错误"，避免被用来枚举有效 Key
-			writeError(w, core.Errf(core.KindForbidden, "", "auth", "API Key 无效"))
+		acct, credErr := s.accountForCredential(value, src)
+		if credErr != nil {
+			credErr.write(w)
 			return
 		}
 		if acct.Disabled {
@@ -174,9 +162,9 @@ func adminAuthed(ctx context.Context) bool {
 	return ok
 }
 
-// serveAdminKey 是管理面的鉴权：把请求里的 Key 与配置的固定管理 Key 比对。
+// serveAdminKey 是管理面的鉴权：明文管理 Key，或管理签名（adm_…）。
 //
-// 三条设计约束：
+// 四条设计约束：
 //
 //   - **管理 Key 不是账号。** 它不查账本、不看账本的停用状态、不扣配额、
 //     不占按 Key 的解析闸门。它唯一的能力就是调用 /v1/admin/*；
@@ -186,24 +174,44 @@ func adminAuthed(ctx context.Context) bool {
 //     在"是不是路径写错了"上白花时间。
 //   - **常量时间比较。** 管理 Key 是服务级凭据，普通字符串比较会因为
 //     提前返回而泄漏前缀信息，长期看是可被逐字节试探的旁路。
+//   - **URL 里只认签名。** 管理面板要把接口链接给出去（右键复制、新标签页
+//     打开），URL 里放明文管理 Key 等于把服务级凭据写进浏览器历史；
+//     所以这里同样只接受 adm_ 签名，明文只能走请求头。
 func (s *Server) serveAdminKey(next http.Handler, w http.ResponseWriter, r *http.Request) {
-	want := strings.TrimSpace(s.cfg.AdminKey)
+	want := s.adminKey()
 	if want == "" {
 		writeError(w, core.Errf(core.KindForbidden, "", "auth",
 			"管理接口未启用：未配置管理 Key（环境变量或 .vl 里的 VIDLINK_ADMIN_KEY）"))
 		return
 	}
-	got := resolveKey(r)
-	if got == "" {
+	value, src := credentialOf(r)
+	if value == "" {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="vidlink-admin"`)
 		writeError(w, core.Errf(core.KindForbidden, "", "auth",
-			"缺少管理 Key：请通过 X-API-Key 头、Authorization: Bearer 头，"+
-				"或 ?key= 查询参数提供"))
+			"缺少管理 Key：请通过 X-API-Key 头或 Authorization: Bearer 头提供管理凭据"+
+				"（明文管理 Key，或 GET /v1/admin/sign 签发的 adm_ 签名）"))
 		return
 	}
-	// 长度不同时 ConstantTimeCompare 立即返回 0，但那只泄漏长度；
-	// Key 是定长随机串，长度本身不是秘密。
-	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+	switch {
+	case src == credQuerySigned:
+		// URL 里只收签名：明文管理 Key 进了 URL 就会长期留在浏览器历史、
+		// 隧道与反代日志里——而它是服务级凭据。
+		if !looksSigned(value) {
+			forbidden("key_format", queryKeyHint).write(w)
+			return
+		}
+		if credErr := s.adminFromSigned(value); credErr != nil {
+			credErr.write(w)
+			return
+		}
+	case constantTimeEqual(value, want):
+		// 明文管理 Key：只在请求头里接受
+	case looksSigned(value):
+		if credErr := s.adminFromSigned(value); credErr != nil {
+			credErr.write(w)
+			return
+		}
+	default:
 		writeError(w, core.Errf(core.KindForbidden, "", "auth", "管理 Key 无效"))
 		return
 	}

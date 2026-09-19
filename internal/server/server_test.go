@@ -273,9 +273,15 @@ func TestQuotaRoutesRequireKey(t *testing.T) {
 	}
 }
 
+// TestThreeKeyPassingStyles：头部与 Bearer 传明文 Key，URL 只能传签名。
+//
+// URL 里那条不是"换个写法"，而是安全要求：明文 Key 一旦进了 URL，
+// 就会留在浏览器历史、隧道日志、聊天记录与截屏里，而它长期有效；
+// 签名只有几十秒，且签名本身不含任何秘密。
 func TestThreeKeyPassingStyles(t *testing.T) {
 	env := newTestEnv(t, nil, defaultStub())
 	h := env.handler()
+	signed := account.SignAt(account.HandlePrefix, env.userKey, time.Now().Unix())
 	cases := []struct {
 		name string
 		path string
@@ -283,12 +289,16 @@ func TestThreeKeyPassingStyles(t *testing.T) {
 	}{
 		{"X-API-Key", "/v1/usage", map[string]string{"X-API-Key": env.userKey}},
 		{"Bearer", "/v1/usage", map[string]string{"Authorization": "Bearer " + env.userKey}},
-		{"query", "/v1/usage?key=" + env.userKey, nil},
+		{"query（签名）", "/v1/usage?key=" + signed, nil},
 	}
 	for _, c := range cases {
 		if w := do(h, http.MethodGet, c.path, c.hdr); w.Code != http.StatusOK {
-			t.Errorf("%s 方式应通过，得到 %d", c.name, w.Code)
+			t.Errorf("%s 方式应通过，得到 %d：%s", c.name, w.Code, w.Body.String())
 		}
+	}
+	// 明文 Key 出现在 URL 里必须被拒，而不是"照样能用"
+	if w := do(h, http.MethodGet, "/v1/usage?key="+env.userKey, nil); w.Code != http.StatusForbidden {
+		t.Errorf("URL 里传明文 Key 应 403，得到 %d", w.Code)
 	}
 }
 
@@ -1503,10 +1513,21 @@ func TestProxyContentTypeWhitelist(t *testing.T) {
 func TestUIScriptsShareAllHelpers(t *testing.T) {
 	body := string(uiHTML)
 	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(body, -1)
-	if len(blocks) < 2 {
-		t.Fatalf("页面应有至少两个 script 块，找到 %d 个", len(blocks))
+	if len(blocks) < 3 {
+		t.Fatalf("页面应有至少三个 script 块（crypto / 主脚本 / 混流），找到 %d 个", len(blocks))
 	}
-	main, mux := blocks[0][1], blocks[len(blocks)-1][1]
+	// 主脚本按"谁定义了 window.VL"来认，而不是按下标：下标会随着
+	// 新增脚本块（比如这次的 vl-crypto）而错位。
+	main := ""
+	for _, b := range blocks {
+		if strings.Contains(b[1], "window.VL = {") {
+			main = b[1]
+		}
+	}
+	if main == "" {
+		t.Fatal("没有任何脚本块导出 window.VL")
+	}
+	mux := blocks[len(blocks)-1][1]
 
 	m := regexp.MustCompile(`(?s)window\.VL = \{(.*?)\};`).FindStringSubmatch(main)
 	if m == nil {
@@ -1517,7 +1538,7 @@ func TestUIScriptsShareAllHelpers(t *testing.T) {
 	// 主脚本里定义、混流脚本可能想复用的符号
 	helpers := []string{
 		"api", "el", "copyBtn", "openBtn", "prettySize", "prettyNum", "target",
-		"withKey", "dlName", "qualityLabel", "DL", "ensureTitle",
+		"signedQuery", "dlName", "qualityLabel", "DL", "ensureTitle",
 	}
 	for _, h := range helpers {
 		if !regexp.MustCompile(`\b` + regexp.QuoteMeta(h) + `\b`).MatchString(mux) {
@@ -1526,6 +1547,300 @@ func TestUIScriptsShareAllHelpers(t *testing.T) {
 		if !strings.Contains(exported, h) {
 			t.Errorf("混流脚本用了 %s，但它没出现在 window.VL 的导出列表里"+
 				"（否则运行时会 xxx is not defined）", h)
+		}
+	}
+}
+
+// TestUIMuxBlockNeverUsesUnexportedMainVars：混流脚本引用的主脚本变量必须已导出。
+//
+// 这条来自一次真实故障：`updateMuxNote()` 里用了 `myProxyRate`，而它声明在
+// **另一个** <script> 的 IIFE 里、也没挂到 window.VL 上。结果是"点一次详情、
+// 页面弹 ReferenceError 并显示原始 JSON"——只在"上游给了体积且勾了代理"时
+// 才炸，平时的冒烟根本碰不到。
+//
+// 两个脚本块之间没有共享词法作用域，所以这类错误的唯一防法就是静态比对：
+// 主脚本里声明的标识符 ∩ 混流脚本里用到的 − 混流脚本自己声明的 − 已导出的
+// 必须为空。
+func TestUIMuxBlockNeverUsesUnexportedMainVars(t *testing.T) {
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(string(uiHTML), -1)
+	var main, mux string
+	for _, b := range blocks {
+		if strings.Contains(b[1], "window.VL = {") {
+			main = b[1]
+		}
+	}
+	if main == "" {
+		t.Fatal("找不到主脚本（没有 window.VL 导出）")
+	}
+	mux = blocks[len(blocks)-1][1]
+
+	// 去掉注释与字符串再扫标识符：注释里提到某个名字（"myProxyRate 曾漏导出"）
+	// 和字符串里的文字都不是引用，扫进来就是误报。
+	stripJS := func(v string) string {
+		var b strings.Builder
+		for i := 0; i < len(v); {
+			switch {
+			case strings.HasPrefix(v[i:], "//"):
+				for i < len(v) && v[i] != '\n' {
+					i++
+				}
+			case strings.HasPrefix(v[i:], "/*"):
+				if j := strings.Index(v[i+2:], "*/"); j < 0 {
+					i = len(v)
+				} else {
+					i += 2 + j + 2
+				}
+			case v[i] == '"' || v[i] == '\'' || v[i] == '`':
+				q := v[i]
+				i++
+				for i < len(v) && v[i] != q {
+					if v[i] == '\\' {
+						i++
+					}
+					i++
+				}
+				i++
+			default:
+				b.WriteByte(v[i])
+				i++
+			}
+		}
+		return b.String()
+	}
+	mainSrc, muxSrc := stripJS(main), stripJS(mux)
+
+	// 主脚本 IIFE 内顶层声明的标识符（两个空格缩进）
+	decl := regexp.MustCompile(`(?m)^  (?:let|const|function)\s+([A-Za-z_$][\w$]*)`)
+	mainDecls := map[string]bool{}
+	for _, m := range decl.FindAllStringSubmatch(mainSrc, -1) {
+		mainDecls[m[1]] = true
+	}
+	if len(mainDecls) < 10 {
+		t.Fatalf("只扫到 %d 个主脚本声明，正则可能失效", len(mainDecls))
+	}
+
+	// 已导出的名字：window.VL = { a, b, c: () => x, d: y } —— 取键名
+	exports := map[string]bool{}
+	if m := regexp.MustCompile(`(?s)window\.VL = \{(.*?)\};`).FindStringSubmatch(mainSrc); m != nil {
+		for _, part := range strings.Split(m[1], ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name := part
+			if i := strings.Index(part, ":"); i >= 0 {
+				name = strings.TrimSpace(part[:i])
+			}
+			exports[name] = true
+		}
+	}
+	if len(exports) < 10 {
+		t.Fatalf("只解析出 %d 个导出名，正则可能失效", len(exports))
+	}
+
+	// 混流脚本自己声明的名字（含解构、函数参数与箭头参数），这些不算"来自主脚本"
+	local := map[string]bool{}
+	for _, re := range []*regexp.Regexp{
+		regexp.MustCompile(`\b(?:let|const|var|function|class)\s+([A-Za-z_$][\w$]*)`),
+		regexp.MustCompile(`\{([^{}]*)\}\s*=`),
+		regexp.MustCompile(`\[([^\[\]]*)\]\s*=`),
+		regexp.MustCompile(`(?:function\s*[A-Za-z_$\w]*\s*)?\(([^()]*)\)\s*=>`),
+		regexp.MustCompile(`\bfunction\s*[A-Za-z_$\w]*\s*\(([^()]*)\)`),
+	} {
+		for _, m := range re.FindAllStringSubmatch(muxSrc, -1) {
+			for _, name := range strings.Split(m[1], ",") {
+				name = strings.TrimSpace(name)
+				if i := strings.LastIndex(name, ":"); i >= 0 { // 解构里的重命名
+					name = strings.TrimSpace(name[i+1:])
+				}
+				if regexp.MustCompile(`^[A-Za-z_$][\w$]*$`).MatchString(name) {
+					local[name] = true
+				}
+			}
+		}
+	}
+
+	// 用到的标识符：跳过属性访问（res.ok 里的 ok 不是变量）
+	used := map[string]bool{}
+	idRe := regexp.MustCompile(`[A-Za-z_$][\w$]*`)
+	for _, loc := range idRe.FindAllStringIndex(muxSrc, -1) {
+		if loc[0] > 0 && muxSrc[loc[0]-1] == '.' {
+			continue
+		}
+		used[muxSrc[loc[0]:loc[1]]] = true
+	}
+
+	for name := range mainDecls {
+		if !used[name] || local[name] || exports[name] {
+			continue
+		}
+		t.Errorf("混流脚本用了主脚本里的 %q，但它没出现在 window.VL 的导出列表里"+
+			"（运行时会是 xxx is not defined；变量要用 getter 导出，否则快照会停在 null）", name)
+	}
+}
+
+// TestUIMuxNoteRenders：把混流区的"代理计费提示"函数抽出来在 node 里真跑一遍。
+//
+// 上一个用例管"引用的东西有没有导出"，这个用例管"跑起来到底出不出文案"：
+// 用户看到的是 `ReferenceError: myProxyRate is not defined` 弹在结果区，
+// 而这类错误只有在"上游给了两轨体积 + 勾了代理"时才会走到，普通冒烟撞不上。
+func TestUIMuxNoteRenders(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过")
+	}
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(string(uiHTML), -1)
+	mux := blocks[len(blocks)-1][1]
+	head := strings.Index(mux, "function updateMuxNote()")
+	if head < 0 {
+		t.Fatal("混流脚本里找不到 updateMuxNote")
+	}
+	tail := strings.Index(mux[head:], "\n  }\n")
+	if tail < 0 {
+		t.Fatal("找不到 updateMuxNote 的结尾")
+	}
+	fn := mux[head : head+tail+len("\n  }")]
+
+	driver := `
+const src = ` + strconv.Quote(fn) + `;
+let text = "";
+const box = { set textContent(v) { text = v; }, get textContent() { return text; } };
+const $ = (sel) => (sel === "#muxCost" ? box : { checked: true, value: "0" });
+const proxyOn = () => true;
+const fmtUnits = (n) => String(Math.round(n * 100) / 100);
+const proxyCost = () => 0.6;
+const tracks = { videos: [{ size: 1048576 }], audios: [{ size: 1048576 }] };
+const run = (rate, mult) => {
+  const f = new Function("$", "proxyOn", "multiplier", "proxyRate", "fmtUnits",
+                         "proxyCost", "tracks", "return " + src);
+  f($, proxyOn, () => mult, () => rate, fmtUnits, proxyCost, tracks)();
+};
+const out = [];
+run(0.5, 1); out.push(text);          // 账户模式：费率来自 /v1/usage
+run(null, 1); out.push(text);         // 费率还没拿到：回落到 0.5
+tracks.videos[0].size = 0;            // 上游没给体积
+run(0.5, 1); out.push(text);
+console.log(JSON.stringify(out));
+`
+	dir := t.TempDir()
+	js := filepath.Join(dir, "muxnote.js")
+	if err := os.WriteFile(js, []byte(driver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := exec.Command(node, js).CombinedOutput()
+	if err != nil {
+		t.Fatalf("跑 updateMuxNote 失败（大概又是某个变量没导出）：%v\n%s", err, raw)
+	}
+	var got []string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("node 输出不是 JSON：%v\n%s", err, raw)
+	}
+	if len(got) != 3 {
+		t.Fatalf("想要 3 段文案，得到 %d 段：%v", len(got), got)
+	}
+	for i, want := range []string{"代理按体积计费：0.5", "代理按体积计费：0.5", "上游没给体积"} {
+		if !strings.Contains(got[i], want) {
+			t.Errorf("第 %d 段文案不对（想要包含 %q）：%s", i+1, want, got[i])
+		}
+	}
+	for _, s := range got {
+		if strings.Contains(s, "undefined") || strings.Contains(s, "NaN") {
+			t.Errorf("文案里出现了 undefined/NaN：%s", s)
+		}
+	}
+}
+
+// TestUICheckinStateRenders：「签到 / 强制签到」的文案与状态判断。
+//
+// 签到按钮是这几类 bug 的高发区：不可签时被禁用/隐藏、文案与真实状态不符、
+// 或者"签一次成功之后按钮永久变灰"。所以把 checkinState 整段抽出来交给 node，
+// 喂四种账号状态跑一遍，断言按钮文案与「可否签到」那一行。
+func TestUICheckinStateRenders(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过")
+	}
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(string(uiHTML), -1)
+	var main string
+	for _, b := range blocks {
+		if strings.Contains(b[1], "window.VL = {") {
+			main = b[1]
+		}
+	}
+	if main == "" {
+		t.Fatal("找不到主脚本")
+	}
+	head := strings.Index(main, "function checkinState(d) {")
+	if head < 0 {
+		t.Fatal("主脚本里找不到 checkinState")
+	}
+	tail := strings.Index(main[head:], "\n  }\n")
+	if tail < 0 {
+		t.Fatal("找不到 checkinState 的结尾")
+	}
+	fn := main[head : head+tail+len("\n  }")]
+
+	driver := `
+const src = ` + strconv.Quote(fn) + `;
+const cases = {
+  can:    { name: "可签",   checkin: {enabled: true, daily: 25, cap: 200, checked_in_today: false, last_checkin_day: ""} },
+  done:   { name: "已签",   checkin: {enabled: true, daily: 25, cap: 0, checked_in_today: true, last_checkin_day: "2026-09-19"} },
+  off:    { name: "未开放", checkin: {enabled: false, daily: 0, cap: 0, checked_in_today: false, last_checkin_day: ""} },
+  pub:    { name: "公共Key", checkin: {enabled: false, daily: 0, cap: 0, checked_in_today: false, last_checkin_day: ""}, public: true },
+  absent: { name: "无字段", checkin: null },
+};
+const f = new Function("return " + src)();
+const out = {};
+for (const k of Object.keys(cases)) out[k] = f(cases[k]);
+console.log(JSON.stringify(out));
+`
+	dir := t.TempDir()
+	js := filepath.Join(dir, "checkinstate.js")
+	if err := os.WriteFile(js, []byte(driver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := exec.Command(node, js).CombinedOutput()
+	if err != nil {
+		t.Fatalf("跑 checkinState 失败：%v\n%s", err, raw)
+	}
+	var got map[string]struct {
+		Show   bool   `json:"show"`
+		Can    bool   `json:"can"`
+		Label  string `json:"label"`
+		Title  string `json:"title"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("node 输出不是 JSON：%v\n%s", err, raw)
+	}
+	want := map[string]struct {
+		show, can bool
+		label     string
+		reasonHas string
+	}{
+		"can":    {true, true, "签到", "可以：点击「签到」领取 +25 配额（上限 200）"},
+		"done":   {true, false, "强制签到", "不可以：今天已经签过了（2026-09-19）"},
+		"off":    {true, false, "强制签到", "不可以：账号未开放每日签到"},
+		"pub":    {false, false, "签到", "不可以：公共 Key 按 IP 每日自动给额度"},
+		"absent": {false, false, "签到", ""},
+	}
+	for key, w := range want {
+		g, ok := got[key]
+		if !ok {
+			t.Errorf("缺少用例 %s", key)
+			continue
+		}
+		if g.Show != w.show || g.Can != w.can || g.Label != w.label {
+			t.Errorf("%s：show/can/label = %v/%v/%q，想要 %v/%v/%q",
+				key, g.Show, g.Can, g.Label, w.show, w.can, w.label)
+		}
+		if w.reasonHas != "" && !strings.Contains(g.Reason, w.reasonHas) {
+			t.Errorf("%s：reason = %q，应包含 %q", key, g.Reason, w.reasonHas)
+		}
+		for _, s := range []string{g.Label, g.Title, g.Reason} {
+			if strings.Contains(s, "undefined") || strings.Contains(s, "NaN") {
+				t.Errorf("%s：文案里出现 undefined/NaN：%q %q %q", key, g.Label, g.Title, g.Reason)
+			}
 		}
 	}
 }
@@ -1642,19 +1957,25 @@ func TestAdminPanelGating(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{
-		marker,                        // 管理 Key 输入框
-		`id="keySave"`,                // 保存
-		`id="keyClear"`,               // 清除
-		"X-API-Key",                   // 内部请求自动带 Key
-		`"key=" + encodeURIComponent`, // 页面里的链接自动拼 ?key=…
-		"localStorage",                // 只存在本机浏览器
-		"/v1/admin/accounts",          // 调用的管理接口
+		marker,               // 管理 Key 输入框
+		`id="keySave"`,       // 保存
+		`id="keyClear"`,      // 清除
+		"X-API-Key",          // 内部请求自动带 Key
+		`vlSignUrl("adm_"`,   // 页面链接自动拼管理签名（绝不放明文 Key）
+		"localStorage",       // 只存在本机浏览器
+		"/v1/admin/accounts", // 调用的管理接口
 		"/v1/admin/stats",
 		"/v1/admin/quota",
 		"/v1/health", // 用于判断模式与版本
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("管理面板缺少 %q", want)
+		}
+	}
+	// 明文 Key 绝不能出现在页面生成的 URL 里（这是本次改动的核心要求）
+	for _, bad := range []string{"encodeURIComponent(ADMINKEY)", "encodeURIComponent(APIKEY)"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("页面里还留着把明文 Key 拼进 URL 的写法：%q", bad)
 		}
 	}
 	if strings.Contains(body, on.userKey) || strings.Contains(body, on.adminKey) {
@@ -1756,8 +2077,9 @@ func TestMuxSectionChoosesTracksAndChannel(t *testing.T) {
 		`function syncProxyBox()`, `syncProxyBox();`,
 		// 选项文本用 textContent，value 只放下标，不把 URL 塞进 DOM
 		`el("option", null,`, `o.value = String(i)`,
-		// 代理通道：必须把 Key 拼进 URL，否则账户模式下 /v1/proxy 直接 403
-		`withKey("/v1/proxy?url="`,
+		// 代理通道：必须把**签名**拼进 URL（明文 Key 不许进 URL），
+		// 否则账户模式下 /v1/proxy 直接 403
+		`signedQuery("/v1/proxy?url="`,
 		// 代理按体积计费：预估展示 + 读响应头拿实际值（前端不编数字）
 		`id="muxCost"`, `proxyCost`, `X-Quota-Consumed`, `配额/MiB`,
 		`rate_per_mib`, // 费率来自接口，前端不写死
@@ -1887,6 +2209,367 @@ func TestUIScriptsParse(t *testing.T) {
 		if out, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
 			t.Errorf("第 %d 个 script 块语法错误：%v\n%s", i+1, err, out)
 		}
+	}
+}
+
+// --- 签名凭据 ---
+
+// TestSignEndpointIssuesUsableCredential：签发端点要"签了就能用"，且不花配额。
+func TestSignEndpointIssuesUsableCredential(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+
+	before, ok := env.store.Get(env.userKey)
+	if !ok {
+		t.Fatal("测试账号应存在")
+	}
+	w := do(h, http.MethodGet, "/v1/sign", userHdr(env.userKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/sign 应 200，得到 %d：%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Key       string `json:"key"`
+		Query     string `json:"query"`
+		Type      string `json:"type"`
+		TTL       int64  `json:"ttl"`
+		IssuedAt  int64  `json:"issued_at"`
+		ExpiresAt int64  `json:"expires_at"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	handle, ts, _, ok := account.ParseCredential(body.Key)
+	if !ok {
+		t.Fatalf("签发的凭据形状不对：%q", body.Key)
+	}
+	if handle != account.Handle(env.userKey) {
+		t.Errorf("句柄 = %q，想要 %q", handle, account.Handle(env.userKey))
+	}
+	if body.Type != "account" || body.TTL != int64(account.DefaultTTL/time.Second) {
+		t.Errorf("type/ttl = %q/%d，想要 account/%d", body.Type, body.TTL, int64(account.DefaultTTL/time.Second))
+	}
+	if body.ExpiresAt != ts+body.TTL || body.IssuedAt != ts {
+		t.Errorf("issued_at/expires_at = %d/%d，与票面时间戳 %d + ttl %d 对不上",
+			body.IssuedAt, body.ExpiresAt, ts, body.TTL)
+	}
+	if !strings.HasPrefix(body.Query, "key=acc_") {
+		t.Errorf("query = %q，应是以 key=acc_ 开头的可拼接形式", body.Query)
+	}
+
+	// 签发是免费的：不扣配额、不增加调用计数
+	after, _ := env.store.Get(env.userKey)
+	if after.Quota != before.Quota || after.Calls != before.Calls {
+		t.Errorf("签发不该动配额/调用数：%v/%d → %v/%d",
+			before.Quota, before.Calls, after.Quota, after.Calls)
+	}
+
+	// 立刻拿去用：解析类接口（这里用不花上游的 /v1/usage）应放行
+	if w := do(h, http.MethodGet, "/v1/usage?"+body.Query, nil); w.Code != http.StatusOK {
+		t.Errorf("签发的凭据应立即可用，得到 %d：%s", w.Code, w.Body.String())
+	}
+	// 也应当能用于计量端点（走的是同一条认证路径）
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1&"+body.Query, nil); w.Code != http.StatusOK {
+		t.Errorf("签发的凭据在计量端点上应放行，得到 %d：%s", w.Code, w.Body.String())
+	}
+}
+
+// TestSignedQueryRejections：每一种"签名不对"都要有各自的稳定错误码。
+//
+// 分开的意义在于可操作性：过期要提示重新签发，时间戳在未来要提示对表，
+// 签名不符要提示 Key 不对。三种都只回 403 而文案一样的话，
+// 用户只能靠猜。
+func TestSignedQueryRejections(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	now := time.Now().Unix()
+	good := account.SignAt(account.HandlePrefix, env.userKey, now)
+	handle, ts, sig, ok := account.ParseCredential(good)
+	if !ok {
+		t.Fatal("黄金凭据解析失败")
+	}
+	flip := func(s string) string {
+		b := []byte(s)
+		if b[0] == 'a' {
+			b[0] = 'b'
+		} else {
+			b[0] = 'a'
+		}
+		return string(b)
+	}
+	// 句柄是别人的（不存在的账号），但签名是用**我们自己的** Key 算的：
+	// 服务端查不到句柄 → 与"Key 无效"同一口径，不泄漏账号是否存在。
+	ghost := account.HandleID(account.HandlePrefix, "vl_ghost")
+	ghostCred := account.SignAtWith(ghost, env.userKey, now)
+
+	cases := []struct{ name, key, wantKind string }{
+		{"过期的签名", account.SignAt(account.HandlePrefix, env.userKey, now-3600), "signature_expired"},
+		{"时间戳在未来", account.SignAt(account.HandlePrefix, env.userKey, now+3600), "signature_future"},
+		{"签名被改过", handle + "." + account.FormatTS(ts) + "." + flip(sig), "signature_invalid"},
+		{"时间戳被改过", handle + "." + account.FormatTS(ts+1) + "." + sig, "signature_invalid"},
+		{"URL 里放明文 Key", env.userKey, "key_format"},
+		{"形状不对", "acc_eb331e889382bce5", "key_format"},
+		{"前缀不对", "xyz_eb331e889382bce5.68a3e658." + sig, "key_format"},
+		{"句柄不存在", ghostCred, "key_invalid"},
+		{"管理签名用在账号接口", account.SignAt(account.AdminPrefix, env.adminKey, now), "key_scope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := do(h, http.MethodGet, "/v1/usage?key="+tc.key, nil)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("应 403，得到 %d：%s", w.Code, w.Body.String())
+			}
+			if kind, _, _ := errBody(t, w); kind != tc.wantKind {
+				t.Errorf("错误码 = %q，想要 %q（%s）", kind, tc.wantKind, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestAdminSignatureAuth：管理面同样只认签名（URL 里不放明文管理 Key）。
+func TestAdminSignatureAuth(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	now := time.Now().Unix()
+
+	signed := account.SignAt(account.AdminPrefix, env.adminKey, now)
+	if w := do(h, http.MethodGet, "/v1/admin/stats?key="+signed, nil); w.Code != http.StatusOK {
+		t.Fatalf("管理签名应通过，得到 %d：%s", w.Code, w.Body.String())
+	}
+	// 管理面板的链接就是这样生成的：/v1/admin/sign 拿一条签名
+	w := do(h, http.MethodGet, "/v1/admin/sign", userHdr(env.adminKey))
+	if w.Code != http.StatusOK {
+		t.Fatalf("/v1/admin/sign 应 200，得到 %d：%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Key  string `json:"key"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Type != "admin" || !strings.HasPrefix(body.Key, "adm_") {
+		t.Fatalf("管理签发结果不对：type=%q key=%q", body.Type, body.Key)
+	}
+	if w := do(h, http.MethodGet, "/v1/admin/accounts?key="+body.Key, nil); w.Code != http.StatusOK {
+		t.Errorf("签发的管理凭据应能用，得到 %d：%s", w.Code, w.Body.String())
+	}
+	// 反过来：账号 Key 拿不到管理签名，账号签名也进不了管理面
+	if w := do(h, http.MethodGet, "/v1/admin/sign", userHdr(env.userKey)); w.Code != http.StatusForbidden {
+		t.Errorf("账号 Key 不能签发管理签名，得到 %d", w.Code)
+	}
+	accSigned := account.SignAt(account.HandlePrefix, env.userKey, now)
+	w = do(h, http.MethodGet, "/v1/admin/stats?key="+accSigned, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("账号签名用在管理面应 403，得到 %d", w.Code)
+	}
+	if kind, _, _ := errBody(t, w); kind != "key_scope" {
+		t.Errorf("错误码 = %q，想要 key_scope", kind)
+	}
+	// 句柄对不上（签名合法但不是派生的那个 adm_ 句柄）→ 无效
+	alien := account.SignAtWith(account.HandleID(account.AdminPrefix, "别的管理 Key"), env.adminKey, now)
+	w = do(h, http.MethodGet, "/v1/admin/stats?key="+alien, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("句柄不匹配的管理签名应 403，得到 %d", w.Code)
+	}
+	if kind, _, _ := errBody(t, w); kind != "key_invalid" {
+		t.Errorf("错误码 = %q，想要 key_invalid", kind)
+	}
+	// 过期的管理签名
+	old := account.SignAt(account.AdminPrefix, env.adminKey, now-3600)
+	w = do(h, http.MethodGet, "/v1/admin/stats?key="+old, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("过期管理签名应 403，得到 %d", w.Code)
+	}
+	if kind, _, _ := errBody(t, w); kind != "signature_expired" {
+		t.Errorf("错误码 = %q，想要 signature_expired", kind)
+	}
+}
+
+// TestPublicAccountCanSign：公共账号也能签名，且**不构成绕过**——
+// 仍然按每 IP 日配额结算，而不是账本余额。
+func TestPublicAccountCanSign(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	w := do(h, http.MethodGet, "/v1/sign", userHdr("vl_public"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("公共账号应能签发，得到 %d：%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if w := do(h, http.MethodGet, "/v1/usage?"+body.Query, nil); w.Code != http.StatusOK {
+		t.Fatalf("公共账号的签名应能用，得到 %d：%s", w.Code, w.Body.String())
+	}
+	if w := do(h, http.MethodGet, "/v1/links?url=https://stub.test/v/1&"+body.Query, nil); w.Code != http.StatusOK {
+		t.Fatalf("公共账号的签名在计量端点应放行，得到 %d：%s", w.Code, w.Body.String())
+	}
+}
+
+// TestUISignatureMatchesGo：页面里那份**手写的** HMAC-SHA256 必须与 Go 侧
+// 算出完全一样的签名。
+//
+// 这是"前端自己算签名"这个设计唯一的单点风险：页面的 SHA-256 是纯 JS
+// 实现（因为没有 crypto.subtle 的可用性保证），只要有一处常量、移位或
+// 长度编码写错，用户看到的就是一片 403 而不知道原因。
+// 所以这里把页面里的那段脚本抽出来交给 node，跑 SHA-256/HMAC 的标准向量
+// 与项目黄金向量，并与 account.SignAt 的产物逐字符比对。
+func TestUISignatureMatchesGo(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过 JS 密码学交叉验证")
+	}
+	extract := func(html string) string {
+		t.Helper()
+		for _, b := range regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(html, -1) {
+			if strings.Contains(b[1], "vl-crypto") {
+				return b[1]
+			}
+		}
+		t.Fatal("页面里找不到 vl-crypto 脚本块")
+		return ""
+	}
+	uiBlock := extract(string(uiHTML))
+	adminBlock := extract(string(adminHTML))
+	// 两个页面必须用**同一份**实现：抄一份改一处是这类代码最典型的腐烂方式
+	if uiBlock != adminBlock {
+		t.Error("解析页与管理面板里的 vl-crypto 实现不一致，两份必须逐字符相同")
+	}
+	// 每页只能有一份：同名 const 在两个经典 <script> 里重复声明会让
+	// 后一个块整个 SyntaxError（而且是在浏览器里才炸，node --check 单块看不出来）
+	for name, html := range map[string]string{"ui.html": string(uiHTML), "admin.html": string(adminHTML)} {
+		n := 0
+		for _, b := range regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(html, -1) {
+			if strings.Contains(b[1], "function vlHmacSha256Hex") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s 里有 %d 份 HMAC 实现，必须恰好 1 份", name, n)
+		}
+	}
+	// 两页各自把"用哪把 Key、哪个前缀"写在自己的 signedQuery 里：
+	// 前缀写错（账号页用了 adm_）只会在运行时表现为 403，静态钉住它。
+	for name, tc := range map[string]struct{ html, want string }{
+		"ui.html":    {string(uiHTML), `vlSignUrl("acc_", APIKEY, url)`},
+		"admin.html": {string(adminHTML), `vlSignUrl("adm_", ADMINKEY, url)`},
+	} {
+		if !strings.Contains(tc.html, tc.want) {
+			t.Errorf("%s 里的 signedQuery 应是 %s", name, tc.want)
+		}
+	}
+
+	driver := `
+const out = [];
+out.push(vlSha256Hex("abc"));
+out.push(vlSha256Hex(""));
+out.push(vlHmacSha256Hex("Jefe", "what do ya want for nothing?"));
+const rep = (b, n) => new Uint8Array(n).fill(b);
+out.push(vlHex(vlHmacSha256(rep(0x0b, 20), vlUtf8("Hi There"))));
+out.push(vlHex(vlHmacSha256(rep(0xaa, 131), vlUtf8("Test Using Larger Than Block-Size Key - Hash Key First"))));
+out.push(vlCredentialAt("acc_", "vl_demo_key", 0x68a3e658));
+out.push(vlSignUrl("acc_", "vl_demo_key", "/v1/usage", 0x68a3e658));
+out.push(vlSignUrl("acc_", "", "/v1/usage", 123));
+console.log(JSON.stringify(out));
+`
+	dir := t.TempDir()
+	jsPath := filepath.Join(dir, "crypto.js")
+	if err := os.WriteFile(jsPath, []byte(uiBlock+"\n"+driver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, jsPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node 跑页面里的密码学实现失败：%v\n%s", err, out)
+	}
+	var got []string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("node 输出不是 JSON：%v\n%s", err, out)
+	}
+	golden := account.SignAt(account.HandlePrefix, "vl_demo_key", 0x68a3e658)
+	want := []string{
+		"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", // SHA-256("abc")
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", // SHA-256("")
+		"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", // RFC 4231 #2
+		"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", // RFC 4231 #1
+		"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", // RFC 4231 #6
+		golden,                    // 与 Go 的 account.SignAt 同源
+		"/v1/usage?key=" + golden, // URL 拼装
+		"/v1/usage",               // 免校验模式：没有 Key 就不签
+	}
+	if len(got) != len(want) {
+		t.Fatalf("node 返回 %d 项，想要 %d 项：%v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 项不一致：\n  JS   = %s\n  Go/向量 = %s", i, got[i], want[i])
+		}
+	}
+}
+
+// TestFrontendsSendSignaturesNotPlainKeys：两个页面对外发出的凭据一律是签名。
+//
+// 明文 Key 只该存在于本机浏览器的输入框与 localStorage 里。一旦它被放进
+// 请求头或 URL，就会出现在 DevTools 网络面板、反代日志与任何抓包里——
+// 而它长期有效，泄漏一次就等于把账号交出去。签名只有几十秒。
+func TestFrontendsSendSignaturesNotPlainKeys(t *testing.T) {
+	cases := map[string]struct {
+		html     string
+		wantSign string
+		badPlain []string
+	}{
+		"ui.html": {
+			html:     string(uiHTML),
+			wantSign: `vlCredentialAt("acc_", APIKEY`,
+			badPlain: []string{`"X-API-Key": APIKEY`, `"X-API-Key"] = APIKEY`, `encodeURIComponent(APIKEY)`},
+		},
+		"admin.html": {
+			html:     string(adminHTML),
+			wantSign: `vlCredentialAt("adm_", ADMINKEY`,
+			badPlain: []string{`"X-API-Key"] = ADMINKEY`, `"X-API-Key": ADMINKEY`, `encodeURIComponent(ADMINKEY)`},
+		},
+	}
+	for name, tc := range cases {
+		if !strings.Contains(tc.html, tc.wantSign) {
+			t.Errorf("%s 里的请求凭据应是现算签名：找不到 %s", name, tc.wantSign)
+		}
+		for _, bad := range tc.badPlain {
+			if strings.Contains(tc.html, bad) {
+				t.Errorf("%s 里还有把明文 Key 放进请求/URL 的写法：%s", name, bad)
+			}
+		}
+	}
+}
+
+// TestSignedCredentialWorksInHeader：签名既可以放 URL，也可以放请求头。
+//
+// 前端走的就是后者——这样明文 Key 根本不进网络。服务端按**形态**识别，
+// 而不是"URL 里才允许是签名"。
+func TestSignedCredentialWorksInHeader(t *testing.T) {
+	env := newTestEnv(t, nil, defaultStub())
+	h := env.handler()
+	now := time.Now().Unix()
+
+	acc := account.SignAt(account.HandlePrefix, env.userKey, now)
+	if w := do(h, http.MethodGet, "/v1/usage", userHdr(acc)); w.Code != http.StatusOK {
+		t.Fatalf("账号签名放在 X-API-Key 头里应通过，得到 %d：%s", w.Code, w.Body.String())
+	}
+	if w := do(h, http.MethodGet, "/v1/usage", map[string]string{"Authorization": "Bearer " + acc}); w.Code != http.StatusOK {
+		t.Fatalf("账号签名放在 Bearer 里应通过，得到 %d：%s", w.Code, w.Body.String())
+	}
+	adm := account.SignAt(account.AdminPrefix, env.adminKey, now)
+	if w := do(h, http.MethodGet, "/v1/admin/stats", userHdr(adm)); w.Code != http.StatusOK {
+		t.Fatalf("管理签名放在请求头里应通过，得到 %d：%s", w.Code, w.Body.String())
+	}
+	// URL 与头同时出现时头部优先：URL 里的过期签名不该把有效身份顶掉
+	old := account.SignAt(account.HandlePrefix, env.userKey, now-3600)
+	if w := do(h, http.MethodGet, "/v1/usage?key="+old, userHdr(env.userKey)); w.Code != http.StatusOK {
+		t.Fatalf("头部有效明文时不该被 URL 里的过期签名影响，得到 %d", w.Code)
+	}
+	// 但 URL 里放明文 Key 依然要拒（哪怕头部没带）
+	if w := do(h, http.MethodGet, "/v1/usage?key="+env.userKey, nil); w.Code != http.StatusForbidden {
+		t.Errorf("URL 里放明文 Key 应 403，得到 %d", w.Code)
 	}
 }
 
@@ -2231,8 +2914,9 @@ func TestAdminLedgerTotalAndScoped(t *testing.T) {
 			t.Errorf("按账号筛选后混进了别的账号：%v", e["id"])
 		}
 	}
-	// 明文 Key 也能寻址（运维手上通常就是 Key）
-	if w := do(h, http.MethodGet, "/v1/admin/ledger?key="+env.userKey, userHdr(env.adminKey)); w.Code != http.StatusOK {
+	// 明文 Key 也能寻址（运维手上通常就是 Key）；参数名是 account（或 id），
+	// 不能是 key —— 那个名字现在是"凭据"，URL 里只收签名。
+	if w := do(h, http.MethodGet, "/v1/admin/ledger?account="+env.userKey, userHdr(env.adminKey)); w.Code != http.StatusOK {
 		t.Errorf("按明文 Key 读应 200，得到 %d", w.Code)
 	}
 	// 不存在的账号 → 404；类型筛选照旧生效
@@ -2262,19 +2946,33 @@ func TestLedgerUIWiring(t *testing.T) {
 		`"/v1/ledger" + qs`,
 		// 各端点系数表里必须有代理那一行（口径与平台系数不同）
 		`媒体代理`, `配额/MiB`,
+		// 签到按钮常驻在「刷新用量」旁边，状态判定走纯函数 checkinState
+		`id="checkinBtn"`, `checkinState(`, `"强制签到"`, `"可否签到"`,
 	} {
 		if !strings.Contains(ui, want) {
 			t.Errorf("解析页缺少 %q", want)
 		}
 	}
+	// 按钮不许再 hidden/disabled：不可签时是「强制签到」，不是消失或变灰
+	if strings.Contains(ui, `class="primary hidden" id="checkinBtn"`) {
+		t.Error("签到按钮不该带 hidden：不可签时应显示为「强制签到」")
+	}
+	if strings.Contains(ui, `cb.disabled = !!`) || strings.Contains(ui, `cbtn.disabled = !!`) {
+		t.Error("签到按钮不该被禁用：状态可能是旧的，点一下让服务端给权威答复")
+	}
 	admin := string(adminHTML)
 	for _, want := range []string{
 		`id="ledgersec"`, `id="ledgerWho"`, `id="ledgerLoad"`, `loadLedger`,
 		`"/v1/admin/ledger" + qs`,
+		`&account=`, // 过滤器参数名是 account，不能是 key（key 现在是"凭据"）
 	} {
 		if !strings.Contains(admin, want) {
 			t.Errorf("管理面板缺少 %q", want)
 		}
+	}
+	// 流水过滤器里不许再出现 ?key=：那个名字现在只意味着"URL 里的签名凭据"
+	if strings.Contains(admin, `qs += "&key="`) {
+		t.Error("管理面板的流水过滤器还在用 &key=，应改成 &account=")
 	}
 }
 

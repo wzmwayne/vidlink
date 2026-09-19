@@ -174,6 +174,12 @@
       </div>
     </div>
     <div class="hint" id="keyState">未填写 Key，解析与用量查询都会被拒（403）。</div>
+    <div class="hint">
+      Key 只存在本机浏览器里，<b>不会出现在任何一次请求里</b>：本页对每次请求
+      现算一张签名（<span class="mono">acc_…</span>，约 30 秒有效）放在
+      <span class="mono">X-API-Key</span> 头，URL 里需要的场合（下载链接等）
+      同样是签名。抓包或看日志只会看到一张很快就作废的票。
+    </div>
     <div class="row hidden" id="pubrow" style="margin-top:8px">
       <div class="col">
         <div class="hint" id="pubHint" style="margin:0"></div>
@@ -189,7 +195,9 @@
     <h2>账户与用量</h2>
     <div id="usage">（点右侧刷新）</div>
     <div class="btns">
-      <button class="primary hidden" id="checkinBtn">每日签到领配额</button>
+      <!-- 签到按钮常驻可见：不可签时文案变成「强制签到」，而不是禁用/隐藏——
+           页面上的状态可能是旧的，点一下让服务端给权威答复。 -->
+      <button class="primary" id="checkinBtn">签到</button>
       <button id="usageRefresh">刷新用量</button>
       <span class="status" id="usageStatus" style="align-self:center"></span>
       <span class="status" id="checkinStatus" style="align-self:center"></span>
@@ -365,6 +373,147 @@
 </main>
 
 <script>
+/* vl-crypto: 纯 JS 的 SHA-256 / HMAC-SHA256 与 URL 签名（零依赖、零外部加载）。
+ *
+ * 为什么自己实现而不是用 crypto.subtle：
+ *   1) 签名必须在浏览器里现算——明文 Key 绝不能拼进 URL，而每次下载都
+ *      先问服务端要一次签名又太绕（多一次往返、还得处理失败重试）；
+ *   2) crypto.subtle 只在**安全上下文**可用，而本项目经常跑在
+ *      http://192.168.x.x:8080 这种局域网明文地址上，那里它是 undefined；
+ *   3) 页面不允许加载任何外部资源，引 CDN 上的实现也不行。
+ * 纯 JS 版本哪儿都能跑，一次签名实测几十微秒，比一次网络往返便宜得多。
+ *
+ * 正确性由测试保证：internal/server/server_test.go 会把这一段脚本抽出来
+ * 交给 node 跑 RFC 4231 的 HMAC 向量与项目自己的黄金向量，
+ * 并与 Go 侧 account.SignAt 的产物逐字符比对。
+ */
+
+// SHA-256 轮常量：前 64 个质数立方根小数部分的前 32 位。
+const VL_K256 = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+// vlRo 是 32 位循环右移（>>> 是无符号右移，左移后必须再 >>> 0 收回 32 位）。
+function vlRo(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+
+function vlUtf8(s) { return new TextEncoder().encode(s); }
+
+function vlHex(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+// vlSha256 计算 SHA-256，返回 32 字节。
+function vlSha256(bytes) {
+  const len = bytes.length;
+  // 补位：0x80 + 若干个 0 + 8 字节大端比特长度，凑成 64 字节的整数倍。
+  const total = (((len + 9) + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  const view = new DataView(buf.buffer);
+  const bits = len * 8;
+  view.setUint32(total - 8, Math.floor(bits / 4294967296));
+  view.setUint32(total - 4, bits >>> 0);
+
+  const h = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ]);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      const s0 = vlRo(x, 7) ^ vlRo(x, 18) ^ (x >>> 3);
+      const s1 = vlRo(y, 17) ^ vlRo(y, 19) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h[0], b = h[1], c = h[2], d = h[3];
+    let e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = vlRo(e, 6) ^ vlRo(e, 11) ^ vlRo(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (hh + S1 + ch + VL_K256[i] + w[i]) >>> 0;
+      const S0 = vlRo(a, 2) ^ vlRo(a, 13) ^ vlRo(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i]);
+  return out;
+}
+
+// vlSha256Hex 返回 64 位小写十六进制（句柄就是它的前 16 位，见 vlSignUrl）。
+function vlSha256Hex(s) { return vlHex(vlSha256(vlUtf8(s))); }
+
+// vlHmacSha256 计算 HMAC-SHA256，返回 32 字节。
+//
+// 分成"字节版 + 字符串版"两层：字符串版只是 UTF-8 + 十六进制包装，
+// 测试可以直接喂 RFC 4231 的原始字节向量，不用绕 UTF-8 编码。
+function vlHmacSha256(keyBytes, msgBytes) {
+  let k = keyBytes;
+  if (k.length > 64) k = vlSha256(k);        // 超长 Key 先哈希（RFC 2104）
+  const block = new Uint8Array(64);
+  block.set(k);
+  const inner = new Uint8Array(64 + msgBytes.length);
+  const outer = new Uint8Array(64 + 32);
+  for (let i = 0; i < 64; i++) {
+    inner[i] = block[i] ^ 0x36;              // ipad
+    outer[i] = block[i] ^ 0x5c;              // opad
+  }
+  inner.set(msgBytes, 64);
+  outer.set(vlSha256(inner), 64);
+  return vlSha256(outer);
+}
+
+// vlHmacSha256Hex 计算 HMAC-SHA256，返回完整的 64 位小写十六进制。
+function vlHmacSha256Hex(key, msg) {
+  return vlHex(vlHmacSha256(vlUtf8(key), vlUtf8(msg)));
+}
+
+// vlCredentialAt 生成一条签名凭据（ts 显式传入，便于测试与"提前签发"）：
+//
+//   acc_<16位句柄>.<8位hex时间戳>.<64位签名>
+//   签名 = HMAC-SHA256(Key, "句柄|时间戳hex")，完整 64 位，不截断。
+//
+// 时间戳与句柄都在签名原料里：改期、换句柄都会对不上；而服务器只需
+// 读出票面时间做减法、再正向复算一次 HMAC，既不用反推也不用遍历。
+function vlCredentialAt(prefix, key, ts) {
+  // ts 省略时取当前秒：调用方（页面、示例）都不必自己算时间。
+  const t = ts === undefined ? Math.floor(Date.now() / 1000) : ts;
+  const handle = prefix + vlSha256Hex(key).slice(0, 16);
+  const tsHex = t.toString(16).padStart(8, "0");
+  return handle + "." + tsHex + "." + vlHmacSha256Hex(key, handle + "|" + tsHex);
+}
+
+// vlSignUrl 把签名凭据以 ?key= 拼到 URL 上；key 为空（免校验模式）时原样返回。
+// ts 省略时取当前秒；服务端允许 ±30 秒的时间偏差（VIDLINK_SIG_TTL）。
+function vlSignUrl(prefix, key, url, ts) {
+  if (!key) return url;
+  const t = ts === undefined ? Math.floor(Date.now() / 1000) : ts;
+  const cred = vlCredentialAt(prefix, key, t);
+  return url + (url.includes("?") ? "&" : "?") + "key=" + cred;
+}
+</script>
+
+<script>
 (() => {
   "use strict";
   const $ = (s) => document.querySelector(s);
@@ -387,18 +536,35 @@
 
   // ---------- 基础设施 ----------
 
-  // withKey 把 Key 拼进 URL —— 只有 <a>/<video> 这类走浏览器原生请求的地方
-  // 才需要它（不能自定义请求头）。fetch 一律走 api()，用请求头传 Key。
-  function withKey(url) {
-    if (!APIKEY) return url;
-    return url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(APIKEY);
+  // signedQuery 把**签名**凭据拼进 URL —— 只有 <a>/<video> 这类走浏览器原生
+  // 请求的地方才需要它（不能自定义请求头）。
+  //
+  // 关键是"签名"而不是"把 Key 拼进去"：URL 会留在浏览器历史、下载记录、
+  // 隧道日志与截屏里，而明文 Key 是长期有效的。签名由本页现算（见上面的
+  // vl-crypto 脚本块），有效期只有几十秒，泄露一张过期的签名什么都换不来。
+  // 免校验模式（APIKEY 为空）下没有凭据可签，原样返回。
+  function signedQuery(url) {
+    return vlSignUrl("acc_", APIKEY, url);
+  }
+
+  // signedCredential 是本页**所有请求**用的凭据：现算的签名（不是明文 Key）。
+  //
+  // 上一次改动静是 URL 里的明文 Key；这次连请求头也不再放明文了。
+  // 明文 Key 只存在于本机浏览器的输入框与 localStorage 里，不出现在
+  // 任何一次网络往返中——浏览器 DevTools 的网络面板、反代日志、抓包
+  // 看到的都只是一张几十秒就作废的票。签名很便宜（几十微秒），
+  // 所以每次请求现算，不需要缓存。
+  function signedCredential() {
+    if (!APIKEY) return "";
+    return vlCredentialAt("acc_", APIKEY, Math.floor(Date.now() / 1000));
   }
 
   async function api(path, opts) {
     const t0 = performance.now();
     const o = Object.assign({}, opts);
-    if (APIKEY) {
-      o.headers = Object.assign({}, o.headers, { "X-API-Key": APIKEY });
+    const cred = signedCredential();
+    if (cred) {
+      o.headers = Object.assign({}, o.headers, { "X-API-Key": cred });
     }
     const res = await fetch(path, o);
     const text = await res.text();
@@ -578,7 +744,7 @@
       try {
         const title = await ensureTitle();
         const name = dlName(title, kind, quality, ext);
-        const href = withKey("/v1/proxy?url=" + encodeURIComponent(url) +
+        const href = signedQuery("/v1/proxy?url=" + encodeURIComponent(url) +
                      "&filename=" + encodeURIComponent(name) +
                      "&type=" + encodeURIComponent(mimeOf(ext)));
         const a = document.createElement("a");
@@ -935,6 +1101,44 @@
 
   // ---------- 身份与用量 ----------
 
+  // checkinState 决定签到按钮的样子与「可否签到」那一行。
+  //
+  // 它是一个**只看入参的纯函数**：这样 Go 侧的测试可以把它整段抽出来、
+  // 在 node 里喂四种账号状态跑一遍，断言文案——按钮文案与状态判断出错
+  // 是用户最容易看到的那种 bug，值得静态钉住。
+  //
+  // 三种"不能签"的情形文案各不相同，因为它们要做的事不一样：
+  //   今日已签 → 明天零点再来；未开放 → 找管理员开额度；公共 Key → 根本不需要签。
+  // 无论哪种，按钮都**不禁用**：页面上的状态可能是旧的（刚过零点、管理员
+  // 在别处改了额度、换了 Key 还没刷新），点一下让服务端给权威答复。
+  function checkinState(d) {
+    const ci = d.checkin || null;
+    if (d.public === true) {
+      return { show: false, can: false, label: "签到",
+        title: "公共 Key 的额度按 IP 每日自动给，不需要签到",
+        reason: "不可以：公共 Key 按 IP 每日自动给额度，无需签到" };
+    }
+    if (!ci) {
+      // 接口没给这一段（异常/旧服务端）：不显示按钮，也不编一句谎
+      return { show: false, can: false, label: "签到", title: "", reason: "" };
+    }
+    if (ci.enabled !== true) {
+      return { show: true, can: false, label: "强制签到",
+        title: "该账号未开放每日签到（管理员未设置额度）；点击仍会向服务端确认",
+        reason: "不可以：账号未开放每日签到（请找管理员设置「每日签到额度」）" };
+    }
+    if (ci.checked_in_today === true) {
+      const day = ci.last_checkin_day ? "（" + ci.last_checkin_day + "）" : "";
+      return { show: true, can: false, label: "强制签到",
+        title: "今天已经签过了" + day + "；点击仍会向服务端确认",
+        reason: "不可以：今天已经签过了" + day + "，明天零点后可再签" };
+    }
+    return { show: true, can: true, label: "签到",
+      title: "领取 +" + ci.daily + " 配额（每天一次）",
+      reason: "可以：点击「签到」领取 +" + ci.daily + " 配额" +
+        (ci.cap ? "（上限 " + ci.cap + "）" : "（不封顶）") };
+  }
+
   function setKeyState(text, bad) {
     const el2 = $("#keyState");
     el2.textContent = text;
@@ -986,25 +1190,28 @@
       add("单位", d.unit);
       box.appendChild(dl);
 
-      // 每日签到：接口始终给这一段，enabled 表示这个账号能不能签
-      if (d.checkin && d.checkin.enabled) {
-        add("每日签到", "+" + d.checkin.daily + (d.checkin.cap ? "，上限 " + d.checkin.cap : "（不封顶）"));
-        add("签到状态", d.checkin.checked_in_today
-          ? ("今天已签到" + (d.checkin.last_checkin_day ? "（" + d.checkin.last_checkin_day + "）" : ""))
-          : "今天还没签到");
-        const cb = $("#checkinBtn");
-        cb.classList.remove("hidden");
-        cb.disabled = !!d.checkin.checked_in_today;
-        cb.title = d.checkin.checked_in_today
-          ? "今天已经签过了，明天零点后可再签"
-          : ("领取 +" + d.checkin.daily + " 配额（每天一次）");
-        cb.textContent = d.checkin.checked_in_today ? "今日已签到" : "每日签到领配额";
+      // 每日签到：接口始终给这一段，enabled 表示这个账号能不能签。
+      // 文案与状态全部由 checkinState 决定（纯函数，有 node 单测钉着）。
+      // 名字避开上面的 `st`（那是 #usageStatus 元素）——同名 const 会让
+      // 整个 <script> 块解析失败，功能静默消失，这类坑踩过一次了。
+      const ck = checkinState(d);
+      const cbtn = $("#checkinBtn");
+      if (ck.show) {
+        cbtn.classList.remove("hidden");
+        cbtn.disabled = false;                     // 永不禁用：不可签时它就是「强制签到」
+        cbtn.classList.toggle("primary", ck.can);  // 能签才用醒目样式
+        cbtn.textContent = ck.label;
+        cbtn.title = ck.title;
       } else {
-        const cb = $("#checkinBtn");
-        cb.classList.add("hidden");
-        cb.disabled = false;
+        cbtn.classList.add("hidden");
+        cbtn.disabled = false;
         $("#checkinStatus").textContent = "";
       }
+      if (d.checkin && d.checkin.enabled) {
+        add("每日签到", "+" + d.checkin.daily +
+          (d.checkin.cap ? "，上限 " + d.checkin.cap : "（不封顶）"));
+      }
+      if (ck.reason) add("可否签到", ck.reason);
 
       // 公共账号：额度是"本 IP 今天"的，也没有个人账单。
       // 说明放在常规字段之后，别把"账号/配额"那几行挤到下面去。
@@ -1285,7 +1492,11 @@
   });
   $("#usageRefresh").addEventListener("click", loadUsage);
 
-  // 每日签到：POST /v1/checkin，成功后刷新用量（余额变了）
+  // 签到 / 强制签到：都打同一个 POST /v1/checkin。
+  //
+  // 「强制签到」不代表绕过服务端规则——服务端照旧每天一次，只是页面上的
+  // 状态可能是旧的（刚过零点、管理员改了额度、换了 Key），所以按钮不禁用，
+  // 点一下让服务端给权威答复，成功/失败文案都照原样显示出来。
   $("#checkinBtn").addEventListener("click", async () => {
     const b = $("#checkinBtn");
     const st = $("#checkinStatus");
@@ -1301,10 +1512,12 @@
       } else {
         const e = (r.body && r.body.error) || {};
         st.textContent = "HTTP " + r.status + " " + (e.message || "");
-        b.disabled = false;
       }
     } catch (e) {
       st.textContent = "签到失败：" + e;
+    } finally {
+      // 必须在 finally 里恢复：成功分支过去不会走到恢复那一步，
+      // 结果就是"签一次成功之后按钮永久变灰"。
       b.disabled = false;
     }
   });
@@ -1321,10 +1534,16 @@
   $("#url").addEventListener("keydown", (e) => { if (e.key === "Enter") run("links"); });
 
   // 供下面的"浏览器内混流"脚本复用（同一个页面，没必要写两遍）
-  window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target, withKey,
+  //
+  // 规则：混流脚本是**另一个 <script>**，只能看见这里导出的东西；而
+  // myMultiplier / myProxyRate / proxyEnabled 要等 /v1/usage 回来才有值，
+  // 所以用 getter 导出（导出快照会永远停在 null，那就成了"页面看起来对、
+  // 数字永远是默认值"的暗坑）。
+  window.VL = { api, el, copyBtn, openBtn, prettySize, prettyNum, target, signedQuery,
                 dlName, qualityLabel, DL, ensureTitle,
                 proxyCost, fmtUnits, refreshUsage: loadUsage,
                 multiplier: () => myMultiplier,
+                proxyRate: () => myProxyRate,
                 proxyOn: () => proxyEnabled };
   boot();
 })();
@@ -1357,8 +1576,8 @@
  */
 (() => {
   "use strict";
-  const { api, el, prettySize, target, proxyOn, withKey, dlName, qualityLabel, DL, ensureTitle,
-          proxyCost, fmtUnits, refreshUsage, multiplier } = window.VL;
+  const { api, el, prettySize, target, proxyOn, signedQuery, dlName, qualityLabel, DL, ensureTitle,
+          proxyCost, fmtUnits, refreshUsage, multiplier, proxyRate } = window.VL;
   let muxKey = "";        // 当前已取到的清晰度列表对应哪个目标（换了链接就重取）
   const $ = (s) => document.querySelector(s);
   const DIR = "vidlink-mux";
@@ -1501,9 +1720,9 @@
           "取消勾选可以试直连。");
       }
       phase(phaseText + "（经服务端代理）…");
-      // withKey：账户模式下 /v1/proxy 也要鉴权，而这里走的是原生 fetch，
-      // 加不了自定义头，只能把 Key 拼进查询参数。
-      const url = withKey("/v1/proxy?url=" + encodeURIComponent(stream.url) +
+      // signedQuery：账户模式下 /v1/proxy 也要鉴权，而这里走的是原生 fetch，
+      // 加不了自定义头，只能把**签名**拼进查询参数（绝不拼明文 Key）。
+      const url = signedQuery("/v1/proxy?url=" + encodeURIComponent(stream.url) +
         (ref ? "&referer=" + encodeURIComponent(ref) : ""));
       return await once(url, name + ".proxy.m4s");
     }
@@ -1766,15 +1985,18 @@
       box.textContent = "代理下载（免校验模式：不计量配额）。";
       return;
     }
+    // 费率与倍率都从 window.VL 取：混流脚本看不见主脚本里的变量
+    // （myProxyRate 曾因为漏导出而在有体积的详情上抛 ReferenceError）。
+    const rate = proxyRate() === null ? 0.5 : proxyRate();
     const v = ((tracks || {}).videos || [])[Number($("#muxVq").value) || 0];
     const a = ((tracks || {}).audios || [])[Number($("#muxAq").value) || 0];
     if (v && a && v.size && a.size) {
       const mib = (v.size + a.size) / (1024 * 1024);
-      box.textContent = "代理按体积计费：" + (myProxyRate === null ? 0.5 : myProxyRate) +
+      box.textContent = "代理按体积计费：" + rate +
         " 配额/MiB × 账号倍率 " + m + "；本次两轨约 " +
         fmtUnits(mib) + " MiB ≈ " + fmtUnits(proxyCost(v.size + a.size)) + " 配额（实际以响应头为准）。";
     } else {
-      box.textContent = "代理按体积计费：" + (myProxyRate === null ? 0.5 : myProxyRate) +
+      box.textContent = "代理按体积计费：" + rate +
         " 配额/MiB × 账号倍率 " + m +
         "；上游没给体积，实际消耗以响应头 X-Quota-Consumed 为准。";
     }

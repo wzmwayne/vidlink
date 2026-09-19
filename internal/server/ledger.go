@@ -133,8 +133,12 @@ func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminLedger 返回指定账号或全部账号的流水。GET /v1/admin/ledger
 //
-// 寻址方式与管理面其它接口一致：`?id=` 句柄或 `?key=` 明文 Key，
+// 寻址方式与管理面其它接口一致：`?account=` 句柄或明文 Key（`?id=` 同义），
 // 都不给就是总账单。
+//
+// 这里**不用** `?key=`：那个参数名现在是"凭据"的意思（URL 里只接受签名），
+// 而本参数是"把范围限定到哪个账号"的过滤器。两者同名会让
+// `/v1/admin/ledger?key=<明文>` 既像认证又像过滤，是最容易埋坑的一类歧义。
 func (s *Server) handleAdminLedger(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -145,16 +149,16 @@ func (s *Server) handleAdminLedger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw := strings.TrimSpace(r.URL.Query().Get("id"))
+	raw := strings.TrimSpace(r.URL.Query().Get("account"))
 	if raw == "" {
-		raw = strings.TrimSpace(r.URL.Query().Get("key"))
+		raw = strings.TrimSpace(r.URL.Query().Get("id"))
 	}
 	resp := map[string]any{
 		"unit":      unitName,
 		"types":     ledgerTypesDoc(),
 		"limit_max": account.MaxLedgerLimit,
 		"note": "流水只保留最近若干条，汇总为全量口径；本接口不消耗配额。" +
-			"不带 id/key 即总账单",
+			"不带 account/id 即总账单",
 	}
 	if raw == "" {
 		entries, totals := s.accounts.Ledger(q)

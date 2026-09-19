@@ -80,6 +80,13 @@ type Server struct {
 	// 计量路径直接读 rates.Table()（读锁），改价不会给每次请求加锁。
 	rates *rates.Store
 
+	// sigTTL 是签名凭据的时间容差（见 config.SigTTL）。
+	sigTTL time.Duration
+	// adminHandle 是管理签名的句柄（adm_ + 16 位），启动时算一次。
+	// 每个管理请求都现算一次 SHA-256 没必要，而且它必须与校验时用的
+	// 那个值严格一致，缓存下来就没有"两处算法漂移"的余地。
+	adminHandle string
+
 	startedAt time.Time
 	reqCount  atomic.Int64
 	errCount  atomic.Int64
@@ -150,18 +157,33 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		}
 	}
 
+	sigTTL := cfg.SigTTL
+	if sigTTL <= 0 {
+		// 直接构造 Config 的调用方（测试、内嵌使用）可能没填这个字段。
+		// 0 会让所有签名立刻过期，而症状是"签名永远验不过"——极难排查，
+		// 所以这里兜一个默认值，而不是让它生效。
+		sigTTL = account.DefaultTTL
+	}
+	adminKey := strings.TrimSpace(cfg.AdminKey)
+	adminHandle := ""
+	if adminKey != "" {
+		adminHandle = account.HandleID(account.AdminPrefix, adminKey)
+	}
+
 	return &Server{
-		cfg:        cfg,
-		svc:        svc,
-		http:       &http.Client{Transport: tr},
-		log:        log,
-		limiter:    newIPLimiter(effectiveRPM(cfg)),
-		accounts:   d.Accounts,
-		gate:       d.Gate,
-		quotaTable: d.QuotaTable,
-		publicQ:    d.PublicQ,
-		rates:      d.Rates,
-		startedAt:  time.Now(),
+		cfg:         cfg,
+		svc:         svc,
+		http:        &http.Client{Transport: tr},
+		log:         log,
+		limiter:     newIPLimiter(effectiveRPM(cfg)),
+		accounts:    d.Accounts,
+		gate:        d.Gate,
+		quotaTable:  d.QuotaTable,
+		publicQ:     d.PublicQ,
+		rates:       d.Rates,
+		sigTTL:      sigTTL,
+		adminHandle: adminHandle,
+		startedAt:   time.Now(),
 	}, nil
 }
 
@@ -221,6 +243,8 @@ func (s *Server) routes() []routeSpec {
 		specs = append(specs,
 			routeSpec{method: http.MethodGet, path: "/v1/usage", handler: s.handleUsage},
 			routeSpec{method: http.MethodGet, path: "/v1/ledger", handler: s.handleLedger},
+			// 签发签名凭据：URL 里唯一允许的凭据形态，见 auth.go
+			routeSpec{method: http.MethodGet, path: "/v1/sign", handler: s.handleSign},
 			// 每日签到领配额：与用量、账单一样属于"身份相关但不计费"的接口
 			routeSpec{method: http.MethodPost, path: "/v1/checkin", handler: s.handleCheckIn})
 		// ---- 管理面：用固定管理 Key（未配置时每条都恒 403）----
@@ -498,7 +522,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 
 		// 健康检查噪音太大，降级为 debug
 		lvl := slog.LevelInfo
-		if strings.HasPrefix(r.URL.Path, "/api/v1/health") ||
+		if strings.HasPrefix(r.URL.Path, "/v1/health") ||
 			r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 			lvl = slog.LevelDebug
 		}
@@ -510,6 +534,9 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			"bytes", rec.bytes,
 			"ms", time.Since(start).Milliseconds(),
 			"ip", s.clientIP(r),
+			// 凭据来源：排查"403 到底是没带还是带了错的"最快的一眼。
+			// 只记录来源（header/bearer/signed-url），不记凭据本身。
+			"auth", authLogSource(r),
 		)
 	})
 }
@@ -651,6 +678,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"proxy":       s.cfg.ProxySrv.Enabled,
 		"webui":       s.cfg.WebUI,
 		"cache":       s.svc.CacheStats(),
+		// time 与 sign_ttl 是给"签名过期/时间戳在未来"这类报错服务的信息：
+		// 调用方拿本机 `date +%s` 一减就知道自己的钟偏了多少——
+		// 这在本地自行签发（openssl / 脚本）的场景里是最常见的原因。
+		"time":     time.Now().Unix(),
+		"sign_ttl": int(s.sigTTL / time.Second),
 	}
 	// 公共入口：Key 是公开信息，页面据此给出"免注册试用"的入口；
 	// 免校验模式下整条概念不存在，不报。

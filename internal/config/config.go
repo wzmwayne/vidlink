@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"vidlink/internal/account"
 	"vidlink/internal/core"
 	"vidlink/internal/deps"
 	"vidlink/internal/publicq"
@@ -103,6 +104,17 @@ type Config struct {
 	// 与账本同目录，这样容器只需要挂一个卷两样都持久化。
 	// 为空 = 纯内存：改动重启即丢，只适合测试。
 	RatesPath string
+
+	// SigTTL 是签名凭据的时间容差与有效期（默认 30 秒）。
+	//
+	// URL 里只接受签名凭据（明文 Key 只能走请求头），签名形如
+	// `acc_<16位句柄>.<8位hex时间戳>.<64位hex签名>`：服务器读出票面的
+	// 时间戳做减法，|now-ts| ≤ SigTTL 才继续验签。所以这个值同时是
+	// "允许的时钟偏差"和"链接能活多久"。
+	//
+	// 调大它只有一个理由：代理下载很大、断点续传要跨越签发时刻
+	// （浏览器续传用的是同一个 URL）。默认 30 秒足够点一下就开始下载的场景。
+	SigTTL time.Duration
 
 	// RateLimitRPM 是每 IP 每分钟请求上限；<=0 表示不限。
 	RateLimitRPM int
@@ -311,6 +323,7 @@ func Load() (*Config, error) {
 		PublicDailyQuota:   envFloat("VIDLINK_PUBLIC_DAILY_QUOTA", publicq.DefaultDaily),
 		ProxyRate:          envFloat("VIDLINK_PROXY_RATE", quota.ProxyRate),
 		RatesPath:          env("VIDLINK_RATES_PATH", "data/rates.json"),
+		SigTTL:             envDuration("VIDLINK_SIG_TTL", account.DefaultTTL),
 		RateLimitRPM:       envInt("VIDLINK_RATE_LIMIT_RPM", 120),
 		CORSOrigins:        splitList(env("VIDLINK_CORS_ORIGINS", "*")),
 		Proxy:              env("VIDLINK_PROXY", ""),
@@ -379,6 +392,11 @@ func (c *Config) IsEase() bool { return c != nil && c.Ease }
 func (c *Config) validate() error {
 	if c.Addr == "" {
 		return fmt.Errorf("config: VIDLINK_ADDR 不能为空")
+	}
+	// 签名有效期：太小则连一次网络往返都撑不住（等于谁都验不过），
+	// 太大则失去"URL 泄露也无所谓"的意义。
+	if c.SigTTL < 5*time.Second || c.SigTTL > time.Hour {
+		return fmt.Errorf("config: VIDLINK_SIG_TTL(%s) 必须在 5s 到 1h 之间", c.SigTTL)
 	}
 	if c.Service.BatchConcurrency < 1 {
 		c.Service.BatchConcurrency = 1

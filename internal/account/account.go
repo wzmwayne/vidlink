@@ -22,8 +22,6 @@ package account
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -151,9 +149,11 @@ func (a Account) Public() Account {
 // 可以忽略，而长度足够短，能放进 URL 路径、日志和运维对话里。
 // 前缀 acc_ 让它与 vl_ 开头的 Key 一眼可分——句柄可以被冒用者当成 Key
 // 去调用接口（会 403），但绝不会有人把它误当凭据保存。
+//
+// 派生逻辑只有 HandleID 一份实现（见 credential.go）：签名凭据要靠
+// 「句柄 → Key」反过来找人，两边算法若各写一份，迟早会对不上。
 func Handle(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return "acc_" + hex.EncodeToString(sum[:8])
+	return HandleID(HandlePrefix, key)
 }
 
 // ErrQuotaExhausted 配额不足。
@@ -180,6 +180,16 @@ var ErrDuplicate = errors.New("账号已存在")
 type Store struct {
 	mu       sync.RWMutex
 	accounts map[string]*Account
+
+	// byHandle 是「句柄 → Key」的索引，只为**签名凭据**这条认证路径存在。
+	//
+	// 为什么不像 Resolve 那样线性扫描：签名认证在每个带凭据的请求上都要
+	// 走一次，是热路径；而 Key 一旦创建不可改（Patch 里没有 Key 字段），
+	// 所以索引只需要在回放/创建/删除三处同步，不会成为"要跟着改"的负担。
+	//
+	// 它是派生数据的缓存：内容永远等于 {Handle(a.Key): a.Key}，
+	// 回放时全量重建，因此重启后不可能残留脏数据。
+	byHandle map[string]string
 
 	// 配额流水：常驻内存只保留最近 ledgerKeep 条，汇总则是全量增量累计。
 	// 两者都在回放时重建，因此重启不丢。
@@ -210,6 +220,7 @@ func New(opts Options) (*Store, error) {
 	}
 	s := &Store{
 		accounts:    make(map[string]*Account, 64),
+		byHandle:    make(map[string]string, 64),
 		totalsAll:   make(map[EntryType]Totals, 8),
 		totalsByKey: make(map[string]map[EntryType]Totals, 64),
 		path:        opts.Path,
@@ -281,6 +292,7 @@ func (s *Store) replay() error {
 		}
 		if a.Deleted {
 			delete(s.accounts, a.Key)
+			delete(s.byHandle, Handle(a.Key))
 			continue
 		}
 		// 句柄是派生的：旧账本里没有这个字段，历史记录也无需迁移，
@@ -288,6 +300,7 @@ func (s *Store) replay() error {
 		a.ID = Handle(a.Key)
 		cp := a
 		s.accounts[a.Key] = &cp
+		s.byHandle[a.ID] = a.Key
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("回放账本失败: %w", err)
@@ -516,9 +529,9 @@ func (s *Store) ClearCheckInDay(key string) {
 // 两种寻址方式并存的原因：管理面板手上只有句柄（它拿不到明文 Key），
 // 而运维用 curl 时手上往往就是明文 Key，没必要先换算一遍。
 //
-// 用线性扫描而不是维护"句柄 → Key"的索引：管理操作是低频人工动作，
-// 账号量级在几百到几千，扫描的代价可以忽略；而多一份索引就多一处
-// 需要与创建/删除/回放保持同步的地方，那类不同步的 bug 更贵。
+// 顺序是"精确 Key → 句柄索引 → 兜底扫描"：Key 优先，因为一个账号的 Key
+// 有可能恰好长得像另一个账号的句柄（极端但合法）；最后的扫描只是兜底，
+// 正常路径不会走到——签名认证走的是更严格的 ByHandle（只认句柄、只走索引）。
 func (s *Store) Resolve(ref string) (Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -528,12 +541,42 @@ func (s *Store) Resolve(ref string) (Account, bool) {
 	if ref == "" {
 		return Account{}, false
 	}
+	if key, ok := s.byHandle[ref]; ok {
+		if a, ok := s.accounts[key]; ok {
+			return *a, true
+		}
+	}
 	for _, a := range s.accounts {
 		if a.ID == ref {
 			return *a, true
 		}
 	}
 	return Account{}, false
+}
+
+// ByHandle 按句柄取账号（签名凭据的认证路径）。
+//
+// 与 Resolve 的区别：这里**只认句柄**、且只走索引——调用方拿到的一定是
+// 20 字符的句柄形态，没有"也可能是个 Key"的歧义；而 Resolve 是给运维用的
+// 宽松入口（明文 Key 或句柄都行），保留了兜底扫描。
+//
+// 索引由 replay/Create/Delete 维护，内容恒等于 {Handle(Key): Key}，
+// 所以这里不需要再扫一遍：扫一遍等于承认索引可能不全，那才是真正的问题。
+func (s *Store) ByHandle(handle string) (Account, bool) {
+	if handle == "" {
+		return Account{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.byHandle[handle]
+	if !ok {
+		return Account{}, false
+	}
+	a, ok := s.accounts[key]
+	if !ok {
+		return Account{}, false
+	}
+	return *a, true
 }
 
 // Count 返回账号数。
@@ -585,6 +628,7 @@ func (s *Store) Create(a Account) (Account, error) {
 	}
 	cp := a
 	s.accounts[a.Key] = &cp
+	s.byHandle[a.ID] = a.Key
 	e := Entry{
 		Time: now, Type: EntryCreate, Key: a.Key, ID: a.ID, Name: a.Name,
 		Units: a.Quota, Balance: a.Quota, Used: a.Used, Calls: a.Calls,
@@ -593,6 +637,7 @@ func (s *Store) Create(a Account) (Account, error) {
 	s.ledgerAdd(e)
 	if err := s.appendAccount(&cp, &e); err != nil {
 		delete(s.accounts, a.Key) // 落盘失败就回滚，避免内存与磁盘不一致
+		delete(s.byHandle, a.ID)
 		s.ledgerDrop()
 		return Account{}, err
 	}
@@ -739,6 +784,7 @@ func (s *Store) Delete(key string) error {
 	}
 	a := s.accounts[key]
 	delete(s.accounts, key)
+	delete(s.byHandle, a.ID)
 	// 追加一条墓碑记录，回放时据此移除。保留原账号的 Used/Calls
 	// 之外的信息没有意义，但把它标成 Deleted 就足以让回放跳过它。
 	now := s.now()
@@ -753,6 +799,7 @@ func (s *Store) Delete(key string) error {
 		CreatedAt: now, UpdatedAt: now,
 	}, &e); err != nil {
 		s.accounts[key] = a // 落盘失败回滚：账号不能"删了但文件里没有"
+		s.byHandle[a.ID] = key
 		s.ledgerDrop()
 		return err
 	}
