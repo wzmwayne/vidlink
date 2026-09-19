@@ -4,6 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -309,5 +314,201 @@ func TestSearchCapabilityMatchesQuotaReasons(t *testing.T) {
 	}
 	if seenSearchable == 0 {
 		t.Fatal("没有任何平台可搜索：内置注册表可能没接上")
+	}
+}
+
+// TestUISeriesSelectionWiring：前端必须真的能选集——
+// 线路按钮、选集按钮、parse_id、以及"切线路要带上 quality 重跑同一档位"。
+func TestUISeriesSelectionWiring(t *testing.T) {
+	ui := string(uiHTML)
+	for _, want := range []string{
+		`function renderSeries(`, `renderSeries(d.series, d)`,
+		`function switchLine(`, `function pickEpisode(`,
+		`ep.parse_id`, `s.in_lines`, `s.truncated`,
+		`switchLine(ln.name)`, `pickEpisode(ep, d)`,
+		// 切线路 = 用 quality=<线路名> 重跑上一次的动作（不擅自升级档位）
+		`$("#quality").value = name`,
+		`lastAct === "links" || lastAct === "info" || lastAct === "detail"`,
+		// 选集 = 把 parse_id 填进表单再取直链
+		`$("#vid").value = ep.parse_id || ep.id`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Errorf("解析页缺少 %q", want)
+		}
+	}
+	// quality 必须同时作用于 info/detail/links，否则"切线路"只影响其中一档
+	if !strings.Contains(ui, `act === "links" || act === "info" || act === "detail"`) {
+		t.Error("run() 里 quality 没有覆盖三类计价端点")
+	}
+}
+
+// TestUIHLSMergeWiring：混流区必须支持 HLS(TS) 分片合并，且**直连 CDN**。
+func TestUIHLSMergeWiring(t *testing.T) {
+	ui := string(uiHTML)
+	for _, want := range []string{
+		`function mergeHLS(`, `function parseM3U8(`, `function looksHLS(`,
+		`function applyHLS(`, `function startMerge(`,
+		`window.VL.applyHLS = applyHLS`, `window.VL.startMerge = startMerge`,
+		`#EXT-X-KEY`, `#EXT-X-STREAM-INF`, `#EXT-X-BYTERANGE`, `#EXT-X-MEDIA-SEQUENCE`,
+		`AES-CBC`, `crypto.subtle`, `importKey`,
+		`ivForSeq`, // 无显式 IV 时按规范用媒体序号当 IV
+		`"ts"`,     // 产物是 .ts（顺序拼接，不转封装）
+		`下载并合并（TS）`,
+		// 安全上下文提示：非 https/localhost 时 Web Crypto 不可用
+		`请用 https 或 http://localhost 打开本页`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Errorf("解析页缺少 %q", want)
+		}
+	}
+	// TS 分片必须直连：合并分支里不能出现代理路径
+	head := strings.Index(ui, "async function mergeHLS(")
+	if head < 0 {
+		t.Fatal("找不到 mergeHLS")
+	}
+	tail := strings.Index(ui[head:], "\n  // startMerge")
+	if tail < 0 {
+		t.Fatal("找不到 mergeHLS 的结尾")
+	}
+	body := ui[head : head+tail]
+	if strings.Contains(body, "/v1/proxy") {
+		t.Error("mergeHLS 不该走服务端代理：分片 CDN 不在白名单里，代理会拒")
+	}
+	if !strings.Contains(body, "fetchBytes(") {
+		t.Error("mergeHLS 应直接用 fetch 拉分片")
+	}
+}
+
+// TestUISectionOrder：结果区在前、混流区在后（用户要求的顺序）。
+func TestUISectionOrder(t *testing.T) {
+	ui := string(uiHTML)
+	iRes := strings.Index(ui, `<!-- 结果 -->`)
+	iMux := strings.Index(ui, `<!-- 浏览器内混流`)
+	if iRes < 0 || iMux < 0 {
+		t.Fatalf("找不到区块注释：结果=%d 混流=%d", iRes, iMux)
+	}
+	if iRes > iMux {
+		t.Error("混流区应在结果区下方")
+	}
+	// 搜索区在批量区下方
+	iBatch := strings.Index(ui, `<!-- 批量 -->`)
+	iSearch := strings.Index(ui, `<!-- 搜索 -->`)
+	if iBatch < 0 || iSearch < 0 || iBatch > iSearch {
+		t.Error("搜索区应在批量区下方")
+	}
+}
+
+// TestUIM3U8Parsing 把混流脚本里的 m3u8 解析原样抽出来，在 node 里跑真实形状的
+// 播放列表：相对地址、AES-128 密钥行、byterange、master 变体、IV 回退规则。
+//
+// 这层是"HLS 分片合并"最容易写错的地方（相对路径、序号→IV、byterange 续偏移），
+// 而它在浏览器里出错只会表现为"合出来的文件播不了"，值得静态钉住。
+func TestUIM3U8Parsing(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过")
+	}
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(string(uiHTML), -1)
+	mux := blocks[len(blocks)-1][1]
+
+	var src strings.Builder
+	for _, name := range []string{"function absURL(", "function parseM3U8(", "function hexToBytes(",
+		"function ivForSeq("} {
+		head := strings.Index(mux, name)
+		if head < 0 {
+			t.Fatalf("混流脚本里找不到 %s", name)
+		}
+		tail := strings.Index(mux[head:], "\n  }\n")
+		if tail < 0 {
+			t.Fatalf("找不到 %s 的结尾", name)
+		}
+		src.WriteString(mux[head : head+tail+len("\n  }")])
+		src.WriteString("\n")
+	}
+
+	media := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\n" +
+		"#EXT-X-KEY:METHOD=AES-128,URI=\"/api/v2/vip/regular/secrets/33921?sign=abc\"\n" +
+		"#EXTINF:10.000,\nsegment_000.ts?a=1\n" +
+		"#EXTINF:10.000,\nsegment_001.ts?a=1\n" +
+		"#EXT-X-BYTERANGE:1024\nsegment_002.ts?a=1\n" +
+		"#EXT-X-BYTERANGE:2048@4096\nsegment_003.ts?a=1\n" +
+		"#EXT-X-ENDLIST"
+	master := "#EXTM3U\n" +
+		"#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=800000,RESOLUTION=1080x608\n3000k/hls/mixed.m3u8\n" +
+		"#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=2000000,RESOLUTION=1920x1080\n6000k/hls/mixed.m3u8"
+
+	driver := `
+const src = ` + strconv.Quote(src.String()) + `;
+` + src.String() + `
+const base = "https://mv.example/api/v2/vip/normal/33921/index.m3u8";
+const media = parseM3U8(` + strconv.Quote(media) + `, base);
+const master = parseM3U8(` + strconv.Quote(master) + `, base);
+const out = {
+  segs: media.segs.length,
+  first: media.segs[0].url,
+  key: media.key.method + " " + media.key.uri,
+  keyIV: media.key.iv,
+  mediaSeq: media.mediaSeq,
+  r0: media.segs[2].range,
+  r1: media.segs[3].range,
+  variants: master.master.length,
+  best: master.master.sort((a,b) => b.bandwidth - a.bandwidth)[0].url,
+  iv5: Array.from(ivForSeq(5)).join(","),
+  sameHost: absURL("/x/y", "https://a.example/z/index.m3u8"),
+};
+console.log(JSON.stringify(out));
+`
+	dir := t.TempDir()
+	js := filepath.Join(dir, "m3u8.js")
+	if err := os.WriteFile(js, []byte(driver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := exec.Command(node, js).CombinedOutput()
+	if err != nil {
+		t.Fatalf("跑 m3u8 解析失败：%v\n%s", err, raw)
+	}
+	var got struct {
+		Segs     int
+		First    string
+		Key      string
+		KeyIV    []byte
+		MediaSeq int
+		R0       struct{ Off, Len int }
+		R1       struct{ Off, Len int }
+		Variants int
+		Best     string
+		IV5      string
+		SameHost string
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("node 输出不是 JSON：%v\n%s", err, raw)
+	}
+	if got.Segs != 4 {
+		t.Errorf("分片数 = %d，应为 4", got.Segs)
+	}
+	if got.First != "https://mv.example/api/v2/vip/normal/33921/segment_000.ts?a=1" {
+		t.Errorf("相对分片地址没有正确解析：%q", got.First)
+	}
+	if got.Key != "AES-128 https://mv.example/api/v2/vip/regular/secrets/33921?sign=abc" {
+		t.Errorf("密钥地址（相对）没有解析：%q", got.Key)
+	}
+	if got.KeyIV != nil {
+		t.Errorf("没有显式 IV 时应为 null（由媒体序号推），得到 %v", got.KeyIV)
+	}
+	if got.R0.Off != 0 || got.R0.Len != 1024 {
+		t.Errorf("byterange（省略 offset）应从 0 开始：%+v", got.R0)
+	}
+	if got.R1.Off != 4096 || got.R1.Len != 2048 {
+		t.Errorf("byterange（显式 offset）解析不对：%+v", got.R1)
+	}
+	if got.Variants != 2 || !strings.HasSuffix(got.Best, "6000k/hls/mixed.m3u8") {
+		t.Errorf("master 变体（取最高码率）不对：%d %q", got.Variants, got.Best)
+	}
+	if got.IV5 != "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,5" {
+		t.Errorf("无显式 IV 时按规范用媒体序号（大端 128 位）：%s", got.IV5)
+	}
+	if got.SameHost != "https://a.example/x/y" {
+		t.Errorf("绝对路径应相对主机解析：%q", got.SameHost)
 	}
 }

@@ -1290,9 +1290,11 @@ func TestEaseModeRootServesUI(t *testing.T) {
 	// github.com 一个域，且必须带 rel="noopener"——否则 window.opener
 	// 会把本页暴露给被打开的页面。
 	checkExternalLinks(t, body)
-	// 上限设为 120KB：混流器（自己实现的 fMP4 重排）占了大头，
-	// 但它换掉的是"外链 mp4box.js / 25MB ffmpeg.wasm"这条路。
-	if len(body) > 120*1024 {
+	// 上限设为 140KB：混流器（自己实现的 fMP4 重排）与 HLS(TS) 分片合并
+	// （自己实现的 m3u8 解析 + AES-128 解密 + 顺序拼接）占了大头，
+	// 但它们换掉的是"外链 mp4box.js / hls.js / 25MB ffmpeg.wasm"这条路；
+	// 页面依然是单文件、零外部资源的。
+	if len(body) > 140*1024 {
 		t.Errorf("页面过大（%d 字节），内嵌资源应保持精简", len(body))
 	}
 }
@@ -1710,16 +1712,17 @@ const proxyOn = () => true;
 const fmtUnits = (n) => String(Math.round(n * 100) / 100);
 const proxyCost = () => 0.6;
 const tracks = { videos: [{ size: 1048576 }], audios: [{ size: 1048576 }] };
-const run = (rate, mult) => {
+const run = (rate, mult, hls) => {
   const f = new Function("$", "proxyOn", "multiplier", "proxyRate", "fmtUnits",
-                         "proxyCost", "tracks", "return " + src);
-  f($, proxyOn, () => mult, () => rate, fmtUnits, proxyCost, tracks)();
+                         "proxyCost", "tracks", "hlsMode", "return " + src);
+  f($, proxyOn, () => mult, () => rate, fmtUnits, proxyCost, tracks, () => !!hls)();
 };
 const out = [];
-run(0.5, 1); out.push(text);          // 账户模式：费率来自 /v1/usage
-run(null, 1); out.push(text);         // 费率还没拿到：回落到 0.5
+run(0.5, 1, false); out.push(text);   // 账户模式：费率来自 /v1/usage
+run(null, 1, false); out.push(text);  // 费率还没拿到：回落到 0.5
 tracks.videos[0].size = 0;            // 上游没给体积
-run(0.5, 1); out.push(text);
+run(0.5, 1, false); out.push(text);
+run(0.5, 1, true); out.push(text);    // HLS(TS) 模式：直连、不消耗配额
 console.log(JSON.stringify(out));
 `
 	dir := t.TempDir()
@@ -1735,10 +1738,11 @@ console.log(JSON.stringify(out));
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("node 输出不是 JSON：%v\n%s", err, raw)
 	}
-	if len(got) != 3 {
-		t.Fatalf("想要 3 段文案，得到 %d 段：%v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("想要 4 段文案，得到 %d 段：%v", len(got), got)
 	}
-	for i, want := range []string{"代理按体积计费：0.5", "代理按体积计费：0.5", "上游没给体积"} {
+	for i, want := range []string{"代理按体积计费：0.5", "代理按体积计费：0.5", "上游没给体积",
+		"HLS(TS) 合并走直连"} {
 		if !strings.Contains(got[i], want) {
 			t.Errorf("第 %d 段文案不对（想要包含 %q）：%s", i+1, want, got[i])
 		}

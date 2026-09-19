@@ -315,13 +315,27 @@
     <div id="searchOut"></div>
   </section>
 
-  <!-- 浏览器内混流 -->
+  <!-- 结果 -->
+  <section id="result" class="hidden">
+    <h2>结果（含线路与选集）</h2>
+    <div class="status" id="status"></div>
+    <div id="view"></div>
+    <details>
+      <summary>原始 JSON 响应</summary>
+      <pre id="raw"></pre>
+    </details>
+  </section>
+
+  <!-- 浏览器内混流 / TS 分片合并 -->
   <section id="muxsec">
-    <h2>浏览器内混流（DASH 音视频合并）</h2>
+    <h2>浏览器内混流（DASH 音视频合并 / HLS-TS 分片合并）</h2>
     <div class="hint" style="margin:0 0 10px">
-      流程：按上面的链接与清晰度，<b>流式下载</b>视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
-      在页面内合并为单个 MP4 → 保存到本地。适用于返回 <code>audio_url</code> 的平台（如 B 站）。
-      合并是<b>片段级重排</b>，不重新编码，所以速度只取决于下载。
+      两种模式自动切换：<br>
+      ① <b>DASH 混流</b>：流式下载视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
+      片段级重排合并为单个 MP4，不重新编码（适用于返回 <code>audio_url</code> 的平台，如 B 站）。<br>
+      ② <b>HLS(TS) 合并</b>：分片本身是一段段 .ts，按顺序下载 → 需要时用 AES-128 现场解密 →
+      <b>顺序拼接</b>为单个 <code>.ts</code> 文件（不转封装、不重编码）。产物用 VLC / mpv / ffmpeg 打开，
+      浏览器 <code>&lt;video&gt;</code> 不能直接播（TS 不是浏览器容器）。
       <span id="muxCostNote"></span>
     </div>
     <div class="row">
@@ -336,15 +350,18 @@
       <div class="col">
         <label>下载通道</label>
         <label class="chk" for="muxProxy">
-          <input type="checkbox" id="muxProxy"> 使用服务端代理下载
+          <input type="checkbox" id="muxProxy"> 使用服务端代理下载（仅 DASH 两轨）
         </label>
+        <div class="hint" style="margin:4px 0 0">
+          HLS(TS) 分片<b>始终直连 CDN</b>：分片 CDN 不在服务端代理白名单里，走代理必被拒。
+        </div>
       </div>
     </div>
     <div class="hint" id="muxCost"></div>
     <div class="hint" id="muxTrackState">
       在上面的「<b>全部详情</b>」里取一次完整信息，档位会自动填到这里（<code>/v1/detail</code>，
-      消耗对应配额）；直接点下面的「下载并混流」也会自动取一次。勾上代理表示两轨都经服务端拉取
-      （CDN 要求 Referer 时必须勾）。
+      消耗对应配额）；直接点下面的「下载并混流」也会自动取一次。勾上代理表示 DASH 两轨都经服务端
+      拉取（CDN 要求 Referer 时必须勾）；若这一条是 HLS(m3u8)，会自动切到分片合并模式。
     </div>
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
@@ -368,16 +385,6 @@
     </div>
   </section>
 
-  <!-- 结果 -->
-  <section id="result" class="hidden">
-    <h2>结果</h2>
-    <div class="status" id="status"></div>
-    <div id="view"></div>
-    <details>
-      <summary>原始 JSON 响应</summary>
-      <pre id="raw"></pre>
-    </details>
-  </section>
 
   <section id="platsec">
     <h2>平台与能力</h2>
@@ -890,9 +897,34 @@ function vlSignUrl(prefix, key, url, ts) {
     const btns = el("div", "btns");
     btns.appendChild(copyBtn(d.url, "复制直链"));
     btns.appendChild(openBtn(d.url, "浏览器打开"));
-    if (proxyEnabled) btns.appendChild(proxyBtn(d.url, kind, reqQ, "mp4"));
+    if (proxyEnabled) btns.appendChild(proxyBtn(d.url, kind, reqQ, d.hls ? "m3u8" : "mp4"));
+    if (d.hls) {
+      // HLS 直链不能直接下载（那是播放列表，不是媒体文件）：给一个
+      // "下载分片并合并"的入口，具体的合并实现在混流区（分片直连 CDN，不过代理）。
+      const hb = el("button", "primary", "下载并合并（TS）");
+      hb.title = "下载 m3u8 里的全部分片（需要时 AES-128 解密）并按顺序拼接为单个 .ts";
+      hb.addEventListener("click", () => {
+        if (window.VL && window.VL.applyHLS) {
+          window.VL.applyHLS({ url: d.url, quality: $("#quality").value.trim() || "", note: d.note || "" });
+        }
+        if (window.VL && window.VL.startMerge) {
+          window.VL.startMerge();
+        } else {
+          $("#muxsec").scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+      btns.appendChild(hb);
+    }
     box.appendChild(btns);
 
+    if (d.hls) {
+      const w = el("div", "warnbox", "这是 HLS(m3u8) 播放列表：可以交给播放器/ffmpeg（ffmpeg -i \"直链\" -c copy out.mp4），" +
+        "也可以点「下载并合并（TS）」由浏览器把分片下载、（需要时）解密并顺序拼接成一个 .ts 文件。" +
+        "TS 不是浏览器容器，<video> 不能直接播，保存后用 VLC / mpv 打开。");
+      w.style.border = "1px solid var(--line)"; w.style.borderRadius = "8px";
+      w.style.padding = "8px"; w.style.marginTop = "10px";
+      box.appendChild(w);
+    }
     if (d.needs_mux) {
       const w = el("div", "warnbox", "该平台为 DASH 分离流：还需要下载 audio_url 并用 ffmpeg 混流（-c copy）。");
       w.style.border = "1px solid var(--line)"; w.style.borderRadius = "8px";
@@ -940,9 +972,83 @@ function vlSignUrl(prefix, key, url, ts) {
     return box;
   }
 
+  // ---------- 剧集型内容：线路与选集 ----------
+  //
+  // 荐片之类"一部剧多条线路 × 多集"的内容，线路就是它的清晰度维度：
+  // 切线路 = 带着 quality=<线路名> 重新取一次；选集 = 用后端给的 parse_id
+  // （<影片ID>_<单集ID>）当解析 ID，点一下就能取直链或看详情。
+  // parse_id 由服务端拼好，前端不自己拼——ID 规则只有一处实现。
+
+  function renderSeries(s, d) {
+    const box = el("div");
+    const lines = s.lines || [];
+    if (lines.length) {
+      box.appendChild(el("h2", null, "线路（" + lines.length + "）"));
+      const bar = el("div", "btns");
+      const current = (s.in_lines || [])[0] || "";
+      lines.forEach((ln) => {
+        const b = el("button", ln.name === current ? "primary" : null,
+          ln.name + (ln.count ? "（" + ln.count + " 集）" : "") + (ln.vip ? " · VIP" : ""));
+        b.title = "以这条线路重新取一次（quality=" + ln.name + "）";
+        b.addEventListener("click", () => switchLine(ln.name));
+        bar.appendChild(b);
+      });
+      box.appendChild(bar);
+      const hint = el("div", "hint", "线路是来源（不是像素档位）：不同线路的质量与可用性可能差别很大，" +
+        "某条线路播放失败就换一条。");
+      box.appendChild(hint);
+    }
+
+    const eps = s.episodes || [];
+    if (eps.length) {
+      box.appendChild(el("h2", null, "选集（" + (s.total || eps.length) + "）"));
+      if (s.in_lines && s.in_lines.length && eps.length === 1) {
+        box.appendChild(el("div", "hint",
+          "这一集出现在线路：" + s.in_lines.join(" / ") + "（同一个单集 ID 可能被多条线路共用）"));
+      }
+      const grid = el("div", "btns");
+      eps.forEach((ep) => {
+        const label = ep.name || ("第 " + ep.index + " 集");
+        const b = el("button", null, label + (ep.vip ? " · VIP" : ""));
+        b.title = "线路 " + (ep.line || "") + " · 单集 ID " + ep.id +
+          (ep.parse_id ? " · 解析 ID " + ep.parse_id : "");
+        b.addEventListener("click", () => pickEpisode(ep, d));
+        grid.appendChild(b);
+      });
+      box.appendChild(grid);
+      if (s.truncated) {
+        box.appendChild(el("div", "hint", "集数超过上限，列表已截断；用 quality 指定线路仍可拿到完整集。"));
+      }
+      const extra = el("div", "hint",
+        "点某一集 → 直接取直链；也可以先切换线路再点。取直链会按 links 档计费（荐片 1.0）。");
+      box.appendChild(extra);
+    }
+    return box;
+  }
+
+  // switchLine 换线路：写进「清晰度」输入框并重跑上一次的动作
+  // （info 0.5 / detail 1.2 / links 1.0 —— 不擅自升级档位）。
+  function switchLine(name) {
+    if (!$("#platform").value || !$("#vid").value.trim()) {
+      alert("请先用平台 + 内容 ID 取一次结果，再切换线路");
+      return;
+    }
+    $("#quality").value = name;
+    run(lastAct === "links" || lastAct === "info" || lastAct === "detail" ? lastAct : "detail");
+  }
+
+  // pickEpisode 选集：把 parse_id 填进表单再取直链。
+  function pickEpisode(ep, d) {
+    $("#platform").value = (d && d.platform) || $("#platform").value;
+    $("#url").value = "";
+    $("#vid").value = ep.parse_id || ep.id;
+    run("links");
+  }
+
   function renderInfo(d, full) {
     const box = el("div");
     box.appendChild(renderAuthorInfo(null, d));
+    if (d.series) box.appendChild(renderSeries(d.series, d));
     if (d.qualities && d.qualities.length) {
       box.appendChild(el("h2", null, "可用档位"));
       const t = el("table");
@@ -1151,8 +1257,11 @@ function vlSignUrl(prefix, key, url, ts) {
     if (t.err) { alert(t.err); return; }
     const q = $("#quality").value.trim();
     let path = "/v1/" + act + "?" + t.q;
-    if (q && (act === "links")) path += "&quality=" + encodeURIComponent(q);
-    if (act === "info" && q) path += "&quality=" + encodeURIComponent(q);
+    // quality 对两边语义不同但都成立：B 站是清晰度、荐片是线路。
+    // links/info/detail 都要带，否则"切线路"只会影响其中一档。
+    if (q && (act === "links" || act === "info" || act === "detail")) {
+      path += "&quality=" + encodeURIComponent(q);
+    }
     await go(path, act, null, t.q);
   }
 
@@ -1171,7 +1280,10 @@ function vlSignUrl(prefix, key, url, ts) {
 
   // key 是这次请求对应的目标（url/platform+id 那段查询串）：混流区据此判断
   // "这份档位列表是不是当前这条视频的"，换了链接就必须重取。
+  let lastAct = "";
+
   async function go(path, act, opts, key) {
+    lastAct = act || lastAct;
     const btns = document.querySelectorAll("button[data-act]");
     btns.forEach((b) => b.disabled = true);
     try {
@@ -1180,7 +1292,16 @@ function vlSignUrl(prefix, key, url, ts) {
       const v = ok(res);
       v.textContent = "";
       if (res.body && res.body.title) rememberTitle(res.body);
-      if (act === "links") v.appendChild(renderLinks(res.body));
+      if (act === "links") {
+        v.appendChild(renderLinks(res.body));
+        // m3u8 直链交给混流区：那边有"下载并合并（TS）"的分片合并实现。
+        if (res.body && res.body.hls && window.VL && window.VL.applyHLS) {
+          window.VL.applyHLS({
+            url: res.body.url, quality: $("#quality").value.trim() || "",
+            note: res.body.note || "", key: key || "",
+          });
+        }
+      }
       else if (act === "detail") {
         // 一次「全部详情」同时喂两个地方：结果区 + 混流区的档位下拉。
         // 让用户为了混流再单独取一次档位是白花一次配额。
@@ -2092,6 +2213,10 @@ function vlSignUrl(prefix, key, url, ts) {
   // 前端算不出来的东西不该装成算得出来（真正的数值在响应头里）。
   function updateMuxNote() {
     const box = $("#muxCost");
+    if (hlsMode()) {
+      box.textContent = "HLS(TS) 合并走直连：不消耗配额（分片 CDN 不在服务端代理白名单里，代理会直接被拒）。";
+      return;
+    }
     // 看的是**复选框**（这次下载走哪条通道），不是"服务端有没有开代理"：
     // 服务端开着代理但用户没勾，这次就是直连，提示必须说直连。
     if (!$("#muxProxy").checked || !proxyOn()) {
@@ -2172,6 +2297,19 @@ function vlSignUrl(prefix, key, url, ts) {
     fillSelect($("#muxVq"), d.videos, "video");
     fillSelect($("#muxAq"), d.audios, "audio");
     const nv = (d.videos || []).length, na = (d.audios || []).length;
+    if (looksHLS((d.videos || [])[0])) {
+      // 荐片这类返回 m3u8 的内容：不走 DASH 混流，走分片合并。
+      hlsTarget = {
+        url: (d.videos || [])[0].url, quality: (d.videos || [])[0].quality || "",
+        key: muxKey,
+      };
+      const line = (d.series && d.series.in_lines && d.series.in_lines[0]) || (d.videos || [])[0].quality || "";
+      setTrackState("这一条是 HLS(m3u8)：点「下载并混流」会把分片全部下载" +
+        "（需要时 AES-128 解密）并按顺序拼接为单个 .ts" + (line ? "（当前线路：" + line + "）" : "") +
+        "。分片直连 CDN，不走代理、不消耗配额。", false);
+      updateMuxNote();
+      return;
+    }
     if (!d.needs_mux || !na) {
       setTrackState("这一条返回的是单文件直链，不需要混流（视频 " + nv + " 档、音频 " + na +
         " 档）：直接在「取直链」里下载即可。", true);
@@ -2182,6 +2320,9 @@ function vlSignUrl(prefix, key, url, ts) {
   }
   // 主脚本在 detail 成功时回调（脚本块顺序：主脚本在前，所以挂在 window.VL 上）
   window.VL.applyDetail = applyTracks;
+  // HLS 直链与"立刻开始合并"两个入口（主脚本的 links 结果与按钮用）
+  window.VL.applyHLS = applyHLS;
+  window.VL.startMerge = startMerge;
 
   // loadTracks 是"没取过就自己取一次"的兜底路径，供「下载并混流」使用。
   async function loadTracks() {
@@ -2197,6 +2338,239 @@ function vlSignUrl(prefix, key, url, ts) {
     applyTracks(r.body || {}, t.q);
     return tracks;
   }
+
+  // ---------- HLS(TS) 分片合并 ----------
+  //
+  // 为什么单独一条路：m3u8 不是媒体文件，而是播放列表；播放列表里的分片
+  // 可能被 AES-128 加密。这里做的事就是"按播放列表把分片按顺序取回来、
+  // 需要时解密、再顺序拼接成一个 .ts"——**不转封装、不重编码**。
+  //
+  // 为什么分片必须直连 CDN（不走 /v1/proxy）：
+  //   服务端代理有域名白名单（VIDLINK_PROXY_ALLOW_HOSTS），分片 CDN
+  //   （各种第三方加速域名）不在其中，走代理会被拒；而分片基本都带
+  //   Access-Control-Allow-Origin: *，浏览器可以直连。
+  //
+  // 为什么产物是 .ts 而不是 .mp4：TS→MP4 需要解复用再封装（要一整套
+  // TS demuxer + fMP4 muxer），本页承诺"零外部资源"，不引 ffmpeg.wasm；
+  // 顺序拼接的 TS 用 VLC/mpv/ffmpeg 都能播，要 MP4 就一行 ffmpeg -c copy。
+
+  let hlsTarget = null;   // {url, quality, note, key}：最近一次拿到的 m3u8 直链
+
+  function looksHLS(st) {
+    return !!st && ((st.mime_type || "").indexOf("mpegurl") >= 0 || st.hls === true);
+  }
+
+  // selectedVideo 返回当前下拉选中的视频轨。
+  function selectedVideo() {
+    const list = (tracks || {}).videos || [];
+    return list[Number($("#muxVq").value) || 0];
+  }
+
+  // hlsMode 判断这一次该走哪条路：选中的档位是 m3u8，或者刚取的直链就是 m3u8。
+  function hlsMode() {
+    if (looksHLS(selectedVideo())) return true;
+    if (!hlsTarget) return false;
+    const t = target();
+    return !t.err && hlsTarget.key === t.q;
+  }
+
+  // absURL 把播放列表里的相对地址补成绝对地址。
+  function absURL(u, base) {
+    try { return new URL(u, base).href; } catch (_) { return u; }
+  }
+
+  // parseM3U8 解析播放列表：master 变体、分片、密钥、初始化段、byterange。
+  function parseM3U8(text, base) {
+    const out = { master: [], segs: [], key: null, map: null, mediaSeq: 0 };
+    const lines = text.split(/\r?\n/);
+    let pending = null, rangeEnd = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.indexOf("#EXT-X-STREAM-INF:") === 0) {
+        const bw = /BANDWIDTH=(\d+)/.exec(line);
+        const next = (lines[i + 1] || "").trim();
+        if (next && next.charAt(0) !== "#") {
+          out.master.push({ bandwidth: bw ? Number(bw[1]) : 0, url: absURL(next, base) });
+        }
+      } else if (line.indexOf("#EXT-X-KEY:") === 0) {
+        const m = /METHOD=([A-Za-z0-9-]+)/.exec(line);
+        const method = m ? m[1].toUpperCase() : "";
+        if (method === "NONE") { out.key = null; continue; }
+        const u = /URI="([^"]+)"/.exec(line);
+        const iv = /IV=0x([0-9A-Fa-f]+)/.exec(line);
+        out.key = { method: method, uri: u ? absURL(u[1], base) : "", iv: iv ? hexToBytes(iv[1]) : null };
+      } else if (line.indexOf("#EXT-X-MAP:") === 0) {
+        const u = /URI="([^"]+)"/.exec(line);
+        if (u) out.map = absURL(u[1], base);
+      } else if (line.indexOf("#EXT-X-MEDIA-SEQUENCE:") === 0) {
+        out.mediaSeq = Number(line.split(":")[1]) || 0;
+      } else if (line.indexOf("#EXT-X-BYTERANGE:") === 0) {
+        const parts = line.slice("#EXT-X-BYTERANGE:".length).trim().split("@");
+        const len = Number(parts[0]);
+        const off = parts[1] !== undefined ? Number(parts[1]) : rangeEnd;
+        pending = { off: off, len: len };
+        rangeEnd = off + len;
+      } else if (line.charAt(0) !== "#") {
+        out.segs.push({ url: absURL(line, base), range: pending });
+        pending = null;
+      }
+    }
+    return out;
+  }
+
+  function hexToBytes(hex) {
+    const b = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return b;
+  }
+
+  // ivForSeq 实现 HLS 规范：没有显式 IV 时，IV = 媒体的序号（128 位大端）。
+  function ivForSeq(seq) {
+    const iv = new Uint8Array(16);
+    const dv = new DataView(iv.buffer);
+    dv.setUint32(8, Math.floor(seq / 4294967296));
+    dv.setUint32(12, seq >>> 0);
+    return iv;
+  }
+
+  async function fetchText(url) {
+    let r;
+    try { r = await fetch(url, { cache: "no-store", credentials: "omit" }); }
+    catch (e) { throw new Error("取播放列表失败（跨域/网络）：" + msg(e)); }
+    if (!r.ok) throw new Error("取播放列表失败：HTTP " + r.status);
+    return await r.text();
+  }
+
+  async function fetchBytes(url, range) {
+    const opt = { cache: "no-store", credentials: "omit" };
+    if (range && range.len) opt.headers = { Range: "bytes=" + range.off + "-" + (range.off + range.len - 1) };
+    let r;
+    try { r = await fetch(url, opt); }
+    catch (e) {
+      throw new Error("分片下载失败（可能是这条线路不允许跨域直连，或网络中断）：" + msg(e) +
+        "；换一条线路再试，或用 ffmpeg/VLC 直接拉 m3u8");
+    }
+    if (!r.ok && r.status !== 206) throw new Error("分片下载失败：HTTP " + r.status);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+
+  function msg(e) { return (e && e.message) ? e.message : String(e); }
+
+  // decryptSeg 做 AES-128-CBC 解密并去掉 PKCS7 填充。
+  async function decryptSeg(aesKey, iv, data) {
+    let plain;
+    try {
+      plain = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-CBC", iv: iv }, aesKey, data));
+    } catch (e) {
+      throw new Error("分片解密失败（密钥/IV 不匹配）：" + msg(e));
+    }
+    const pad = plain.length ? plain[plain.length - 1] : 0;
+    if (pad > 0 && pad <= 16 && pad <= plain.length) return plain.subarray(0, plain.length - pad);
+    return plain;
+  }
+
+  // applyHLS 接收主脚本交过来的 m3u8 直链（/v1/links 且 hls=true 时）。
+  function applyHLS(info) {
+    if (!info || !info.url) return;
+    const t = target();
+    hlsTarget = {
+      url: info.url, quality: info.quality || "", note: info.note || "",
+      key: info.key || ((!t.err && t.q) ? t.q : ""),
+    };
+    setTrackState("已拿到 HLS(m3u8) 直链：点「下载并混流」会把分片全部下载、（需要时 AES-128 解密）" +
+      "并按顺序拼接为单个 .ts（分片直连 CDN，不走代理）。", false);
+    updateMuxNote();
+  }
+
+  // mergeHLS 是分片合并主流程：取列表 → （可选）取密钥 → 有界并发下载 →
+  // 顺序解密拼接 → 交给「保存到本地」。
+  async function mergeHLS(src) {
+    if (!src || !src.url) throw new Error("没有可用的 m3u8 直链");
+    phase("① 取播放列表（直连 CDN）…");
+    let url = src.url;
+    let pl = parseM3U8(await fetchText(url), url);
+    if (pl.master.length) {
+      pl.master.sort((a, b) => b.bandwidth - a.bandwidth);
+      const best = pl.master[0];
+      phase("① 取播放列表（已选最高码率变体 " + Math.round(best.bandwidth / 1000) + " kbps）…");
+      url = best.url;
+      pl = parseM3U8(await fetchText(url), url);
+    }
+    if (!pl.segs.length) throw new Error("播放列表里没有分片（可能是直播、或结构不支持）");
+    if (pl.key && pl.key.method && pl.key.method !== "AES-128") {
+      throw new Error("不支持的分片加密方式：" + pl.key.method);
+    }
+
+    let aesKey = null;
+    if (pl.key && pl.key.uri) {
+      if (!(window.crypto && crypto.subtle)) {
+        throw new Error("加密分片需要 Web Crypto：请用 https 或 http://localhost 打开本页（当前不是安全上下文）");
+      }
+      phase("② 取 AES-128 密钥…");
+      const kb = await fetchBytes(pl.key.uri, null);
+      if (kb.byteLength !== 16) throw new Error("密钥长度应为 16 字节，实际 " + kb.byteLength);
+      aesKey = await crypto.subtle.importKey("raw", kb, { name: "AES-CBC" }, false, ["decrypt"]);
+    }
+
+    await cleanStorage();
+    const store = await newFile("hls.ts");
+    try {
+      let bytes = 0;
+      if (pl.map) {
+        const init = await fetchBytes(pl.map, null);
+        await store.append(init);
+        bytes += init.byteLength;
+      }
+      const total = pl.segs.length;
+      const CONC = 4;   // 有界并发：单批最多 4 个分片在内存里，约几 MB
+      let done = 0;
+      phase("③ 下载分片并顺序合并…" + (aesKey ? "（AES-128 解密）" : "（明文，无需解密）"));
+      for (let i = 0; i < total; i += CONC) {
+        const batch = pl.segs.slice(i, i + CONC);
+        const bufs = await Promise.all(batch.map((sg) => fetchBytes(sg.url, sg.range)));
+        for (let k = 0; k < bufs.length; k++) {
+          let chunk = bufs[k];
+          if (aesKey) chunk = await decryptSeg(aesKey, pl.key.iv || ivForSeq(pl.mediaSeq + i + k), chunk);
+          await store.append(chunk);
+          bytes += chunk.byteLength;
+        }
+        done += bufs.length;
+        bar(done / total);
+        detail("已合并 " + done + " / " + total + " 个分片 · " + prettySize(bytes));
+      }
+      await store.close();
+      const file = await store.file();
+      const name = dlName(await ensureTitle(), "前端合并", qualityLabel(src.quality || ""), "ts");
+
+      phase("④ 完成");
+      bar(1);
+      detail("共 " + total + " 个分片 · " + prettySize(file.size) +
+        (aesKey ? " · 已解密" : "") + " · 直连 CDN，未消耗配额");
+      const blobURL = URL.createObjectURL(file);
+      lastURL = blobURL;
+      // TS 不是浏览器容器：隐藏播放器，明确告诉用户怎么打开。
+      $("#muxVideo").classList.add("hidden");
+      $("#muxVideo").removeAttribute("src");
+      const w = $("#muxNoPreview");
+      w.classList.remove("hidden");
+      w.textContent = "分片已按顺序合并为单个 MPEG-TS 文件（未转封装、未重编码）：浏览器 <video> 不能直接播 TS，" +
+        "点『保存到本地』后用 VLC / mpv / PotPlayer 打开；要 MP4 就执行 ffmpeg -i 输入.ts -c copy 输出.mp4。";
+      const a = $("#muxSave");
+      a.href = blobURL;
+      a.download = name;
+      $("#muxInfo").textContent = name + " · " + prettySize(file.size) +
+        (opfsOK ? " · 已写入浏览器存储" : " · 内存模式（本浏览器不支持 OPFS）");
+      $("#muxOut").classList.remove("hidden");
+      refreshQuota();
+    } catch (e) {
+      await store.drop();
+      throw e;
+    }
+  }
+
+  // startMerge 给主脚本的「下载并合并（TS）」按钮用（同一套 busy 保护）。
+  function startMerge() { start(); }
 
   // ---------- 主流程 ----------
   let busy = false;
@@ -2256,6 +2630,12 @@ function vlSignUrl(prefix, key, url, ts) {
       const vTrack = (d.videos || [])[Number($("#muxVq").value) || 0];
       const aTrack = (d.audios || [])[Number($("#muxAq").value) || 0];
       if (!vTrack) throw new Error("这一条没有可用的视频档位");
+      if (hlsMode()) {
+        // HLS：走分片合并（直连 CDN）。优先用当前选中的档位，否则用刚拿到的直链。
+        const src = looksHLS(vTrack) ? { url: vTrack.url, quality: vTrack.quality || "" } : hlsTarget;
+        await mergeHLS(src);
+        return;
+      }
       if (!aTrack) throw new Error("该平台返回的是单文件直链，不需要混流（直接下载上面的直链即可）");
       const useProxy = $("#muxProxy").checked && proxyOn();
 
