@@ -105,7 +105,10 @@ curl '$BASE/v1/links?url=...'   # 不带任何凭据
   需用户手势，Firefox 会弹一次权限），避免大文件被当 best-effort 清理。
   **配额上限由浏览器决定**（Firefox 每个源约 10 GiB、Chrome 按磁盘比例），本服务不设上限；
 - HLS(TS) 分片合并默认 **8** 路并发下载分片，界面可手动调整（1~32）；
-- TS 合并产物现代浏览器一般能直接在页面里预览（`video/mp2t`），播不了再用 VLC / mpv / ffmpeg。
+- TS 合并产物现代浏览器一般能直接在页面里预览（`video/mp2t`），播不了再用 VLC / mpv / ffmpeg；
+- 合并完可以点「**转成 MP4（不重编码）**」：页面里自己解 MPEG-TS（PAT/PMT/PES、
+  Annex-B→AVCC、ADTS→裸 AAC、SPS 解宽高）并写 MP4 的 sample 表（`stts/ctts/stsz/co64/stss`），
+  只搬字节，不重编码。只支持 **H.264 + AAC**；HEVC / AC-3 / MP2 线路会明确拒绝并保留 `.ts`。
 
 ### 拿到的直链怎么用
 

@@ -1290,11 +1290,12 @@ func TestEaseModeRootServesUI(t *testing.T) {
 	// github.com 一个域，且必须带 rel="noopener"——否则 window.opener
 	// 会把本页暴露给被打开的页面。
 	checkExternalLinks(t, body)
-	// 上限设为 140KB：混流器（自己实现的 fMP4 重排）与 HLS(TS) 分片合并
-	// （自己实现的 m3u8 解析 + AES-128 解密 + 顺序拼接）占了大头，
-	// 但它们换掉的是"外链 mp4box.js / hls.js / 25MB ffmpeg.wasm"这条路；
+	// 上限设为 175KB：混流器（自己实现的 fMP4 重排）、HLS(TS) 分片合并
+	// （自己实现的 m3u8 解析 + AES-128 解密 + 顺序拼接）与 TS→MP4 转封装
+	// （自己实现的 TS 解复用 + SPS 解析 + MP4 sample 表）占了大头，
+	// 但它们换掉的是"外链 mp4box.js / hls.js / mux.js / 25MB ffmpeg.wasm"这条路；
 	// 页面依然是单文件、零外部资源的。
-	if len(body) > 140*1024 {
+	if len(body) > 175*1024 {
 		t.Errorf("页面过大（%d 字节），内嵌资源应保持精简", len(body))
 	}
 }

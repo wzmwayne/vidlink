@@ -336,6 +336,8 @@
       ② <b>HLS(TS) 合并</b>：分片本身是一段段 .ts，按顺序下载 → 需要时用 AES-128 现场解密 →
       <b>顺序拼接</b>为单个 <code>.ts</code> 文件（不转封装、不重编码）。现代浏览器一般能直接在
       页面里预览播放（TS 走 <code>video/mp2t</code> 解复用）；确实播不了时再用 VLC / mpv / ffmpeg 打开。
+      合并完还可以点「<b>转成 MP4（不重编码）</b>」把 .ts 换盒子成 MP4（H.264+AAC 时零画质损失，
+      剪辑软件/相册更认这种；HEVC/AC-3 线路会拒绝并保留 .ts）。
       <span id="muxCostNote"></span>
     </div>
     <div class="row">
@@ -392,6 +394,7 @@
       <div id="muxNoPreview" class="hint hidden" style="margin-top:6px"></div>
       <div class="btns">
         <a id="muxSave" class="btn primary" download>保存到本地</a>
+        <button id="muxRemux" class="hidden" title="把合并出来的 .ts 换盒子成 MP4（H.264+AAC 时），不重编码、不损失画质与体积">转成 MP4（不重编码）</button>
         <span class="status" id="muxInfo" style="align-self:center"></span>
       </div>
     </div>
@@ -1904,6 +1907,16 @@ function vlSignUrl(prefix, key, url, ts) {
       return f;
     }
     async append(chunk) { await this.w.write(chunk); this.n += (chunk.size !== undefined ? chunk.size : chunk.length); }
+    // writeAt 覆盖写指定位置：mdat 的长度字段要等全部 sample 写完才知道，只能回填；
+    // moov 也用位置写钉在文件末尾（位置写会把流的游标挪走，不能再用 append 续写）。
+    // WriteParams 在 Chrome/Firefox/Safari 都有；真没有就返回 false，调用方另写一份。
+    async writeAt(start, bytes) {
+      if (!this.w) return false;
+      try {
+        await this.w.write({ type: "write", position: start, data: bytes });
+        return true;
+      } catch (_) { return false; }
+    }
     async close() { if (this.w) { await this.w.close(); this.w = null; } }
     async size() { return (await this.handle.getFile()).size; }
     async read(start, len) {
@@ -1929,6 +1942,26 @@ function vlSignUrl(prefix, key, url, ts) {
       this.parts.push(chunk); this.n += (chunk.size !== undefined ? chunk.size : chunk.length);
     }
     async close() {}
+    // 内存模式的回填：parts 是按顺序追加的，直接改对应片段；写到末尾之后
+    // 就补零再追加（与 OPFS 的 writeAt 语义一致，两种存储的行为不能有分叉）。
+    async writeAt(start, bytes) {
+      const src = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      let off = 0;
+      for (const part of this.parts) {
+        const p = part instanceof Uint8Array ? part : new Uint8Array(part);
+        const end = off + p.length;
+        const from = Math.max(off, start), to = Math.min(end, start + src.length);
+        for (let i = from; i < to; i++) p[i - off] = src[i - start];
+        off = end;
+      }
+      if (start + src.length > this.n) {
+        const grow = new Uint8Array(start + src.length - this.n);
+        grow.set(src.subarray(Math.max(0, this.n - start)), Math.max(0, start - this.n));
+        this.parts.push(grow);
+        this.n += grow.length;
+      }
+      return true;
+    }
     async size() { return this.n; }
     async read(start, len) {
       const blob = await this.file();
@@ -2604,6 +2637,7 @@ function vlSignUrl(prefix, key, url, ts) {
       $("#muxInfo").textContent = name + " · " + prettySize(file.size) +
         (opfsOK ? " · 已写入浏览器存储" : " · 内存模式（本浏览器不支持 OPFS）");
       $("#muxOut").classList.remove("hidden");
+      setRemuxAvailable(store, src.quality || "");
       refreshQuota();
     } catch (e) {
       await store.drop();
@@ -2611,8 +2645,762 @@ function vlSignUrl(prefix, key, url, ts) {
     }
   }
 
+  // ==TS-REMUX-BEGIN==
+  // ---------- TS → MP4 转封装（自写 demuxer + muxer，不重编码） ----------
+  //
+  // HLS 的合并产物默认是 .ts：能播，但剪辑软件、相册、微信这类东西对它的接受度差。
+  // 转封装只是"换盒子"——把 TS 里的 H.264 Annex-B 与 AAC 原始帧搬进 MP4 的 sample 表，
+  // 不解码、不重编码，画质音质与体积一个字节都不变，只是多了一张索引表。
+  //
+  // 边界（明确拒绝并回退 .ts，而不是悄悄给出坏文件）：
+  //   - 视频只认 H.264：HEVC 也能封进 MP4，但多数浏览器/播放器放不了；
+  //   - 音频只认 AAC：AC-3/MP2/MP3 需要另外的 box 与解码器；
+  //   - 每条流都要有可用的 PTS/DTS，否则建不出 stts/ctts。
+  //
+  // 这一段是"纯逻辑 + 一个 write 回调"：不碰 DOM、不碰 OPFS，所以能在 node 里
+  // 拿真实 TS 做端到端测试（search_test.go 的 TestUITSMp4RemuxE2E 会跑 ffmpeg 校验）。
+  // 改动这块时请让那个测试跟着过——MP4 索引写错只会表现为"某些播放器播不了"，
+  // 在浏览器里肉眼很难发现。
+  const TS_PKT = 188, TS_SYNC_BYTE = 0x47, TS_TIMESCALE = 90000;
+  const ST_MPEG_AUDIO = 0x03, ST_AAC_ADTS = 0x0f, ST_H264 = 0x1b,
+        ST_HEVC = 0x24, ST_AC3 = 0x81;
+  const ADTS_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                      16000, 12000, 11025, 8000, 7350];
+
+  // ---- 写 box 的小工具 ----
+  function fourcc(s) {
+    const b = new Uint8Array(4);
+    for (let i = 0; i < 4; i++) b[i] = s.charCodeAt(i) & 255;
+    return b;
+  }
+  function be32(n) {
+    const b = new Uint8Array(4);
+    b[0] = (n >>> 24) & 255; b[1] = (n >>> 16) & 255; b[2] = (n >>> 8) & 255; b[3] = n & 255;
+    return b;
+  }
+  function be16(n) { const b = new Uint8Array(2); b[0] = (n >>> 8) & 255; b[1] = n & 255; return b; }
+  function be64(n) {
+    const b = new Uint8Array(8);
+    b.set(be32(Math.floor(n / 4294967296)), 0);
+    b.set(be32(n % 4294967296), 4);
+    return b;
+  }
+  function cat(parts) {
+    let len = 0;
+    for (const p of parts) if (p) len += p.length;
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const p of parts) if (p) { out.set(p, off); off += p.length; }
+    return out;
+  }
+  function bytesCopy(u8) { const b = new Uint8Array(u8.length); b.set(u8); return b; }
+  // mp4box("trak", a, b) 或 mp4box("stsz", [很多字段])：后者给大表用，
+  // 避免把十几万个参数展开进调用栈（会直接爆栈）。
+  function mp4box(type, parts) {
+    const list = Array.isArray(parts) ? parts : Array.prototype.slice.call(arguments, 1);
+    const body = cat(list);
+    return cat([be32(body.length + 8), fourcc(type), body]);
+  }
+  function fullBox(version, flags) { return be32((((version & 255) << 24) | (flags & 0xffffff)) >>> 0); }
+  function utf8z(s) {
+    const b = new Uint8Array(s.length + 1);
+    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255;
+    return b;
+  }
+  const MATRIX_9 = cat([be32(0x00010000), be32(0), be32(0),
+                        be32(0), be32(0x00010000), be32(0),
+                        be32(0), be32(0), be32(0x40000000)]);
+  function mdatHeader(payload) {
+    // size=1 + 'mdat' + 64 位长度：固定 16 字节（回填位置好算），顺带支持 >4GiB。
+    // 注意 largesize 记的是**含 16 字节头**的整盒长度，少加这 16 字节会让
+    // 解析器把 moov 的起点算错，ffprobe 直接报 "moov atom not found"。
+    return cat([be32(1), fourcc("mdat"), be64(payload + 16)]);
+  }
+  function buildFTYP() {
+    return mp4box("ftyp", fourcc("isom"), be32(512), fourcc("isom"),
+                  fourcc("iso2"), fourcc("avc1"), fourcc("mp41"));
+  }
+
+  // ---- H.264：SPS 解析（avcC 需要 profile/level，stsd 需要宽高） ----
+  function makeBitReader(buf) {
+    let bit = 0;
+    const r = {
+      bit() {
+        const byte = buf[bit >> 3];
+        if (byte === undefined) throw new Error("SPS 数据不足");
+        const v = (byte >> (7 - (bit & 7))) & 1;
+        bit++;
+        return v;
+      },
+      bits(n) { let v = 0; for (let i = 0; i < n; i++) v = v * 2 + r.bit(); return v; },
+      ue() {
+        let zeros = 0;
+        while (r.bit() === 0) { zeros++; if (zeros > 31) throw new Error("SPS 里的 ue(v) 异常"); }
+        return zeros === 0 ? 0 : (1 << zeros) - 1 + r.bits(zeros);
+      },
+      se() { const k = r.ue(); return (k & 1) ? (k + 1) >> 1 : -(k >> 1); },
+    };
+    return r;
+  }
+  function skipScalingList(r, size) {
+    let last = 8, next = 8;
+    for (let i = 0; i < size; i++) {
+      if (next !== 0) next = (last + r.se() + 256) % 256;
+      last = next;
+    }
+  }
+  // parseSPS 返回 { profile, compat, level, width, height }；解析失败返回 null。
+  function parseSPS(nal) {
+    try {
+      const r = makeBitReader(nal.subarray(1));    // 跳过 NAL 头
+      const profile = r.bits(8), compat = r.bits(8), level = r.bits(8);
+      r.ue();                                      // seq_parameter_set_id
+      let chroma = 1, separate = 0;
+      if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].indexOf(profile) >= 0) {
+        chroma = r.ue();
+        if (chroma === 3) separate = r.bit();
+        r.ue();                                    // bit_depth_luma_minus8
+        r.ue();                                    // bit_depth_chroma_minus8
+        r.bit();                                   // qpprime_y_zero_transform_bypass_flag
+        if (r.bit()) {                             // seq_scaling_matrix_present_flag
+          const n = chroma === 3 ? 12 : 8;
+          for (let i = 0; i < n; i++) if (r.bit()) skipScalingList(r, i < 6 ? 16 : 64);
+        }
+      }
+      r.ue();                                      // log2_max_frame_num_minus4
+      const poc = r.ue();                          // pic_order_cnt_type
+      if (poc === 0) r.ue();
+      else if (poc === 1) {
+        r.bit(); r.se(); r.se();
+        const n = r.ue();
+        for (let i = 0; i < n; i++) r.se();
+      }
+      r.ue();                                      // max_num_ref_frames
+      r.bit();                                     // gaps_in_frame_num_value_allowed_flag
+      const wMB = r.ue() + 1, hMap = r.ue() + 1;
+      const frameMB = r.bit();                     // frame_mbs_only_flag
+      const hMB = (frameMB ? 1 : 2) * hMap;
+      if (!frameMB) r.bit();                       // mb_adaptive_frame_field_flag
+      r.bit();                                     // direct_8x8_inference_flag
+      let cropL = 0, cropR = 0, cropT = 0, cropB = 0;
+      if (r.bit()) { cropL = r.ue(); cropR = r.ue(); cropT = r.ue(); cropB = r.ue(); }
+      const unitX = (!chroma || separate) ? 1 : (chroma === 1 || chroma === 2) ? 2 : 1;
+      const unitY = (!chroma || separate) ? 1 : (chroma === 1 ? 2 : 1) * (frameMB ? 1 : 2);
+      const width = wMB * 16 - (cropL + cropR) * unitX;
+      const height = hMB * 16 - (cropT + cropB) * unitY;
+      if (width <= 0 || height <= 0) return null;
+      return { profile, compat, level, width, height };
+    } catch (_) { return null; }
+  }
+
+  // ---- Annex-B 字节流 → NAL 列表 ----
+  function splitNALs(buf) {
+    const out = [];
+    let i = 0, start = -1;
+    while (i + 2 < buf.length) {
+      if (buf[i] === 0 && buf[i + 1] === 0 &&
+          (buf[i + 2] === 1 || (buf[i + 2] === 0 && i + 3 < buf.length && buf[i + 3] === 1))) {
+        const scLen = buf[i + 2] === 1 ? 3 : 4;
+        if (start >= 0) {
+          let end = i;
+          while (end > start && buf[end - 1] === 0) end--;   // 起始码前的 00 属于字节流填充
+          if (end > start) out.push(buf.subarray(start, end));
+        }
+        i += scLen;
+        start = i;
+        continue;
+      }
+      i++;
+    }
+    if (start >= 0) {
+      let end = buf.length;
+      while (end > start && buf[end - 1] === 0) end--;
+      if (end > start) out.push(buf.subarray(start, end));
+    }
+    return out;
+  }
+  function joinChunks(list) {
+    let len = 0;
+    for (const c of list) len += c.length;
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const c of list) { out.set(c, off); off += c.length; }
+    return out;
+  }
+  // AudioSpecificConfig：ADTS 的 profile 字段就是 objectType-1。
+  function audioSpecificConfig(profile, sfIndex, channels) {
+    const objType = (profile & 3) + 1;
+    return new Uint8Array([(objType << 3) | ((sfIndex >> 1) & 7),
+                           ((sfIndex & 1) << 7) | ((channels & 15) << 3)]);
+  }
+
+  // createTSRemuxer 返回 { push, finish }。
+  //   write(bytes)：把 sample 数据**按顺序**追加到 mdat（落盘由调用方负责）。
+  //   push(Uint8Array)：可以按任意字节数分块喂；finish() 收尾并返回索引信息。
+  function createTSRemuxer(write) {
+    let tail = new Uint8Array(0);
+    let pending = [], pendingLen = 0;
+    let pos = 0, tsBytes = 0, packets = 0;
+    let pmtPID = -1, sawPMT = false, badAudio = "";
+    const unsupported = [];
+    const psi = new Map();                 // PID → 半截 PSI section
+    const v = newStream(), a = newStream();
+
+    function newStream() {
+      return {
+        pid: -1, type: 0, pes: [], pesLen: 0, tsValid: false,
+        ptsRaw: -1, dtsRaw: -1, wrap: 0, shift: 0, lastRaw: -1, lastDts: -1, lastDur: 0,
+        samples: [], bytes: 0, sps: null, pps: null, width: 0, height: 0,
+        profile: 0, compat: 0, level: 0, asc: null, rate: 0, channels: 0, frames: 0,
+      };
+    }
+
+    function flush(force) {
+      if (!pendingLen || (!force && pendingLen < (1 << 20))) return null;
+      const buf = new Uint8Array(pendingLen);
+      let off = 0;
+      for (const p of pending) { buf.set(p, off); off += p.length; }
+      pending = []; pendingLen = 0;
+      return write(buf);
+    }
+
+    function addSample(t, s) {
+      if (t.lastDts >= 0) {
+        const dur = s.dts - t.lastDts;
+        if (dur > 0) t.lastDur = dur;
+        else s.dts = t.lastDts + (t.lastDur || 1);        // 同刻/倒退：给一个最小步长
+      }
+      t.lastDts = s.dts;
+      t.samples.push(s);
+      t.bytes += s.size;
+      pending.push(s.data);
+      pendingLen += s.size;
+      pos += s.size;
+    }
+
+    // normalize 处理 33 位回绕与"段间时间戳倒退"：后者不修就是负的 stts delta，
+    // 播放器会直接卡住或只播第一段。
+    function normalize(t, rawDts) {
+      if (t.lastRaw >= 0 && rawDts < t.lastRaw && t.lastRaw - rawDts > 0x80000000) {
+        t.wrap += 0x200000000;                            // 2^33
+      }
+      t.lastRaw = rawDts;
+      let dts = rawDts + t.wrap + t.shift;
+      if (t.lastDts >= 0 && dts < t.lastDts) {
+        const bump = t.lastDts + (t.lastDur || 1) - dts;
+        t.shift += bump;
+        dts += bump;
+      }
+      return dts;
+    }
+
+    function readTimestamp(b, o) {
+      return ((b[o] >> 1) & 7) * 0x40000000 + (b[o + 1] << 22) +
+             ((b[o + 2] >> 1) & 0x7f) * 0x8000 + (b[o + 3] << 7) + ((b[o + 4] >> 1) & 0x7f);
+    }
+
+    function finishVideo(data) {
+      let dts, cts;
+      if (v.tsValid) {
+        const lead = Math.max(0, v.ptsRaw - v.dtsRaw);
+        dts = normalize(v, v.dtsRaw);
+        cts = dts + lead;
+      } else {
+        dts = v.lastDts < 0 ? 0 : v.lastDts + (v.lastDur || 3000);
+        cts = dts;
+      }
+      const keep = [];
+      let size = 0, key = false;
+      for (const nal of splitNALs(data)) {
+        const type = nal[0] & 0x1f;
+        if (type === 9) continue;                          // AUD：MP4 里没有意义
+        if (type === 7) {
+          if (!v.sps) {
+            v.sps = bytesCopy(nal);
+            const info = parseSPS(nal);
+            if (info) {
+              v.width = info.width; v.height = info.height;
+              v.profile = info.profile; v.compat = info.compat; v.level = info.level;
+            }
+          }
+          continue;                                        // SPS/PPS 进 avcC，不进 sample
+        }
+        if (type === 8) { if (!v.pps) v.pps = bytesCopy(nal); continue; }
+        if (type === 5) key = true;
+        keep.push(nal);
+        size += 4 + nal.length;
+      }
+      if (!size) return;
+      if (!v.samples.length) key = true;                   // 第一帧必须是同步样本
+      const buf = new Uint8Array(size);
+      let off = 0;
+      for (const nal of keep) {
+        buf[off] = (nal.length >>> 24) & 255;
+        buf[off + 1] = (nal.length >>> 16) & 255;
+        buf[off + 2] = (nal.length >>> 8) & 255;
+        buf[off + 3] = nal.length & 255;
+        buf.set(nal, off + 4);
+        off += 4 + nal.length;
+      }
+      addSample(v, { off: pos, size, dts, cts, key, data: buf });
+    }
+
+    // 一个音频 PES 通常打包好几帧 ADTS：每帧是一个 MP4 sample。
+    function finishAudio(data) {
+      const base = a.tsValid ? normalize(a, a.dtsRaw)
+                             : (a.lastDts < 0 ? 0 : a.lastDts + (a.lastDur || 0));
+      let p = 0, idx = 0;
+      while (p + 7 <= data.length) {
+        if (data[p] !== 0xff || (data[p + 1] & 0xf0) !== 0xf0) { p++; continue; }
+        const hdr = (data[p + 1] & 1) ? 7 : 9;             // protection_absent=0 时多 2 字节 CRC
+        if (p + hdr > data.length) break;
+        const profile = (data[p + 2] >> 6) & 3;
+        const sfIndex = (data[p + 2] >> 2) & 0x0f;
+        const channels = ((data[p + 2] & 1) << 2) | ((data[p + 3] >> 6) & 3);
+        const frameLen = ((data[p + 3] & 3) << 11) | (data[p + 4] << 3) | ((data[p + 5] >> 5) & 7);
+        if (frameLen < hdr || p + frameLen > data.length) break;
+        const rate = ADTS_RATES[sfIndex];
+        if (!rate) { badAudio = "AAC 采样率索引 " + sfIndex + " 不认识"; return; }
+        if (!a.asc) {
+          a.asc = audioSpecificConfig(profile, sfIndex, channels || 2);
+          a.rate = rate;
+          a.channels = channels || 2;
+        }
+        const dts = base + Math.round(idx * 1024 * TS_TIMESCALE / rate);
+        addSample(a, { off: pos, size: frameLen - hdr, dts, cts: dts, key: true,
+                       data: bytesCopy(data.subarray(p + hdr, p + frameLen)) });
+        idx++;
+        p += frameLen;
+      }
+      a.frames += idx;
+    }
+
+    function finishPES(t) {
+      if (!t.pes.length) return;
+      const data = joinChunks(t.pes);
+      t.pes = []; t.pesLen = 0;
+      if (!data.length) return;
+      if (t === v) finishVideo(data); else finishAudio(data);
+    }
+
+    function parsePESHeader(t, payload) {
+      if (payload.length < 9 || payload[0] !== 0 || payload[1] !== 0 || payload[2] !== 1) return null;
+      const flags = payload[7], hdrLen = payload[8];
+      if (9 + hdrLen > payload.length) return null;
+      const kind = (flags >> 6) & 3;
+      let pts = -1, dts = -1;
+      if (kind === 2 || kind === 3) {
+        pts = readTimestamp(payload, 9);
+        dts = kind === 3 ? readTimestamp(payload, 14) : pts;
+      }
+      if (pts >= 0) { t.ptsRaw = pts; t.dtsRaw = dts; t.tsValid = true; }
+      else t.tsValid = false;
+      return payload.subarray(9 + hdrLen);
+    }
+
+    function onPAT(d) {
+      if (d[0] !== 0x00) return;
+      const end = d.length - 4;                            // 末尾 4 字节 CRC32
+      for (let i = 8; i + 4 <= end; i += 4) {
+        if (((d[i] << 8) | d[i + 1]) !== 0) { pmtPID = ((d[i + 2] & 0x1f) << 8) | d[i + 3]; return; }
+      }
+    }
+    function onPMT(d) {
+      if (d[0] !== 0x02 || d.length < 16) return;
+      sawPMT = true;
+      const infoLen = ((d[10] & 0x0f) << 8) | d[11];
+      let i = 12 + infoLen;
+      const end = d.length - 4;
+      while (i + 5 <= end) {
+        const type = d[i];
+        const pid = ((d[i + 1] & 0x1f) << 8) | d[i + 2];
+        const esLen = ((d[i + 3] & 0x0f) << 8) | d[i + 4];
+        i += 5 + esLen;
+        if (type === ST_H264 && v.pid < 0) { v.pid = pid; v.type = type; continue; }
+        if (type === ST_AAC_ADTS && a.pid < 0) { a.pid = pid; a.type = type; continue; }
+        if (type === ST_HEVC) unsupported.push({ kind: "video", name: "HEVC（H.265）" });
+        else if (type === ST_AC3) unsupported.push({ kind: "audio", name: "AC-3" });
+        else if (type === ST_MPEG_AUDIO) unsupported.push({ kind: "audio", name: "MP2/MP3" });
+      }
+    }
+
+    // PSI 段可能跨包：先攒着，够了再交给回调。丢了半截就等下一次 PUSI。
+    function onSection(pid, pusi, payload) {
+      let data;
+      if (pusi) {
+        const ptr = payload[0] || 0;
+        psi.delete(pid);
+        data = payload.subarray(1 + ptr);
+      } else {
+        const prev = psi.get(pid);
+        if (!prev) return;
+        data = cat([prev, payload]);
+      }
+      if (data.length < 3) { psi.set(pid, bytesCopy(data)); return; }
+      const want = 3 + (((data[1] & 0x0f) << 8) | data[2]);
+      if (data.length < want) { psi.set(pid, bytesCopy(data)); return; }
+      psi.delete(pid);
+      const sec = data.subarray(0, want);
+      if (pid === 0) onPAT(sec); else onPMT(sec);
+    }
+
+    function onPacket(b, p) {
+      const b1 = b[p + 1], b3 = b[p + 3];
+      const pusi = (b1 & 0x40) !== 0;
+      const pid = ((b1 & 0x1f) << 8) | b[p + 2];
+      const afc = (b3 >> 4) & 3;
+      if (afc === 0 || afc === 2) return;                  // 无负载
+      let off = p + 4;
+      if (afc === 3) off += 1 + b[off];
+      if (off >= p + TS_PKT) return;
+      const payload = b.subarray(off, p + TS_PKT);
+      if (pid === 0 || (pmtPID >= 0 && pid === pmtPID)) { onSection(pid, pusi, payload); return; }
+      const t = pid === v.pid ? v : (pid === a.pid ? a : null);
+      if (!t) return;
+      if (pusi) {
+        finishPES(t);
+        const es = parsePESHeader(t, payload);
+        if (es) { t.pes = [es]; t.pesLen = es.length; }
+      } else if (t.pes.length) {
+        t.pes.push(payload);
+        t.pesLen += payload.length;
+      }
+    }
+
+    async function push(chunk) {
+      tsBytes += chunk.length;
+      let buf = chunk;
+      if (tail.length) {
+        buf = new Uint8Array(tail.length + chunk.length);
+        buf.set(tail, 0);
+        buf.set(chunk, tail.length);
+      }
+      let p = 0;
+      // 只在开头重新同步一次：拼接残留/垃圾字节也不至于整段错位。
+      if (buf.length >= TS_PKT && buf[0] !== TS_SYNC_BYTE) {
+        for (; p + TS_PKT <= buf.length; p++) {
+          if (buf[p] === TS_SYNC_BYTE && (p + TS_PKT >= buf.length || buf[p + TS_PKT] === TS_SYNC_BYTE)) break;
+        }
+      }
+      const end = buf.length - TS_PKT;
+      for (; p <= end; p += TS_PKT) {
+        if (buf[p] !== TS_SYNC_BYTE) continue;
+        packets++;
+        onPacket(buf, p);
+      }
+      const rest = buf.subarray(p);
+      tail = rest.length ? bytesCopy(rest) : new Uint8Array(0);
+      const job = flush(false);
+      if (job) await job;
+    }
+
+    async function finish() {
+      finishPES(v);
+      finishPES(a);
+      const job = flush(true);
+      if (job) await job;
+      let error = "";
+      const badVideo = unsupported.filter((s) => s.kind === "video");
+      const badA = unsupported.filter((s) => s.kind === "audio");
+      if (badAudio) error = badAudio;
+      else if (!v.samples.length) {
+        error = badVideo.length
+          ? "视频编码是 " + badVideo[0].name + "，本页只转 H.264；请保持 .ts，或用 ffmpeg 处理"
+          : (sawPMT ? "TS 里没有解析到 H.264 视频帧（可能是纯音频、或不是 TS 数据）"
+                    : "没有读到 PMT（不像是 MPEG-TS 数据）");
+      } else if (!v.sps || !v.pps) {
+        error = "没有拿到 H.264 的 SPS/PPS，建不出 avcC";
+      } else if (a.pid >= 0 && !a.samples.length) {
+        error = "AAC 音频一帧都没解析出来（TS 结构异常）";
+      } else if (a.pid < 0 && badA.length) {
+        error = "音频编码是 " + badA[0].name + "，本页只支持 AAC 转 MP4；请保持 .ts";
+      }
+      // 第一条采样不一定从 0 开始（TS 常带 ~1.4s 的 mux delay）：整体平移到 0，
+      // 否则 mvhd/轨道时长会凭空多出这一段静音，剪辑软件里前面就是一段黑。
+      const first = Math.min(v.samples.length ? v.samples[0].dts : Infinity,
+                             a.samples.length ? a.samples[0].dts : Infinity);
+      if (Number.isFinite(first) && first > 0) {
+        for (const s of v.samples) { s.dts -= first; s.cts -= first; }
+        for (const s of a.samples) { s.dts -= first; s.cts -= first; }
+      }
+      const video = v.samples.length ? {
+        samples: v.samples, count: v.samples.length, bytes: v.bytes,
+        width: v.width, height: v.height, sps: v.sps, pps: v.pps,
+        profile: v.profile, compat: v.compat, level: v.level,
+      } : null;
+      const audio = a.samples.length ? {
+        samples: a.samples, count: a.samples.length, bytes: a.bytes,
+        rate: a.rate, channels: a.channels, asc: a.asc,
+      } : null;
+      const dur90 = Math.max(video ? trackDuration(video) : 0, audio ? trackDuration(audio) : 0);
+      return {
+        error, video, audio, packets, tsBytes,
+        mdatBytes: pos, durationMs: Math.round(dur90 * 1000 / TS_TIMESCALE),
+      };
+    }
+
+    return { push, finish };
+  }
+
+  function trackDuration(t) {
+    const n = t.samples.length;
+    if (!n) return 0;
+    return t.samples[n - 1].dts + sampleDelta(t.samples, n - 1);
+  }
+  function sampleDelta(samples, i) {
+    if (samples.length > 1) {
+      if (i > 0) return Math.max(1, samples[i].dts - samples[i - 1].dts);
+      return Math.max(1, samples[1].dts - samples[0].dts);
+    }
+    return 3000;                                           // 只有一个样本：按 1/30 秒
+  }
+
+  function sttsBox(samples) {
+    const runs = [];
+    for (let i = 0; i < samples.length; i++) {
+      const d = sampleDelta(samples, i);
+      if (runs.length && runs[runs.length - 2] === d) runs[runs.length - 2]++;
+      else runs.push(1, d);
+    }
+    const body = new Uint8Array(8 + runs.length * 4);
+    body.set(fullBox(0, 0), 0);
+    body.set(be32(runs.length / 2), 4);
+    for (let i = 0; i < runs.length; i++) body.set(be32(runs[i] >>> 0), 8 + i * 4);
+    return mp4box("stts", [body]);
+  }
+  function cttsBox(samples) {
+    let any = false, neg = false;
+    for (const s of samples) { const o = s.cts - s.dts; if (o) any = true; if (o < 0) neg = true; }
+    if (!any) return null;                                 // 没有 B 帧：不需要 ctts
+    const runs = [];
+    for (const s of samples) {
+      const o = s.cts - s.dts;
+      if (runs.length && runs[runs.length - 2] === o) runs[runs.length - 2]++;
+      else runs.push(1, o);
+    }
+    const ver = neg ? 1 : 0;
+    const body = new Uint8Array(8 + runs.length * 4);
+    body.set(fullBox(ver, 0), 0);
+    body.set(be32(runs.length / 2), 4);
+    for (let i = 0; i < runs.length; i++) body.set(be32(runs[i] >>> 0), 8 + i * 4);
+    return mp4box("ctts", [body]);
+  }
+  function stszBox(samples) {
+    const body = new Uint8Array(12 + samples.length * 4);
+    body.set(fullBox(0, 0), 0);
+    body.set(be32(samples.length), 8);
+    for (let i = 0; i < samples.length; i++) {
+      const n = samples[i].size, o = 12 + i * 4;
+      body[o] = (n >>> 24) & 255; body[o + 1] = (n >>> 16) & 255;
+      body[o + 2] = (n >>> 8) & 255; body[o + 3] = n & 255;
+    }
+    return mp4box("stsz", [body]);
+  }
+  // 每个 sample 自成一个 chunk：stsc 只要一条，偏移表用 co64（>4GiB 也不用换表）。
+  function co64Box(samples, mdatStart) {
+    const body = new Uint8Array(8 + samples.length * 8);
+    body.set(fullBox(0, 0), 0);
+    body.set(be32(samples.length), 4);
+    for (let i = 0; i < samples.length; i++) {
+      const off = mdatStart + samples[i].off;
+      body.set(be32(Math.floor(off / 4294967296)), 8 + i * 8);
+      body.set(be32(off % 4294967296), 12 + i * 8);
+    }
+    return mp4box("co64", [body]);
+  }
+  function stssBox(samples) {
+    const keys = [];
+    for (let i = 0; i < samples.length; i++) if (samples[i].key) keys.push(i + 1);
+    if (!keys.length || keys.length === samples.length) return null;
+    const body = new Uint8Array(8 + keys.length * 4);
+    body.set(fullBox(0, 0), 0);
+    body.set(be32(keys.length), 4);
+    for (let i = 0; i < keys.length; i++) body.set(be32(keys[i]), 8 + i * 4);
+    return mp4box("stss", [body]);
+  }
+  function avcCBox(sps, pps) {
+    return mp4box("avcC", new Uint8Array([1, sps[1] & 255, sps[2] & 255, sps[3] & 255, 0xff, 0xe1]),
+                  be16(sps.length), sps, new Uint8Array([1]), be16(pps.length), pps);
+  }
+  // esds：AAC-LC/LTP 的 DecoderSpecificInfo 就是 AudioSpecificConfig。
+  function esdsBox(asc, rate, channels) {
+    const dsi = cat([new Uint8Array([0x05, asc.length]), asc]);
+    const dcd = cat([new Uint8Array([0x04, 13 + asc.length]), new Uint8Array([0x40, 0x15, 0, 0, 0]),
+                     be32(0), be32(rate * channels * 2), dsi]);
+    const es = cat([new Uint8Array([0x03, 3 + dcd.length]), be16(0), new Uint8Array([0]), dcd]);
+    return mp4box("esds", [fullBox(0, 0), es]);
+  }
+  function dinfBox() {
+    return mp4box("dinf", mp4box("dref", fullBox(0, 0), be32(1), mp4box("url ", fullBox(0, 1))));
+  }
+  function moovTrak(t, id, kind, mdatStart) {
+    const dur = trackDuration(t);
+    let entry, vmhd = null, smhd = null, width = 0, height = 0;
+    if (kind === "video") {
+      width = t.width || 0; height = t.height || 0;
+      entry = mp4box("avc1",
+        new Uint8Array(6), be16(1), be16(0), be16(0), new Uint8Array(12),
+        be16(width), be16(height), be32(0x00480000), be32(0x00480000),
+        be32(0), be16(1), new Uint8Array(32), be16(0x0018), be16(0xffff),
+        avcCBox(t.sps, t.pps));
+      vmhd = mp4box("vmhd", fullBox(0, 1), be16(0), be16(0), be16(0), be16(0));
+    } else {
+      entry = mp4box("mp4a",
+        new Uint8Array(6), be16(1), new Uint8Array(8),
+        be16(t.channels || 2), be16(16), be16(0), be16(0),
+        be32((t.rate || 48000) * 65536), esdsBox(t.asc, t.rate || 48000, t.channels || 2));
+      smhd = mp4box("smhd", fullBox(0, 0), be16(0), be16(0));
+    }
+    const stbl = mp4box("stbl", [
+      mp4box("stsd", fullBox(0, 0), be32(1), entry),
+      sttsBox(t.samples),
+      cttsBox(t.samples),                                // 无 B 帧时为 null，cat 会跳过
+      mp4box("stsc", fullBox(0, 0), be32(1), be32(1), be32(1), be32(1)),
+      stszBox(t.samples),
+      co64Box(t.samples, mdatStart),
+      stssBox(t.samples),
+    ]);
+    const minf = mp4box("minf", kind === "video" ? vmhd : smhd, dinfBox(), stbl);
+    const mdia = mp4box("mdia", [
+      mp4box("mdhd", fullBox(0, 0), be32(0), be32(0), be32(TS_TIMESCALE), be32(dur),
+             be16(0x55c4), be16(0)),
+      mp4box("hdlr", fullBox(0, 0), be32(0), fourcc(kind === "video" ? "vide" : "soun"),
+             new Uint8Array(12), utf8z(kind === "video" ? "VideoHandler" : "SoundHandler")),
+      minf,
+    ]);
+    const tkhd = mp4box("tkhd", fullBox(0, 7), be32(0), be32(0), be32(id), be32(0), be32(dur),
+      new Uint8Array(8), be16(0), be16(0), be16(kind === "video" ? 0 : 0x0100), be16(0),
+      MATRIX_9, be32(width * 65536), be32(height * 65536));
+    return mp4box("trak", tkhd, mdia);
+  }
+  // buildRemuxMoov 生成索引：调用方把它追加在 mdat 之后（moov 在尾部的普通 MP4）。
+  function buildRemuxMoov(info, mdatStart) {
+    const traks = [];
+    let id = 1;
+    if (info.video) traks.push(moovTrak(info.video, id++, "video", mdatStart));
+    if (info.audio) traks.push(moovTrak(info.audio, id++, "audio", mdatStart));
+    const dur = Math.max(info.video ? trackDuration(info.video) : 0,
+                         info.audio ? trackDuration(info.audio) : 0);
+    const mvhd = mp4box("mvhd", fullBox(0, 0), be32(0), be32(0), be32(1000),
+      be32(Math.round(dur * 1000 / TS_TIMESCALE)), be32(0x00010000), be16(0x0100), be16(0),
+      be32(0), be32(0), MATRIX_9, new Uint8Array(24), be32(traks.length + 1));
+    return mp4box("moov", [mvhd].concat(traks));
+  }
+  // ==TS-REMUX-END==
+
   // startMerge 给主脚本的「下载并合并（TS）」按钮用（同一套 busy 保护）。
   function startMerge() { start(); }
+
+  // ---------- TS → MP4 的界面接线 ----------
+  //
+  // 合并出 .ts 之后由用户点按钮转封装，**不自动做**：自动做意味着每次合并都要多写
+  // 一份文件（浏览器存储翻倍）、多花一遍 CPU，而很多人只要 .ts 就够了。
+  let lastTSStore = null;              // 当前可转换的 .ts（OPFS / MemFile 句柄）
+  let lastTSQuality = "";
+
+  function setRemuxAvailable(store, quality) {
+    lastTSStore = store || null;
+    lastTSQuality = quality || "";
+    const b = $("#muxRemux");
+    if (b) b.classList.toggle("hidden", !store);
+  }
+
+  // streamCopy：把一个 store 的一段原样搬到另一个 store（不支持位置写时的兜底）。
+  async function streamCopy(src, dst, start, len) {
+    const CH = 2 * 1024 * 1024;
+    for (let off = start; off < start + len; off += CH) {
+      await dst.append(await src.read(off, Math.min(CH, start + len - off)));
+    }
+  }
+
+  async function remuxTS() {
+    if (busy) return;
+    if (!lastTSStore) { alert("当前没有可转换的 .ts：先用 HLS 分片合并一次"); return; }
+    const ts = lastTSStore, tsQuality = lastTSQuality;
+    busy = true;
+    $("#muxStart").disabled = true;
+    $("#muxRemux").disabled = true;
+    $("#muxProgWrap").classList.remove("hidden");
+    bar(0); detail("");
+    let out = null;
+    try {
+      const total = await ts.size();
+      if (!total) throw new Error("合并出来的 .ts 是空的");
+
+      phase("① 写 MP4 容器头…");
+      out = await newFile("remux.mp4");
+      const ftyp = buildFTYP();
+      const mdatAt = ftyp.length;                  // mdat 长度字段的偏移
+      const mdatStart = ftyp.length + 16;          // mdat 的媒体数据起点
+      await out.append(ftyp);
+      await out.append(mdatHeader(0));             // 先占位，收尾时回填
+      let written = 0;
+      const rx = createTSRemuxer(async (b) => { await out.append(b); written += b.byteLength; });
+
+      phase("② 解复用 TS（不解码、不重编码）…");
+      const CH = 4 * 1024 * 1024;
+      for (let off = 0; off < total; off += CH) {
+        const got = await ts.read(off, Math.min(CH, total - off));
+        if (!got.length) break;
+        await rx.push(got);
+        bar(Math.min(0.9, ((off + got.length) / total) * 0.9));
+        detail("已解析 " + prettySize(off + got.length) + " / " + prettySize(total));
+      }
+      const info = await rx.finish();
+      if (info.error) throw new Error(info.error + "（原始 .ts 仍可保存）");
+
+      phase("③ 写 MP4 索引（moov）…");
+      bar(0.95);
+      const moov = buildRemuxMoov(info, mdatStart);
+      if (await out.writeAt(mdatAt, mdatHeader(written))) {
+        await out.writeAt(mdatStart + written, moov);
+      } else {
+        // 极端兜底：浏览器不支持在文件中间回填。另写一份、把 mdat 原样搬过去，
+        // 结果一模一样，代价是多一遍读写（几 GB 的文件会明显慢）。
+        await out.close();
+        const src = out;
+        out = await newFile("remux2.mp4");
+        await out.append(ftyp);
+        await out.append(mdatHeader(written));
+        await streamCopy(src, out, mdatStart, written);
+        await out.append(moov);
+        await src.drop();
+      }
+      await out.close();
+
+      const file = await out.file();
+      const name = dlName(await ensureTitle(), "前端转封装", qualityLabel(tsQuality), "mp4");
+      const url = URL.createObjectURL(new Blob([file], { type: "video/mp4" }));
+      if (lastURL) URL.revokeObjectURL(lastURL);
+      lastURL = url;
+      const vw = $("#muxVideo");
+      vw.classList.remove("hidden");
+      $("#muxNoPreview").classList.add("hidden");
+      vw.src = url;
+      const save = $("#muxSave");
+      save.href = url;
+      save.download = name;
+      $("#muxInfo").textContent = name + " · " + prettySize(file.size) + " · MP4（未重编码）";
+      phase("④ 完成");
+      bar(1);
+      detail("视频 " + info.video.count + " 帧 · 音频 " + (info.audio ? info.audio.count : 0) +
+        " 帧 · 约 " + Math.round(info.durationMs / 1000) + " 秒 · MP4 " + prettySize(file.size) +
+        "（媒体数据 " + prettySize(info.mdatBytes) + "，一个字节都没重编码）");
+      // 转完就把 .ts 删掉：内容一模一样（只是换了盒子），留着白占一份浏览器存储。
+      setRemuxAvailable(null);
+      try { await ts.drop(); } catch (_) {}
+      refreshQuota();
+    } catch (e) {
+      if (out) { try { await out.drop(); } catch (_) {} }
+      phase("转封装失败（原始 .ts 仍然可用）");
+      detail(String(e && e.message ? e.message : e));
+      bar(0);
+    } finally {
+      busy = false;
+      $("#muxStart").disabled = false;
+      $("#muxRemux").disabled = false;
+    }
+  }
 
   // ---------- 主流程 ----------
   let busy = false;
@@ -2683,6 +3471,7 @@ function vlSignUrl(prefix, key, url, ts) {
     $("#muxProgWrap").classList.remove("hidden");
     bar(0); detail("");
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
+    setRemuxAvailable(null);   // 新的一次合并会覆盖存储，旧的 .ts 不再可转
 
     try {
       syncProxyBox();
@@ -2833,6 +3622,7 @@ function vlSignUrl(prefix, key, url, ts) {
   });
 
   $("#muxStart").addEventListener("click", start);
+  $("#muxRemux").addEventListener("click", remuxTS);
   $("#muxVq").addEventListener("change", updateMuxNote);
   $("#muxAq").addEventListener("change", updateMuxNote);
 
@@ -2884,6 +3674,7 @@ function vlSignUrl(prefix, key, url, ts) {
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
     $("#muxVideo").removeAttribute("src");
     $("#muxOut").classList.add("hidden");
+    setRemuxAvailable(null);
     await cleanStorage();
     await refreshQuota();
     phase("已清理浏览器存储");
