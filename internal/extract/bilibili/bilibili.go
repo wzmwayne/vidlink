@@ -250,9 +250,17 @@ func (e *Extractor) ParseID(ctx context.Context, id string) (*core.Video, error)
 	if id == "" {
 		return nil, core.BadInput(core.PlatformBilibili, "ID 为空")
 	}
+	low := strings.ToLower(id)
+	// 季号（ss）也要给出可操作的报错：否则会走到 /video/ss28747 那条路，
+	// 报成"无法从链接中识别 BV/av/ep"，用户看不出来该怎么办。
+	if strings.HasPrefix(low, "ss") {
+		return nil, core.Unsupported(core.PlatformBilibili,
+			"这是番剧季号（%s）：请用具体一集的 ep 号（形如 ep733316），"+
+				"或在番剧页里点开一集后复制地址", id)
+	}
 	href := "https://www.bilibili.com/video/" + id
-	if strings.HasPrefix(strings.ToLower(id), "ep") {
-		href = "https://www.bilibili.com/bangumi/play/" + strings.ToLower(id)
+	if strings.HasPrefix(low, "ep") {
+		href = "https://www.bilibili.com/bangumi/play/" + low
 	}
 	u := &core.URL{Raw: id, Href: href, Host: "www.bilibili.com", Path: u_pathOf(href)}
 	return e.Parse(ctx, u)

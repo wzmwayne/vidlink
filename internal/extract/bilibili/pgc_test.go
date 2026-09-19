@@ -203,6 +203,22 @@ func TestParseBangumiSeasonLinkRejected(t *testing.T) {
 	}
 }
 
+// TestParseIDSeasonNumberRejected：platform=bilibili&id=ss28747 也要给可操作的报错，
+// 而不是退化到 /video/ss28747 之后报"无法识别 BV/av/ep"。
+func TestParseIDSeasonNumberRejected(t *testing.T) {
+	e := pgcTestExtractor(t, seasonFixture, pgcViewFixture, playurlFixture, nil)
+	_, err := e.ParseID(context.Background(), "ss28747")
+	if err == nil {
+		t.Fatal("季号应报错")
+	}
+	if core.KindOf(err) != core.KindUnsupport {
+		t.Errorf("应是 unsupported：%v", err)
+	}
+	if !strings.Contains(err.Error(), "ep") || !strings.Contains(err.Error(), "ss28747") {
+		t.Errorf("报错应告诉用户改用 ep 号：%v", err)
+	}
+}
+
 // TestParseBangumiMissingEpisode：ep 不在集列表里 → 404，而不是拿别的集冒充。
 func TestParseBangumiMissingEpisode(t *testing.T) {
 	e := pgcTestExtractor(t, seasonFixture, pgcViewFixture, playurlFixture, nil)
