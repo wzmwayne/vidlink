@@ -14,6 +14,7 @@ const (
 	PlatformBilibili    Platform = "bilibili"    // 哔哩哔哩
 	PlatformKuaishou    Platform = "kuaishou"    // 快手
 	PlatformXiaohongshu Platform = "xiaohongshu" // 小红书
+	PlatformJianpian    Platform = "jianpian"    // 荐片（影视剧集）
 )
 
 // Author 是内容作者信息。
@@ -85,6 +86,40 @@ type Stats struct {
 	Duration int   `json:"duration,omitempty"`
 }
 
+// Line 是"剧集型内容"的一条线路（一部剧可能有十几条来源线路）。
+//
+// 荐片把线路当作可选项暴露，**线路名就是它的"清晰度"维度**
+// （与 B 站的 Height/qn 不同：线路是来源，不是像素高度）。
+type Line struct {
+	Name string `json:"name"`
+	// Key 是平台内部的线路标识（荐片 source_key，如 back_source_list_cdn）。
+	Key string `json:"key,omitempty"`
+	// Count 是该线路的集数。
+	Count int `json:"count,omitempty"`
+	// VIP 表示这是平台标记的 VIP/蓝光优先线路（荐片匿名也可用，仍然照常返回）。
+	VIP bool `json:"vip,omitempty"`
+}
+
+// Episode 是"剧集型内容"的一集（或电影的唯一一集）。
+//
+// ID 是平台内的**单集** ID（荐片的 source id），与 Video.ID（影片 ID）不同。
+type Episode struct {
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Line     string  `json:"line,omitempty"`
+	LineIdx  int     `json:"line_index,omitempty"` // 线路序号（1 基）
+	Index    int     `json:"index,omitempty"`      // 线路内集序号（1 基）
+	URL      string  `json:"url,omitempty"`        // 播放地址（荐片为 m3u8）
+	FTP      string  `json:"ftp,omitempty"`        // 可选的整集直链（荐片 ftp_list）
+	Duration float64 `json:"duration,omitempty"`
+	VIP      bool    `json:"vip,omitempty"`
+	// ParseID 是"可以直接拿去解析的 ID"。
+	//
+	// 由提取器自己填（它最清楚自己的 ID 规则）：荐片是 `<影片ID>_<单集ID>`。
+	// 放在这里而不是让接口层拼，是为了避免"ID 规则"在两处各写一份。
+	ParseID string `json:"parse_id,omitempty"`
+}
+
 // Video 是一次解析的完整结果，是 API 的唯一输出模型。
 type Video struct {
 	Platform Platform `json:"platform"`
@@ -108,6 +143,23 @@ type Video struct {
 	Images    []Image    `json:"images,omitempty"`
 	Music     *Stream    `json:"music,omitempty"`
 	Subtitles []Subtitle `json:"subtitles,omitempty"`
+
+	// Lines / Episodes 是"剧集型内容"（荐片）的线路与选集。
+	//
+	// Episodes 里**只有被选中的那条线路**（默认 VIP 线路，见提取器），
+	// 而不是全部线路 × 全部集——否则 detail 响应会被十几条线路撑爆；
+	// 要换线路/换集就换 line/episode 参数再解析一次。
+	Lines    []Line    `json:"lines,omitempty"`
+	Episodes []Episode `json:"episodes,omitempty"`
+	// Latest 是平台标注的更新进度（如 "第10集"），Finished 表示已完结。
+	Latest   string `json:"latest,omitempty"`
+	Finished bool   `json:"finished,omitempty"`
+	// EpisodeOnly 表示 Episodes 里**只有被指定的那一集**（可能横跨多条线路，
+	// 因为多条线路可能共用同一个单集 ID）。
+	//
+	// 它决定了出参怎么裁剪：false = "全部集"，投影时按请求的线路筛；
+	// true = "精确到集"，投影时不再按线路筛（否则可能筛成空）。
+	EpisodeOnly bool `json:"episode_only,omitempty"`
 
 	// SourceURL 是归一化后的原始页面地址，便于回溯。
 	SourceURL string `json:"source_url,omitempty"`

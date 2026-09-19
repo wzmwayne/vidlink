@@ -37,10 +37,17 @@ import (
 	"vidlink/internal/core"
 )
 
-// Endpoint 是四个配额端点。
+// Endpoint 是配额端点。
 type Endpoint string
 
 const (
+	// EndpointSearch 按关键词搜索内容：只给元信息 + id，不含任何直链。
+	//
+	// **按条计量**（与 batch_links 同一类）：一次搜索返回 n 条结果，就按 n 条
+	// 计价，因为每条结果都等价于一次 info 的产出（标题/简介/封面/统计）。
+	// 默认 0.25/条 —— 是 info(0.5/条) 的一半：搜索结果只给元信息的一部分
+	// （没有档位列表、没有直链），但一次要打多次上游，属实比单条 info 重。
+	EndpointSearch Endpoint = "search"
 	// EndpointInfo 只返回元信息与可用档位列表，不含任何直链。
 	EndpointInfo Endpoint = "info"
 	// EndpointLinks 只返回直链，不含任何元信息。
@@ -53,7 +60,7 @@ const (
 
 // AllEndpoints 便于遍历与测试。
 var AllEndpoints = []Endpoint{
-	EndpointInfo, EndpointLinks, EndpointDetail, EndpointBatchLinks,
+	EndpointSearch, EndpointInfo, EndpointLinks, EndpointDetail, EndpointBatchLinks,
 }
 
 // defaultPlatformKey 是"通用"档的键。表里没列出的平台都走它。
@@ -69,6 +76,7 @@ const PlatformDefault = "default"
 var AllPlatforms = []core.Platform{
 	core.PlatformBilibili, core.PlatformDouyin,
 	core.PlatformKuaishou, core.PlatformXiaohongshu,
+	core.PlatformJianpian,
 }
 
 // PlatformName 把内部平台键转成对外名字（通用档 → "default"）。
@@ -208,6 +216,14 @@ func DefaultTable() *Table {
 // 所以将来新增平台不需要动这张表就有合理的默认系数。
 func defaultRates() map[Endpoint]map[core.Platform]float64 {
 	return map[Endpoint]map[core.Platform]float64{
+		// 搜索：**0.25/条**。默认一次返回 20 条 → 5 配额；上限 50 条 → 12.5。
+		// 比 info(0.5/条) 便宜一半：搜索结果只给元信息的一部分（没有档位列表、
+		// 没有直链），但一次搜索要打多次上游（荐片 10 条/页，拿 50 条要 5 次），
+		// 所以按条计价、单价减半，两边都说得通。
+		// 平台默认值不单列：荐片不额外加价，部署者可在面板上把 jianpian/search 调高。
+		EndpointSearch: {
+			defaultPlatformKey: 0.25,
+		},
 		EndpointInfo: {
 			defaultPlatformKey:  0.5,
 			core.PlatformDouyin: 0.75,
@@ -235,6 +251,33 @@ func BatchUnsupportedReason(p core.Platform) string {
 	return batchUnsupported[p]
 }
 
+// SearchUnsupportedReason 返回该平台不能搜索的原因；空串表示支持。
+//
+// 与批量不同的是，这里的判据是**上游事实**（而不是运营策略）：
+// 抖音搜索要求登录态、快手搜索要反爬验证、小红书要整套签名，
+// 都是 2026-09 实测确认的。原因文案会出现在 /v1/platforms 与
+// /v1/search 的报错里——用户搜不了，至少要知道为什么。
+func SearchUnsupportedReason(p core.Platform) string {
+	return searchUnsupported[p]
+}
+
+// unsupportedReason 统一回答"这个端点在这个平台上支持吗"。
+//
+// 两处判定（Coefficient 与 ValidateCell）共用它，避免"系数算得出来但设不进去"
+// 这类自相矛盾的状态。
+func unsupportedReason(e Endpoint, p core.Platform) (string, bool) {
+	switch e {
+	case EndpointBatchLinks:
+		r, bad := batchUnsupported[p]
+		return r, bad
+	case EndpointSearch:
+		r, bad := searchUnsupported[p]
+		return r, bad
+	default:
+		return "", false
+	}
+}
+
 // ErrPlatformUnsupported 表示该端点不支持这个平台。
 type ErrPlatformUnsupported struct {
 	Endpoint Endpoint
@@ -253,6 +296,25 @@ func (e ErrPlatformUnsupported) Error() string {
 var batchUnsupported = map[core.Platform]string{
 	core.PlatformDouyin: "抖音按 IP 维度限流，批量会瞬间打出多个请求，容易被判定为异常流量。" +
 		"请改用 GET /v1/links 逐条获取",
+	core.PlatformJianpian: "荐片不支持链接解析（没有稳定的作品页形态）：批量接口按链接输入，" +
+		"荐片请用 platform=jianpian&id=<影片ID> 逐条调 GET /v1/links",
+}
+
+// searchUnsupported 列出"不能搜索"的平台及原因（全部为 2026-09 实测结论）。
+//
+// 这张表是**能力**事实，不是定价：因此它同时也决定了
+// /v1/platforms 的 search 字段。将来某个平台的条件具备
+// （例如运维提供了抖音登录态 Cookie，或实现了快手的 __NS_sig3 签名），
+// 删掉对应那行即可，接口契约不变。
+var searchUnsupported = map[core.Platform]string{
+	core.PlatformDouyin: "抖音搜索接口要求登录态：未登录请求实测返回 " +
+		"status_code=2483「请先登录，再继续搜索吧」；且搜索属受签名保护的重量级接口、" +
+		"按 IP 维度限流，本服务只维护访客身份，故不提供搜索",
+	core.PlatformKuaishou: "快手搜索接口有反爬校验：实测 visionSearchPhoto 返回 " +
+		"result=400002 并给出滑块验证链接（captcha.zt.kuaishou.com），" +
+		"需要 __NS_sig3 签名；移动端 rest 搜索接口要求登录态，故不提供搜索",
+	core.PlatformXiaohongshu: "小红书搜索接口需要 x-s / x-s-common / x-rap-param 全套签名" +
+		"（其中 x-rap-param 需位级兼容 gzip）与登录态，实现成本远超收益，故不提供搜索",
 }
 
 // Coefficient 返回一次调用的端点系数（已含平台差异；不含账号倍率）。
@@ -263,10 +325,8 @@ var batchUnsupported = map[core.Platform]string{
 //
 // 对批量端点，返回的是**每条**的系数。
 func (t *Table) Coefficient(e Endpoint, p core.Platform) (float64, error) {
-	if e == EndpointBatchLinks {
-		if reason, bad := batchUnsupported[p]; bad {
-			return 0, ErrPlatformUnsupported{Endpoint: e, Platform: p, Reason: reason}
-		}
+	if reason, bad := unsupportedReason(e, p); bad {
+		return 0, ErrPlatformUnsupported{Endpoint: e, Platform: p, Reason: reason}
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -432,11 +492,9 @@ func ValidateCell(e Endpoint, p core.Platform, v float64) error {
 		return fmt.Errorf("%s/%s 的系数 %v 超出允许范围 [%v, %v]",
 			PlatformName(p), e, v, MinRate, MaxRate)
 	}
-	if e == EndpointBatchLinks {
-		if reason, bad := batchUnsupported[p]; bad {
-			return fmt.Errorf("%s 不支持 %s（%s），不能给它设系数",
-				PlatformName(p), e, reason)
-		}
+	if reason, bad := unsupportedReason(e, p); bad {
+		return fmt.Errorf("%s 不支持 %s（%s），不能给它设系数",
+			PlatformName(p), e, reason)
 	}
 	for _, known := range AllEndpoints {
 		if known == e {

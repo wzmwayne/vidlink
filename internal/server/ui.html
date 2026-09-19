@@ -276,13 +276,43 @@
 
   <!-- 批量 -->
   <section>
-    <h2>批量取直链（5 ~ 20 条，抖音不支持）</h2>
+    <h2>批量取直链（5 ~ 20 条，抖音与荐片不支持）</h2>
     <textarea id="batch" placeholder="每行一条链接，例如：&#10;https://www.bilibili.com/video/BV1xx411c7mD&#10;https://v.kuaishou.com/xxxx/"></textarea>
     <div class="btns">
       <button data-act="batch">批量解析</button>
       <button data-act="batchfill">填入当前链接</button>
       <span class="status" id="batchCount" style="align-self:center"></span>
     </div>
+  </section>
+
+  <!-- 搜索 -->
+  <section>
+    <h2>搜索内容（默认前 20 条，可翻页）</h2>
+    <div class="row">
+      <div class="col narrow">
+        <label for="searchPlatform">平台</label>
+        <select id="searchPlatform"></select>
+      </div>
+      <div class="col" style="flex:3 1 320px">
+        <label for="searchKeyword">关键词</label>
+        <input id="searchKeyword" placeholder="例如：太空 / 猫" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label for="searchLimit">每页条数</label>
+        <input id="searchLimit" value="20" autocomplete="off">
+      </div>
+      <div class="col narrow">
+        <label for="searchPage">页码</label>
+        <input id="searchPage" value="1" autocomplete="off">
+      </div>
+    </div>
+    <div class="btns">
+      <button class="primary" id="searchBtn">搜索</button>
+      <span class="status" id="searchStatus" style="align-self:center"></span>
+    </div>
+    <div class="hint">搜索按条计价（0.25 配额/条，默认 20 条）；结果只给元信息与 ID，
+      直链请点条目上的「取直链」或「详情」（荐片还要选线路/集，见结果里的 parse_id 与线路列表）。</div>
+    <div id="searchOut"></div>
   </section>
 
   <!-- 浏览器内混流 -->
@@ -1031,6 +1061,79 @@ function vlSignUrl(prefix, key, url, ts) {
     return box;
   }
 
+  // ---------- 搜索 ----------
+
+  // useTarget 把一条搜索结果填进上面的解析表单：搜索只是入口，
+  // 真正取直链仍走同一个 links/detail 流程（同一套配额与错误处理）。
+  function useTarget(it) {
+    $("#platform").value = it.platform || "";
+    $("#vid").value = it.id || "";
+    $("#url").value = it.url || "";
+  }
+
+  async function runSearch() {
+    const plat = $("#searchPlatform") ? $("#searchPlatform").value : "";
+    const kw = $("#searchKeyword").value.trim();
+    if (!plat) { alert("请选择平台（当前可搜索的平台见 /v1/platforms）"); return; }
+    if (!kw) { alert("请填关键词"); return; }
+    const path = "/v1/search?platform=" + encodeURIComponent(plat) +
+      "&keyword=" + encodeURIComponent(kw) +
+      "&limit=" + encodeURIComponent($("#searchLimit").value.trim() || "20") +
+      "&page=" + encodeURIComponent($("#searchPage").value.trim() || "1");
+    const b = $("#searchBtn");
+    b.disabled = true;
+    try {
+      const res = await api(path);
+      if (res.status !== 200) { fail(res); $("#searchOut").textContent = ""; return; }
+      const d = res.body || {};
+      $("#searchStatus").textContent = "匹配 " + (d.total || 0) + " 条，本页 " + (d.count || 0) + " 条" +
+        (d.cost ? "，消耗 " + fmtUnits(d.cost) : "") + (d.cached ? "（命中缓存）" : "");
+      $("#searchOut").textContent = "";
+      $("#searchOut").appendChild(renderSearch(d));
+    } catch (e) {
+      $("#searchStatus").textContent = "请求失败：" + e;
+    } finally {
+      b.disabled = false;
+    }
+  }
+
+  function renderSearch(d) {
+    const box = el("div");
+    const items = d.items || [];
+    if (!items.length) {
+      box.appendChild(el("div", "hint", "没有匹配结果。"));
+      return box;
+    }
+    items.forEach((it) => {
+      const card = el("div");
+      card.style.cssText = "border:1px solid var(--line);border-radius:8px;padding:8px;margin:6px 0";
+      const h = el("div", null, it.title || "(无标题)");
+      h.style.fontWeight = "600";
+      card.appendChild(h);
+      const meta = [it.id];
+      if (it.author && it.author.name) meta.push(it.author.name);
+      if (it.score) meta.push(it.score + " 分");
+      if (it.year) meta.push(String(it.year));
+      if (it.category) meta.push(it.category);
+      if (it.latest) meta.push("更新到 " + it.latest);
+      if (it.duration) meta.push(prettyDur(it.duration));
+      card.appendChild(el("div", "status", meta.join(" · ")));
+      if (it.desc) card.appendChild(el("div", "hint", it.desc.slice(0, 200)));
+      if (it.actors && it.actors.length) {
+        card.appendChild(el("div", "hint", "主演：" + it.actors.slice(0, 6).join(" / ")));
+      }
+      const btns = el("div", "btns");
+      const b1 = el("button", "primary", "取直链");
+      b1.addEventListener("click", () => { useTarget(it); run("links"); });
+      const b2 = el("button", null, "详情");
+      b2.addEventListener("click", () => { useTarget(it); run("detail"); });
+      btns.appendChild(b1); btns.appendChild(b2);
+      card.appendChild(btns);
+      box.appendChild(card);
+    });
+    return box;
+  }
+
   // ---------- 动作 ----------
 
   function target() {
@@ -1246,12 +1349,12 @@ function vlSignUrl(prefix, key, url, ts) {
         box.appendChild(el("h2", null, "各端点系数（消耗 = 系数 × 条数 × 你的倍率，实时值）"));
         const t = el("table");
         const tr = el("tr");
-        ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
+        ["平台", "search", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
         t.appendChild(tr);
         Object.keys(d.rates).sort().forEach((p) => {
           const r2 = el("tr");
           r2.appendChild(el("td", null, p));
-          ["info", "links", "detail", "batch_links"].forEach((k) => {
+          ["search", "info", "links", "detail", "batch_links"].forEach((k) => {
             const v = d.rates[p][k];
             const cell = el("td", "mono");
             if (v && typeof v === "object") cell.textContent = "不支持";
@@ -1265,7 +1368,7 @@ function vlSignUrl(prefix, key, url, ts) {
         const rp = el("tr");
         rp.appendChild(el("td", null, "媒体代理"));
         const pc = el("td", "mono");
-        pc.colSpan = 4;
+        pc.colSpan = 5;
         const pr = (d.proxy && d.proxy.rate) || "0.5 配额/MiB";
         pc.textContent = pr + " × 账号倍率 " + (d.multiplier === undefined ? "" : d.multiplier) +
           "（按传输体积，不乘平台系数）";
@@ -1434,6 +1537,15 @@ function vlSignUrl(prefix, key, url, ts) {
     try {
       const p = await api("/v1/platforms");
       const list = (p.body && p.body.platforms) || [];
+      const ssel = $("#searchPlatform");
+      if (ssel) {
+        ssel.textContent = "";
+        list.filter((x) => x.search).forEach((x) => {
+          const o = el("option", null, x.name);
+          o.value = x.name;
+          ssel.appendChild(o);
+        });
+      }
       const sel = $("#platform");
       list.forEach((x) => {
         const o = el("option", null, x.name + (x.batch ? "" : "（不支持批量）"));
@@ -1444,15 +1556,19 @@ function vlSignUrl(prefix, key, url, ts) {
       const box = $("#plats");
       const t = el("table");
       const tr = el("tr");
-      ["平台", "域名", "按 ID 解析", "批量", "说明"].forEach((h) => tr.appendChild(el("th", null, h)));
+      ["平台", "域名", "按 ID 解析", "搜索", "批量", "说明"].forEach((h) => tr.appendChild(el("th", null, h)));
       t.appendChild(tr);
       list.forEach((x) => {
         const r = el("tr");
         r.appendChild(el("td", null, x.name));
         r.appendChild(el("td", "mono", (x.hosts || []).join(", ")));
         r.appendChild(el("td", null, x.supports_id ? "支持" : "—"));
+        r.appendChild(el("td", null, x.search ? "支持" : "不支持"));
         r.appendChild(el("td", null, x.batch ? "支持" : "不支持"));
-        r.appendChild(el("td", null, x.batch ? "" : (x.batch_reason || "")));
+        const why = [];
+        if (!x.search && x.search_reason) why.push("搜索：" + x.search_reason);
+        if (!x.batch && x.batch_reason) why.push("批量：" + x.batch_reason);
+        r.appendChild(el("td", null, why.join(" ")));
         t.appendChild(r);
       });
       box.appendChild(t);
@@ -1491,6 +1607,8 @@ function vlSignUrl(prefix, key, url, ts) {
     applyKey("", { save: true });
   });
   $("#usageRefresh").addEventListener("click", loadUsage);
+  $("#searchBtn").addEventListener("click", runSearch);
+  $("#searchKeyword").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
 
   // 签到 / 强制签到：都打同一个 POST /v1/checkin。
   //

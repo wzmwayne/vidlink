@@ -34,6 +34,16 @@ type BatchExtractor interface {
 	ParseBatch(ctx context.Context, ids []string) ([]*Video, []error)
 }
 
+// SearchExtractor 是可选能力：按关键词搜索内容。
+//
+// 只有"搜索结果里能拿到可用 ID、且该 ID 能被本提取器解析"的平台才实现它——
+// 否则用户搜到了也拿不到直链，等于一个死接口。
+//
+// 返回的每条结果只带元信息与 ID（见 SearchResult 的说明），**不含直链**。
+type SearchExtractor interface {
+	Search(ctx context.Context, q SearchQuery) (*SearchResult, error)
+}
+
 // URL 是归一化后的输入地址。
 //
 // 之所以不直接用 *url.URL：解析前需要先"展开短链 + 提取文案中的链接"，

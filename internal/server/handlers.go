@@ -311,34 +311,51 @@ func (s *Server) writeQuotaError(w http.ResponseWriter, err error) {
 // 免校验模式下直接返回：不扣配额，也不回写 X-Quota-* 头。
 // 头里写 0 会让人以为"还有配额这回事，只是这次没用掉"，干脆不写。
 func (s *Server) consumeQuota(w http.ResponseWriter, r *http.Request, v *core.Video, ep quota.Endpoint, items int) {
+	s.consumeQuotaFor(w, r, v.Platform, ep, items)
+}
+
+// consumeQuotaFor 按"平台 + 端點 + 条数"结算，返回实际扣减的 units。
+//
+// 第二个返回值 ok 表示"确实发生了一次扣减"：免校验模式与缺少账号上下文时
+// 返回 false——调用方据此决定要不要在响应里写 cost 字段
+// （写 0 会让人以为"有配额这回事、只是这次没花钱"）。
+func (s *Server) consumeQuotaFor(w http.ResponseWriter, r *http.Request,
+	platform core.Platform, ep quota.Endpoint, items int) (float64, bool) {
 	if s.cfg.IsEase() {
-		return
+		return 0, false
+	}
+	// 按条计价的端点（search/batch）在"一条都没成功"时不结算：
+	// quota.Consume 会把 items<1 夹成 1，这里必须先挡住，
+	// 否则"搜不到"也要扣一份钱。
+	if items <= 0 {
+		return 0, false
 	}
 	acct, ok := accountFrom(r.Context())
 	if !ok {
-		return
+		return 0, false
 	}
-	units, err := s.quotaTable.Consume(ep, v.Platform, items, acct.Multiplier)
+	units, err := s.quotaTable.Consume(ep, platform, items, acct.Multiplier)
 	if err != nil {
 		s.log.Error("配额计量失败：无法计算系数乘积", "request_id", requestID(r.Context()),
-			"endpoint", string(ep), "platform", string(v.Platform), "err", err)
-		return
+			"endpoint", string(ep), "platform", string(platform), "err", err)
+		return 0, false
 	}
 	// 流水里的说明要能让人看懂"这一笔花在哪"：端点 + 平台 + 条数
-	detail := fmt.Sprintf("%s/%s ×%d", ep, v.Platform, items)
+	detail := fmt.Sprintf("%s/%s ×%d", ep, platform, items)
 
 	if acct.PublicAccount {
 		s.consumePublicQuota(w, r, acct, units, detail)
-		return
+		return units, true
 	}
 
 	rc, err := s.accounts.Consume(acct.Key, units, detail)
 	if err != nil {
 		s.log.Error("配额计量失败：扣减未成功", "request_id", requestID(r.Context()),
 			"key", acct.Masked(), "units", units, "err", err)
-		return
+		return units, false
 	}
 	setQuotaHeaders(w, rc.Units, rc.Quota)
+	return rc.Units, true
 }
 
 func setQuotaHeaders(w http.ResponseWriter, cost, balance float64) {
@@ -394,7 +411,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.consumeQuota(w, r, v, quota.EndpointInfo, 1)
-	writeJSON(w, http.StatusOK, tier.NewInfo(v))
+	writeJSON(w, http.StatusOK, tier.NewInfoFor(v, r.URL.Query().Get("quality")))
 }
 
 // handleLinks 是 links 档：只给直链，不给任何内容元信息。
@@ -433,7 +450,7 @@ func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.consumeQuota(w, r, v, quota.EndpointDetail, 1)
-	writeJSON(w, http.StatusOK, tier.NewDetail(v))
+	writeJSON(w, http.StatusOK, tier.NewDetailFor(v, r.URL.Query().Get("quality")))
 }
 
 // --- 批量 ---
@@ -657,10 +674,13 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 					"（所有账号同一费率）", s.proxyRate()),
 			},
 			"limits": map[string]any{
-				"per_key_concurrency": s.gate.Options().PerKey,
-				"global_concurrency":  s.gate.Options().Global,
-				"batch_min":           s.cfg.BatchMin,
-				"batch_max":           s.cfg.BatchMax,
+				"per_key_concurrency":  s.gate.Options().PerKey,
+				"global_concurrency":   s.gate.Options().Global,
+				"batch_min":            s.cfg.BatchMin,
+				"batch_max":            s.cfg.BatchMax,
+				"search_limit_max":     searchMaxLimit,
+				"search_page_max":      searchMaxPage,
+				"searchable_platforms": s.svc.SearchablePlatforms(),
 			},
 			"note": "公共账号：Key 公开，额度按「每 IP 每日」计算，不使用账本余额；" +
 				"不提供账单，需要账单请申请独立 Key",
@@ -687,10 +707,13 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 				"（所有账号同一费率）", s.proxyRate()),
 		},
 		"limits": map[string]any{
-			"per_key_concurrency": s.gate.Options().PerKey,
-			"global_concurrency":  s.gate.Options().Global,
-			"batch_min":           s.cfg.BatchMin,
-			"batch_max":           s.cfg.BatchMax,
+			"per_key_concurrency":  s.gate.Options().PerKey,
+			"global_concurrency":   s.gate.Options().Global,
+			"batch_min":            s.cfg.BatchMin,
+			"batch_max":            s.cfg.BatchMax,
+			"search_limit_max":     searchMaxLimit,
+			"search_page_max":      searchMaxPage,
+			"searchable_platforms": s.svc.SearchablePlatforms(),
 		},
 	}
 	// 每日签到：**始终**给出这一段，用 enabled 表明这个账号能不能签。
@@ -731,16 +754,18 @@ const ratesNote = "系数由部署者配置，这里是当前部署的生效值�
 // allRates 返回四个平台各端点的完整系数。
 func (s *Server) allRates() map[string]any {
 	out := map[string]any{}
-	for _, p := range []core.Platform{
-		core.PlatformBilibili, core.PlatformDouyin,
-		core.PlatformKuaishou, core.PlatformXiaohongshu,
-	} {
+	for _, p := range quota.AllPlatforms {
 		m := map[string]any{}
 		for k, v := range s.quotaTable.Coefficients(p) {
 			m[string(k)] = v
 		}
 		if reason := quota.BatchUnsupportedReason(p); reason != "" {
 			m[string(quota.EndpointBatchLinks)] = map[string]any{
+				"unsupported": true, "reason": reason,
+			}
+		}
+		if reason := quota.SearchUnsupportedReason(p); reason != "" {
+			m[string(quota.EndpointSearch)] = map[string]any{
 				"unsupported": true, "reason": reason,
 			}
 		}
@@ -760,12 +785,14 @@ func (s *Server) handlePlatforms(w http.ResponseWriter, r *http.Request) {
 	for _, p := range pf {
 		plat := core.Platform(p.Name)
 		m := map[string]any{
-			"name":         p.Name,
-			"hosts":        p.Hosts,
-			"supports_id":  p.ByID,
-			"has_cookie":   p.HasAuth,
-			"batch":        quota.BatchUnsupportedReason(plat) == "",
-			"batch_reason": quota.BatchUnsupportedReason(plat),
+			"name":          p.Name,
+			"hosts":         p.Hosts,
+			"supports_id":   p.ByID,
+			"has_cookie":    p.HasAuth,
+			"batch":         quota.BatchUnsupportedReason(plat) == "",
+			"batch_reason":  quota.BatchUnsupportedReason(plat),
+			"search":        p.Search,
+			"search_reason": quota.SearchUnsupportedReason(plat),
 		}
 		if !ease {
 			m["rates"] = s.quotaTable.Coefficients(plat)
@@ -776,8 +803,12 @@ func (s *Server) handlePlatforms(w http.ResponseWriter, r *http.Request) {
 		"platforms": out,
 		"mode":      s.modeName(),
 		"limits": map[string]any{
-			"batch_min": s.cfg.BatchMin,
-			"batch_max": s.cfg.BatchMax,
+			"batch_min":            s.cfg.BatchMin,
+			"batch_max":            s.cfg.BatchMax,
+			"search_default_limit": searchDefaultLimit,
+			"search_limit_max":     searchMaxLimit,
+			"search_page_max":      searchMaxPage,
+			"searchable_platforms": s.svc.SearchablePlatforms(),
 		},
 	}
 	if !ease {

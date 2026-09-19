@@ -12,6 +12,7 @@ import (
 	"vidlink/internal/deps"
 	"vidlink/internal/extract/bilibili"
 	"vidlink/internal/extract/douyin"
+	"vidlink/internal/extract/jianpian"
 	"vidlink/internal/extract/kuaishou"
 	"vidlink/internal/extract/xiaohongshu"
 	"vidlink/internal/urlx"
@@ -31,6 +32,7 @@ func NewRegistry(d *deps.Deps) *Registry {
 		bilibili.New(d),
 		kuaishou.New(d),
 		xiaohongshu.New(d),
+		jianpian.New(d),
 	)
 }
 

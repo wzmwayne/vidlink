@@ -91,6 +91,56 @@ type Quality struct {
 	Codecs    []string `json:"codecs,omitempty"`
 }
 
+// Line 是剧集型内容的一条线路。
+//
+// 荐片把线路当作"清晰度"维度暴露（不同来源、质量与可用性差异极大），
+// 所以线路名既能出现在 qualities 之外的 series.lines 里，也能用于 quality 选择。
+type Line struct {
+	Name  string `json:"name"`
+	Key   string `json:"key,omitempty"`
+	Count int    `json:"count,omitempty"`
+	VIP   bool   `json:"vip,omitempty"`
+}
+
+// Episode 是剧集型内容的一集。
+//
+// info 档只给 ID/名称/可直接解析的 parse_id（不含 URL）；detail 档才带上播放地址。
+type Episode struct {
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Line     string  `json:"line,omitempty"`
+	LineIdx  int     `json:"line_index,omitempty"`
+	Index    int     `json:"index,omitempty"`
+	URL      string  `json:"url,omitempty"`
+	FTP      string  `json:"ftp,omitempty"`
+	Duration float64 `json:"duration,omitempty"`
+	VIP      bool    `json:"vip,omitempty"`
+	// ParseID 是可以直接拿去 /v1/links、/v1/detail 的 ID（剧集型平台如 `<影片ID>_<单集ID>`）。
+	ParseID string `json:"parse_id,omitempty"`
+}
+
+// Series 是剧集型内容的线路/选集结构（荐片专有，其它平台为空）。
+type Series struct {
+	Lines []Line `json:"lines"`
+	// Episodes 默认是**默认（VIP）线路**的全部集；用 quality 指定线路时是那条线路的集；
+	// 传入 `<影片ID>_<单集ID>` 时只有这一集（可能横跨多条线路）。
+	Episodes []Episode `json:"episodes,omitempty"`
+	Latest   string    `json:"latest,omitempty"`
+	Finished bool      `json:"finished,omitempty"`
+	// Total 是所选线路的集数（截断前），EpisodesCount 是本次返回的条数。
+	Total         int  `json:"total,omitempty"`
+	EpisodesCount int  `json:"episodes_count,omitempty"`
+	Truncated     bool `json:"truncated,omitempty"`
+	// InLines 列出本次返回的这些集存在于哪些线路里。
+	//
+	// 传入 `<影片ID>_<单集ID>` 时它就是"这个单集属于哪条/哪几条线路"的答案：
+	// 实测多条线路可能共用同一个单集 ID，所以答案可能不止一条。
+	InLines []string `json:"in_lines,omitempty"`
+}
+
+// EpisodeListLimit 是单次返回的选集条数上限（长剧/动漫可能上千集）。
+const EpisodeListLimit = 2000
+
 // Info 是 info 档的响应。
 type Info struct {
 	Platform  string    `json:"platform"`
@@ -103,6 +153,7 @@ type Info struct {
 	SourceURL string    `json:"source_url,omitempty"`
 	Qualities []Quality `json:"qualities,omitempty"`
 	Images    []Image   `json:"images,omitempty"`
+	Series    *Series   `json:"series,omitempty"`
 	Warning   string    `json:"warning,omitempty"`
 	Cached    bool      `json:"cached,omitempty"`
 }
@@ -118,6 +169,13 @@ type Links struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 	AudioURL   string            `json:"audio_url,omitempty"`
 	NeedsMux   bool              `json:"needs_mux,omitempty"`
+	// HLS 表示 url 是 m3u8 播放列表（HLS），不是单个媒体文件。
+	//
+	// 必须显式告知：客户端拿到 url 要判断"能不能直接下/能不能直接喂 <video>"。
+	// 荐片的播放列表还可能是 AES-128 加密的，密钥在播放列表内、由客户端现场取。
+	HLS bool `json:"hls,omitempty"`
+	// Note 是人能读的补充说明（荐片用来说明线路/加密/下载方式）。
+	Note string `json:"note,omitempty"`
 }
 
 // Detail 是 detail 档的响应：info 的全部内容 + 全部档位的直链。
@@ -136,7 +194,10 @@ type Detail struct {
 // --- 构造 ---
 
 // NewInfo 把领域模型投影成 info 档。
-func NewInfo(v *core.Video) Info {
+func NewInfo(v *core.Video) Info { return NewInfoFor(v, "") }
+
+// NewInfoFor 在 info 档上指定"要列哪条线路的选集"（空 = 默认/VIP 线路）。
+func NewInfoFor(v *core.Video, line string) Info {
 	if v == nil {
 		return Info{}
 	}
@@ -151,6 +212,11 @@ func NewInfo(v *core.Video) Info {
 		Cached:    v.Cached,
 		Author:    Author{ID: v.Author.ID, Name: v.Author.Name, Avatar: v.Author.Avatar},
 		Qualities: Qualities(v),
+		Series:    newSeries(v, false, line),
+	}
+	if out.Series != nil && out.Series.Truncated {
+		out.Warning = appendWarning(out.Warning,
+			fmt.Sprintf("该线路集数超过 %d 条，已截断", EpisodeListLimit))
 	}
 	if v.Stats != nil {
 		out.Stats = &Stats{
@@ -167,17 +233,164 @@ func NewInfo(v *core.Video) Info {
 	return out
 }
 
+// newSeries 把剧集型结构投影出来。
+//
+//	withURLs=false  info 档：只给 ID/集名/parse_id，不给播放地址
+//	withURLs=true   detail 档：带上播放地址（m3u8）与 ftp 直链
+//	line            要列哪条线路的选集；空 = 默认（VIP）线路
+//
+// 两种裁剪规则：
+//
+//	v.EpisodeOnly == false：Episodes 里是"全部线路 × 全部集"，按 line 筛；
+//	v.EpisodeOnly == true ：Episodes 里已被提取器收敛成"指定的那一集"（可能横跨
+//	  多条线路），此时**不能**再按线路筛（否则那条只存在于非默认线路的集会消失），
+//	  只有在显式指定 line 且能筛出结果时才筛。
+func newSeries(v *core.Video, withURLs bool, line string) *Series {
+	if v == nil || (len(v.Lines) == 0 && len(v.Episodes) == 0) {
+		return nil
+	}
+	out := &Series{Latest: v.Latest, Finished: v.Finished}
+	for _, ln := range v.Lines {
+		out.Lines = append(out.Lines, Line{Name: ln.Name, Key: ln.Key, Count: ln.Count, VIP: ln.VIP})
+	}
+	if out.Lines == nil {
+		out.Lines = []Line{}
+	}
+
+	eps := v.Episodes
+	want := pickLine(v, line)
+	if want != "" {
+		if filtered := filterByLine(eps, want); len(filtered) > 0 {
+			eps = filtered
+		} else if !v.EpisodeOnly {
+			// 指定了一条不存在的线路：退回默认线路，而不是返回空列表。
+			// info/detail 是只读接口，"选择失败"应该由 links 的 Select 报错，
+			// 在这里报错只会让"看线路列表"这种无害请求也失败。
+			eps = filterByLine(eps, firstLine(v))
+		}
+	} else if !v.EpisodeOnly {
+		eps = filterByLine(eps, "")
+	}
+	// Total 是"这条线路一共有多少集"（截断前）；拿不到线路信息时退化为本次条数。
+	out.Total = len(eps)
+	if n := lineCount(v, want); n > 0 {
+		out.Total = n
+	}
+
+	if len(eps) > EpisodeListLimit {
+		eps = eps[:EpisodeListLimit]
+		out.Truncated = true
+	}
+	seen := map[string]bool{}
+	for _, ep := range eps {
+		item := Episode{
+			ID: ep.ID, Name: ep.Name, Line: ep.Line,
+			LineIdx: ep.LineIdx, Index: ep.Index, VIP: ep.VIP,
+			Duration: ep.Duration, ParseID: ep.ParseID,
+		}
+		if withURLs {
+			item.URL = ep.URL
+			item.FTP = ep.FTP
+		}
+		out.Episodes = append(out.Episodes, item)
+		if ep.Line != "" && !seen[ep.Line] {
+			seen[ep.Line] = true
+			out.InLines = append(out.InLines, ep.Line)
+		}
+	}
+	out.EpisodesCount = len(out.Episodes)
+	return out
+}
+
+// pickLine 决定要列哪条线路：显式指定优先，否则默认（VIP 优先的）第一条。
+func pickLine(v *core.Video, line string) string {
+	if line != "" {
+		// qn:<序号> 与线路名两种写法都支持，复用 Select 的匹配口径。
+		if rest, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(line)), "qn:"); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil {
+				for _, ln := range v.Lines {
+					if ln.Name != "" && lineIndex(v, ln.Name) == n {
+						return ln.Name
+					}
+				}
+			}
+			return line
+		}
+		for _, ln := range v.Lines {
+			if strings.EqualFold(ln.Name, strings.TrimSpace(line)) {
+				return ln.Name
+			}
+		}
+		return line
+	}
+	if len(v.Lines) > 0 {
+		return v.Lines[0].Name
+	}
+	return ""
+}
+
+// firstLine 返回第一条线路（VIP 优先，由提取器保证顺序）的名字。
+func firstLine(v *core.Video) string {
+	if len(v.Lines) > 0 {
+		return v.Lines[0].Name
+	}
+	return ""
+}
+
+// lineIndex 返回线路名的 1 基序号。
+func lineIndex(v *core.Video, name string) int {
+	for i, ln := range v.Lines {
+		if strings.EqualFold(ln.Name, name) {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// lineCount 返回某条线路声明的集数。
+func lineCount(v *core.Video, name string) int {
+	for _, ln := range v.Lines {
+		if strings.EqualFold(ln.Name, name) {
+			return ln.Count
+		}
+	}
+	return 0
+}
+
+// filterByLine 按线路名筛选集；want 为空时按第一条线路筛。
+func filterByLine(eps []core.Episode, want string) []core.Episode {
+	out := make([]core.Episode, 0, len(eps))
+	for _, ep := range eps {
+		if want == "" || strings.EqualFold(ep.Line, want) {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// appendWarning 拼接警告文案（保持先出现的在前，避免覆盖）。
+func appendWarning(existing, add string) string {
+	if existing == "" {
+		return add
+	}
+	return existing + "；" + add
+}
+
 // NewDetail 把领域模型投影成 detail 档。
-func NewDetail(v *core.Video) Detail {
+func NewDetail(v *core.Video) Detail { return NewDetailFor(v, "") }
+
+// NewDetailFor 在 detail 档上指定要展开哪条线路的选集（空 = 默认/VIP 线路）。
+func NewDetailFor(v *core.Video, line string) Detail {
 	if v == nil {
 		return Detail{}
 	}
 	out := Detail{
-		Info:     NewInfo(v),
+		Info:     NewInfoFor(v, line),
 		Videos:   NewStreams(v.Videos),
 		Audios:   NewStreams(v.Audios),
 		NeedsMux: v.NeedsMux,
 	}
+	out.Series = newSeries(v, true, line)
 	if v.Music != nil {
 		s := NewStream(*v.Music)
 		out.Music = &s
@@ -229,7 +442,33 @@ func NewLinks(v *core.Video, want string) (Links, error) {
 	if a := v.BestAudio(); a != nil {
 		out.AudioURL = a.URL
 	}
+	if strings.Contains(s.MimeType, "mpegurl") {
+		out.HLS = true
+	}
+	// 剧集型内容（荐片）：同一条流的"备份"就是同集的其他线路。
+	// 只有 Lines 非空时才这么算——B 站的多档位是不同清晰度，不是容灾备份。
+	if len(v.Lines) > 0 {
+		out.BackupURLs = lineBackups(v.Videos, s.URL, 5)
+		out.Note = "HLS 播放列表（m3u8）：可交给 ffmpeg/VLC/mpv；浏览器需要 HLS 播放器。" +
+			"线路之间是替代关系（可用 quality=<线路名> 选择），个别线路可能失效，" +
+			"失败时请换 backup_urls 里的线路。"
+	}
 	return out, nil
+}
+
+// lineBackups 返回同一集在其它线路上的播放地址（最多 n 条）。
+func lineBackups(streams []core.Stream, chosen string, n int) []string {
+	var out []string
+	for i := range streams {
+		if streams[i].URL == "" || streams[i].URL == chosen {
+			continue
+		}
+		out = append(out, streams[i].URL)
+		if len(out) >= n {
+			break
+		}
+	}
+	return out
 }
 
 // Select 按 want 从流列表里挑一条。
@@ -257,11 +496,21 @@ func Select(streams []core.Stream, want string) (*core.Stream, error) {
 		}
 	}
 
+	// 标签匹配：荐片把"线路"当作清晰度维度（不同来源，质量差异极大），
+	// 所以 quality 也要能按线路名选。放在数字解析之前，避免
+	// "VIP线路" 被当成"无法识别的清晰度参数"直接拒掉。
+	for i := range streams {
+		if streams[i].Quality != "" && strings.EqualFold(strings.TrimSpace(streams[i].Quality), want) {
+			return &streams[i], nil
+		}
+	}
+
 	// 纯数字或带 P 后缀 → 按高度。注意：按高度匹配时可能有多条（不同编码），
 	// 已排序的列表保证第一条是兼容性最好的那个。
 	h, err := strconv.Atoi(strings.TrimRight(strings.ToUpper(want), "P"))
 	if err != nil {
-		return nil, fmt.Errorf("无法识别的清晰度参数 %q：可用形如 1080、720P 或 qn:80", want)
+		// 列出现有档位/线路，比一句"参数无法识别"有用得多。
+		return nil, notFoundErr(want, streams)
 	}
 	for i := range streams {
 		if streams[i].Height == h {
@@ -283,6 +532,18 @@ func notFoundErr(want string, streams []core.Stream) error {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(opts)))
 	if len(opts) == 0 {
+		// 没有像素高度（荐片的线路就没有）：列出线路名，别让用户猜。
+		var labels []string
+		seenLabel := map[string]bool{}
+		for _, s := range streams {
+			if s.Quality != "" && !seenLabel[s.Quality] {
+				seenLabel[s.Quality] = true
+				labels = append(labels, s.Quality)
+			}
+		}
+		if len(labels) > 0 {
+			return fmt.Errorf("没有 %s 这一档；可用线路：%s", want, strings.Join(labels, " / "))
+		}
 		return fmt.Errorf("没有 %s 这一档；该内容没有可用的清晰度列表", want)
 	}
 	return fmt.Errorf("没有 %s 这一档；可用档位：%s", want, strings.Join(opts, ", "))

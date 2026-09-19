@@ -224,7 +224,9 @@ func (s *Server) routes() []routeSpec {
 		{method: http.MethodGet, path: "/healthz", public: true, handler: s.handleHealthz},
 		{method: http.MethodGet, path: "/readyz", public: true, handler: s.handleReadyz},
 
-		// ---- 配额端点：四个 ----
+		// ---- 配额端点：五个 ----
+		{method: http.MethodGet, path: "/v1/search", handler: s.handleSearch,
+			endpoint: quota.EndpointSearch},
 		{method: http.MethodGet, path: "/v1/info", handler: s.handleInfo,
 			endpoint: quota.EndpointInfo},
 		{method: http.MethodGet, path: "/v1/links", handler: s.handleLinks,
@@ -720,6 +722,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `vidlink %s — 多平台视频解析 API（免校验模式）
 
 解析端点（无需 API Key，不计量配额）
+  GET  /v1/search?platform=&keyword=  搜索（前 20 条，可 page/limit）
   GET  /v1/info?url=             元信息 + 档位列表，无直链
   GET  /v1/links?url=&quality=   仅直链
   GET  /v1/detail?url=           元信息 + 全部档位直链
@@ -738,6 +741,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `vidlink %s — 多平台视频解析 API（计量单位：%s）
 
 计量端点（消耗配额，需 API Key）
+  GET  /v1/search?platform=&keyword=  0.25/条（默认 20 条，可 page/limit）
+                                    搜索：元信息 + id，直链要再调 detail/links
   GET  /v1/info?url=             0.5（抖音 0.75）    元信息 + 档位列表，无直链
   GET  /v1/links?url=&quality=   1.0（抖音 1.1）     仅直链
   GET  /v1/detail?url=           1.2（抖音 1.5）     元信息 + 全部档位直链

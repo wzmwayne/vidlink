@@ -367,10 +367,11 @@ func Load() (*Config, error) {
 	}
 
 	// Cookie 注入。命名约定：VIDLINK_COOKIE_<PLATFORM>
-	for _, p := range []core.Platform{
-		core.PlatformDouyin, core.PlatformBilibili,
-		core.PlatformKuaishou, core.PlatformXiaohongshu,
-	} {
+	//
+	// 平台清单从 quota.AllPlatforms 取，而不是在这里再抄一份：
+	// 抄一份的代价是"加了平台、忘了加 Cookie 注入"，而且症状很隐蔽
+	// （配置明明写了，服务却不认）。
+	for _, p := range quota.AllPlatforms {
 		key := "VIDLINK_COOKIE_" + strings.ToUpper(string(p))
 		if v := env(key, ""); v != "" {
 			c.Cookies[p] = v

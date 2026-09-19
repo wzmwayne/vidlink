@@ -1050,12 +1050,12 @@ function vlSignUrl(prefix, key, url, ts) {
       box.appendChild(el("h3", null, "当前生效值（消耗 = 系数 × 条数 × 账号倍率）"));
       const t = el("table");
       const tr = el("tr");
-      ["平台", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
+      ["平台", "search", "info", "links", "detail", "batch_links"].forEach((h) => tr.appendChild(el("th", null, h)));
       t.appendChild(tr);
       Object.keys(d.platforms).sort().forEach((p) => {
         const row = el("tr");
         row.appendChild(el("td", null, p));
-        ["info", "links", "detail", "batch_links"].forEach((k) => {
+        ["search", "info", "links", "detail", "batch_links"].forEach((k) => {
           const v = d.platforms[p][k];
           const cell = el("td", "mono");
           if (v && typeof v === "object") cell.textContent = "不支持";
@@ -1071,15 +1071,16 @@ function vlSignUrl(prefix, key, url, ts) {
   // ---------- 计费倍率：可编辑网格 ----------
 
   const ENDPOINT_DOC = [
+    ["search", "按关键词搜索，按条计量（仅部分平台支持）"],
     ["info", "只给元信息与档位列表，不含直链"],
     ["links", "只给直链（核心产出）"],
     ["detail", "元信息 + 全部档位直链"],
     ["batch_links", "批量直链，按条计量"],
   ];
-  const PLATFORMS = ["bilibili", "douyin", "kuaishou", "xiaohongshu", "default"];
+  const PLATFORMS = ["bilibili", "douyin", "kuaishou", "xiaohongshu", "jianpian", "default"];
   const PLATFORM_CN = {
     bilibili: "哔哩哔哩", douyin: "抖音", kuaishou: "快手",
-    xiaohongshu: "小红书", default: "通用（未单列的平台）",
+    xiaohongshu: "小红书", jianpian: "荐片", default: "通用（未单列的平台）",
   };
 
   let rateSnapshot = null;       // 最近一次载入的生效值，用于算"改过哪些格"

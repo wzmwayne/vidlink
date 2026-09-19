@@ -34,6 +34,12 @@ type Endpoints struct {
 	PlayURL     string
 	PlayerV2WBI string
 	Nav         string
+	// Search 是搜索接口的**非签名**通道；SearchWBI 是同功能的 WBI 通道。
+	//
+	// 两条都要：实测匿名走非签名通道就能拿到结果（省一次 nav 请求），
+	// 但历史上 B 站收紧过搜索接口，届时自动降级/升级到 WBI 通道即可。
+	Search    string
+	SearchWBI string
 }
 
 // DefaultEndpoints 返回官方地址。
@@ -44,6 +50,8 @@ func DefaultEndpoints() Endpoints {
 		PlayURL:     "https://api.bilibili.com/x/player/playurl",
 		PlayerV2WBI: "https://api.bilibili.com/x/player/wbi/v2",
 		Nav:         "https://api.bilibili.com/x/web-interface/nav",
+		Search:      "https://api.bilibili.com/x/web-interface/search/type",
+		SearchWBI:   "https://api.bilibili.com/x/web-interface/wbi/search/type",
 	}
 }
 
@@ -74,6 +82,16 @@ func New(d *deps.Deps) *Extractor {
 func (e *Extractor) WithMode(m Mode) *Extractor {
 	cp := *e
 	cp.mode = m
+	return &cp
+}
+
+// WithEndpoints 返回替换了接口地址的副本。
+//
+// 存在的意义有两个：把测试指向 httptest 上游（离线可测），
+// 以及在被镜像/反代场景下不改代码就换地址。
+func (e *Extractor) WithEndpoints(ep Endpoints) *Extractor {
+	cp := *e
+	cp.ep = ep
 	return &cp
 }
 
