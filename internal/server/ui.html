@@ -334,8 +334,8 @@
       ① <b>DASH 混流</b>：流式下载视频轨与音频轨到浏览器存储（分片写盘，不占内存）→
       片段级重排合并为单个 MP4，不重新编码（适用于返回 <code>audio_url</code> 的平台，如 B 站）。<br>
       ② <b>HLS(TS) 合并</b>：分片本身是一段段 .ts，按顺序下载 → 需要时用 AES-128 现场解密 →
-      <b>顺序拼接</b>为单个 <code>.ts</code> 文件（不转封装、不重编码）。产物用 VLC / mpv / ffmpeg 打开，
-      浏览器 <code>&lt;video&gt;</code> 不能直接播（TS 不是浏览器容器）。
+      <b>顺序拼接</b>为单个 <code>.ts</code> 文件（不转封装、不重编码）。现代浏览器一般能直接在
+      页面里预览播放（TS 走 <code>video/mp2t</code> 解复用）；确实播不了时再用 VLC / mpv / ffmpeg 打开。
       <span id="muxCostNote"></span>
     </div>
     <div class="row">
@@ -347,6 +347,10 @@
         <label for="muxAq">音频清晰度</label>
         <select id="muxAq"><option value="">先取一次完整信息</option></select>
       </div>
+      <div class="col narrow">
+        <label for="muxConc">分片并发（线程）</label>
+        <input type="number" id="muxConc" min="1" max="32" step="1" value="8">
+      </div>
       <div class="col">
         <label>下载通道</label>
         <label class="chk" for="muxProxy">
@@ -354,6 +358,8 @@
         </label>
         <div class="hint" style="margin:4px 0 0">
           HLS(TS) 分片<b>始终直连 CDN</b>：分片 CDN 不在服务端代理白名单里，走代理必被拒。
+          「分片并发」只作用于 HLS(TS) 合并，默认 <b>8</b> 路、可手动调（1~32）：
+          单批同时下载的分片数，调高更占内存与带宽。
         </div>
       </div>
     </div>
@@ -366,7 +372,13 @@
     <div class="btns">
       <button class="primary" id="muxStart">下载并混流</button>
       <button id="muxClean">清理浏览器存储</button>
+      <button id="muxPersist" title="申请持久化存储：避免大文件写到一半被浏览器回收；配额上限仍由浏览器决定">申请持久化存储</button>
       <span class="status" id="muxQuota" style="align-self:center"></span>
+    </div>
+    <div class="hint">
+      合并产物写在浏览器存储（OPFS）里：首次点「下载并混流」或「申请持久化存储」会申请持久化
+      （Firefox 会弹一次权限），避免大文件被浏览器回收。<b>配额上限由浏览器决定</b>（Firefox 每源约
+      10 GiB、Chrome 按磁盘比例），本页不设任何上限、也不做 10G 之类的判断，显示的上限仅作参考。
     </div>
     <div id="muxProgWrap" class="hidden" style="margin-top:10px">
       <div class="status" id="muxPhase">准备中…</div>
@@ -920,7 +932,7 @@ function vlSignUrl(prefix, key, url, ts) {
     if (d.hls) {
       const w = el("div", "warnbox", "这是 HLS(m3u8) 播放列表：可以交给播放器/ffmpeg（ffmpeg -i \"直链\" -c copy out.mp4），" +
         "也可以点「下载并合并（TS）」由浏览器把分片下载、（需要时）解密并顺序拼接成一个 .ts 文件。" +
-        "TS 不是浏览器容器，<video> 不能直接播，保存后用 VLC / mpv 打开。");
+        "合出来的 .ts 一般能直接在页面里预览；播不了就用 VLC / mpv / ffmpeg 打开。");
       w.style.border = "1px solid var(--line)"; w.style.borderRadius = "8px";
       w.style.padding = "8px"; w.style.marginTop = "10px";
       box.appendChild(w);
@@ -2494,6 +2506,21 @@ function vlSignUrl(prefix, key, url, ts) {
     updateMuxNote();
   }
 
+  // HLS 分片并发：默认 8 路，界面可调（1~32）。
+  //
+  // 分片大多几百 KB ~ 几 MB，并发数只决定"同时在内存里的分片数"和吞吐。
+  // 调太高会同时压内存、带宽和 CDN（同一条线路的节点通常也不欢迎几十路并发），
+  // 所以夹在 [1,32]：非法输入退回默认，超范围夹到边界。
+  const CONC_DEFAULT = 8, CONC_MIN = 1, CONC_MAX = 32;
+  function hlsConc() {
+    const node = $("#muxConc");
+    const raw = node ? String(node.value).trim() : "";
+    if (raw === "") return CONC_DEFAULT;
+    const n = Math.floor(Number(raw));
+    if (!Number.isFinite(n)) return CONC_DEFAULT;
+    return Math.min(CONC_MAX, Math.max(CONC_MIN, n));
+  }
+
   // mergeHLS 是分片合并主流程：取列表 → （可选）取密钥 → 有界并发下载 →
   // 顺序解密拼接 → 交给「保存到本地」。
   async function mergeHLS(src) {
@@ -2534,9 +2561,9 @@ function vlSignUrl(prefix, key, url, ts) {
         bytes += init.byteLength;
       }
       const total = pl.segs.length;
-      const CONC = 4;   // 有界并发：单批最多 4 个分片在内存里，约几 MB
+      const CONC = hlsConc();   // 有界并发：单批最多 CONC 个分片在内存里（默认 8，界面可调）
       let done = 0;
-      phase("③ 下载分片并顺序合并…" + (aesKey ? "（AES-128 解密）" : "（明文，无需解密）"));
+      phase("③ 下载分片并顺序合并（" + CONC + " 路并发）…" + (aesKey ? "（AES-128 解密）" : "（明文，无需解密）"));
       for (let i = 0; i < total; i += CONC) {
         const batch = pl.segs.slice(i, i + CONC);
         const bufs = await Promise.all(batch.map((sg) => fetchBytes(sg.url, sg.range)));
@@ -2558,15 +2585,19 @@ function vlSignUrl(prefix, key, url, ts) {
       bar(1);
       detail("共 " + total + " 个分片 · " + prettySize(file.size) +
         (aesKey ? " · 已解密" : "") + " · 直连 CDN，未消耗配额");
-      const blobURL = URL.createObjectURL(file);
+      const blobURL = URL.createObjectURL(new Blob([file], { type: "video/mp2t" }));
       lastURL = blobURL;
-      // TS 不是浏览器容器：隐藏播放器，明确告诉用户怎么打开。
-      $("#muxVideo").classList.add("hidden");
-      $("#muxVideo").removeAttribute("src");
+      // 现代浏览器（Chromium / Firefox / Safari）基本都能直接播 MPEG-TS，
+      // 所以照样交给 <video> 预览。显式标成 video/mp2t 是必要的：OPFS 拿到的
+      // File 没有 MIME，按 application/octet-stream 有些浏览器会拒绝解复用
+      // （数据一个字节都没动，只是告诉它"这是 TS"）。
+      // 真播不了会触发下面 #muxVideo 的 error 回调，那里再提示用本地播放器。
       const w = $("#muxNoPreview");
-      w.classList.remove("hidden");
-      w.textContent = "分片已按顺序合并为单个 MPEG-TS 文件（未转封装、未重编码）：浏览器 <video> 不能直接播 TS，" +
-        "点『保存到本地』后用 VLC / mpv / PotPlayer 打开；要 MP4 就执行 ffmpeg -i 输入.ts -c copy 输出.mp4。";
+      w.classList.add("hidden");
+      w.textContent = "";
+      const v = $("#muxVideo");
+      v.classList.remove("hidden");
+      v.src = blobURL;
       const a = $("#muxSave");
       a.href = blobURL;
       a.download = name;
@@ -2603,12 +2634,40 @@ function vlSignUrl(prefix, key, url, ts) {
   function bar(ratio) { $("#muxBar").style.width = Math.max(0, Math.min(1, ratio)) * 100 + "%"; }
   function detail(text) { $("#muxDetail").textContent = text; }
 
+  // ensurePersist 申请"持久化存储"。
+  //
+  // 为什么需要：不申请时浏览器把本站数据当 best-effort——磁盘紧张时可以直接
+  // 清理掉（一个 3GB 的合并临时文件写到一半被回收，用户只会看到"失败"）；
+  // 而且部分浏览器（Firefox 每个源 10 GiB 一类的组配额）给的上限本来就低。
+  // 申请**必须由用户手势发起**（Firefox 会弹一次权限提示），所以挂在
+  // 「下载并混流」的点击里，而不是页面加载时。
+  //
+  // 注意：能不能拿到由浏览器决定（Chrome 看站点互动/权限），拿不到不阻断流程。
+  async function ensurePersist() {
+    if (!navigator.storage || !navigator.storage.persist) return false;
+    try {
+      if (navigator.storage.persisted && await navigator.storage.persisted()) return true;
+      return await navigator.storage.persist();
+    } catch (_) { return false; }
+  }
+
+  // refreshQuota 只报告浏览器**给**的用量与配额上限。
+  //
+  // 文案刻意写"浏览器配额上限"而不是"可用空间"：这个数字（如 Firefox 的
+  // 10 GiB、Chrome 按磁盘比例算的值）由浏览器决定，本页没有任何上限判断，
+  // 写"可用"会让人以为是我们抠出来的额度。
   async function refreshQuota() {
     if (!navigator.storage || !navigator.storage.estimate) return;
     try {
       const e = await navigator.storage.estimate();
+      let persisted = null;
+      if (navigator.storage.persisted) {
+        try { persisted = await navigator.storage.persisted(); } catch (_) {}
+      }
       $("#muxQuota").textContent = "浏览器存储：已用 " + prettySize(e.usage || 0) +
-        (e.quota ? " / 可用 " + prettySize(e.quota) : "");
+        (e.quota ? " / 浏览器配额上限 " + prettySize(e.quota) : "") +
+        (persisted === null ? "" :
+          persisted ? " · 已持久化（不会被自动清理）" : " · 未持久化（空间紧张时浏览器可能自动清理）");
     } catch (_) {}
   }
 
@@ -2627,6 +2686,7 @@ function vlSignUrl(prefix, key, url, ts) {
 
     try {
       syncProxyBox();
+      await ensurePersist();   // 在用户手势内申请；浏览器不给也不影响合并
 
       // 清晰度列表按需拉取：换了链接（t.q 变了）就必须重取，否则两轨
       // 可能属于上一个视频——那会合出一个时长对不上的文件。
@@ -2767,7 +2827,9 @@ function vlSignUrl(prefix, key, url, ts) {
     const w = $("#muxNoPreview");
     w.classList.remove("hidden");
     w.textContent = "预览失败（错误码 " + (($("#muxVideo").error && $("#muxVideo").error.code) || "?") +
-      "）：多为浏览器缺少 H.264 解码器或容器预览支持。合并文件本身有效，保存后用本地播放器打开。";
+      "）：当前浏览器/系统不支持这个容器或编解码器（TS 预览在部分构建上不可用）。" +
+      "文件本身有效，点『保存到本地』后用 VLC / mpv / 系统播放器打开；要 MP4 就 " +
+      "ffmpeg -i 输入.ts -c copy 输出.mp4。";
   });
 
   $("#muxStart").addEventListener("click", start);
@@ -2801,6 +2863,23 @@ function vlSignUrl(prefix, key, url, ts) {
       updateMuxNote();
     });
   })();
+  // 分片并发：默认 8 路，用户改过就记住（存本机浏览器）。
+  // 写回的是**夹取后**的值：手输 99 会落成 32、空值落回默认，
+  // 免得框里留一个和真正用的数字不一致的脏值。
+  const CONC_STORE = "vidlink_mux_conc";
+  (function initConc() {
+    const node = $("#muxConc");
+    let saved = NaN;
+    try { saved = Number(localStorage.getItem(CONC_STORE)); } catch (_) {}
+    if (Number.isFinite(saved) && saved >= CONC_MIN && saved <= CONC_MAX) {
+      node.value = String(Math.floor(saved));
+    }
+    node.addEventListener("change", () => {
+      const c = hlsConc();
+      node.value = String(c);
+      try { localStorage.setItem(CONC_STORE, String(c)); } catch (_) {}
+    });
+  })();
   $("#muxClean").addEventListener("click", async () => {
     if (lastURL) { URL.revokeObjectURL(lastURL); lastURL = null; }
     $("#muxVideo").removeAttribute("src");
@@ -2809,6 +2888,12 @@ function vlSignUrl(prefix, key, url, ts) {
     await refreshQuota();
     phase("已清理浏览器存储");
     bar(0); detail("");
+  });
+  $("#muxPersist").addEventListener("click", async () => {
+    const ok = await ensurePersist();
+    await refreshQuota();
+    phase(ok ? "已获得持久化存储：合并产物不会被浏览器自动清理"
+             : "浏览器没有授予持久化存储（不满足条件或你拒绝了）：功能照常，但空间紧张时产物可能被清理");
   });
   refreshQuota();
   updateMuxNote();

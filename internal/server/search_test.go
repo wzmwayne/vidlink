@@ -357,12 +357,18 @@ func TestUIHLSMergeWiring(t *testing.T) {
 		`ivForSeq`, // 无显式 IV 时按规范用媒体序号当 IV
 		`"ts"`,     // 产物是 .ts（顺序拼接，不转封装）
 		`下载并合并（TS）`,
+		// 现代浏览器基本能直接播 MPEG-TS：合并完照样交给 <video> 预览，
+		// 只有真的解不了才回退到"保存后用本地播放器"。
+		`video/mp2t`, `v.src = blobURL`,
 		// 安全上下文提示：非 https/localhost 时 Web Crypto 不可用
 		`请用 https 或 http://localhost 打开本页`,
 	} {
 		if !strings.Contains(ui, want) {
 			t.Errorf("解析页缺少 %q", want)
 		}
+	}
+	if strings.Contains(ui, "不能直接播") {
+		t.Error("不该再说\"浏览器不能直接播 TS\"：现代浏览器一般可以直接播，播不了由预览失败的提示兜底")
 	}
 	// TS 分片必须直连：合并分支里不能出现代理路径
 	head := strings.Index(ui, "async function mergeHLS(")
@@ -379,6 +385,116 @@ func TestUIHLSMergeWiring(t *testing.T) {
 	}
 	if !strings.Contains(body, "fetchBytes(") {
 		t.Error("mergeHLS 应直接用 fetch 拉分片")
+	}
+}
+
+// TestUIMuxConcurrencyKnob：HLS 分片并发默认 8 路、界面可调（1~32），且合并主流程
+// 真的读界面上的值——不再写死常量。
+//
+// 夹取逻辑单独在 node 里跑一遍：这类"非法输入回退默认、越界夹到边界"的代码写错了
+// 在浏览器里只表现为"并发数不对"，不会报错，靠手点很难发现。
+func TestUIMuxConcurrencyKnob(t *testing.T) {
+	ui := string(uiHTML)
+	for _, want := range []string{
+		`id="muxConc"`, `value="8"`, `min="1"`, `max="32"`,
+		`const CONC_DEFAULT = 8, CONC_MIN = 1, CONC_MAX = 32;`,
+		`function hlsConc()`,
+		`const CONC = hlsConc();`,
+		` 路并发`,
+		`CONC_STORE`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Errorf("解析页缺少 %q", want)
+		}
+	}
+	if strings.Contains(ui, "const CONC = 4") {
+		t.Error("分片并发不该再写死 4：应由界面上的「分片并发（线程）」决定")
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("环境里没有 node，跳过夹取逻辑校验")
+	}
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(ui, -1)
+	mux := blocks[len(blocks)-1][1]
+	head := strings.Index(mux, "const CONC_DEFAULT")
+	if head < 0 {
+		t.Fatal("混流脚本里找不到并发常量")
+	}
+	fn := strings.Index(mux[head:], "function hlsConc(")
+	if fn < 0 {
+		t.Fatal("混流脚本里找不到 hlsConc")
+	}
+	tail := strings.Index(mux[head+fn:], "\n  }\n")
+	if tail < 0 {
+		t.Fatal("找不到 hlsConc 的结尾")
+	}
+	src := mux[head : head+fn+tail+len("\n  }")]
+
+	cases := []string{"8", "1", "32", "0", "-3", "99", "2.7", "", "abc", " 16 "}
+	want := []int{8, 1, 32, 1, 1, 32, 2, 8, 8, 16}
+	quoted := make([]string, len(cases))
+	for i, c := range cases {
+		quoted[i] = strconv.Quote(c)
+	}
+	driver := `
+let CONC_VALUE = "8";
+function $(sel) { return { value: CONC_VALUE }; }
+` + src + `
+const out = [` + strings.Join(quoted, ",") + `].map((v) => { CONC_VALUE = v; return hlsConc(); });
+console.log(JSON.stringify(out));
+`
+	dir := t.TempDir()
+	js := filepath.Join(dir, "conc.js")
+	if err := os.WriteFile(js, []byte(driver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := exec.Command(node, js).CombinedOutput()
+	if err != nil {
+		t.Fatalf("跑并发夹取逻辑失败：%v\n%s", err, raw)
+	}
+	var got []int
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("node 输出不是 JSON：%v\n%s", err, raw)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("夹取结果长度 = %d，应为 %d（%v）", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hlsConc(%q) = %d，应为 %d", cases[i], got[i], want[i])
+		}
+	}
+}
+
+// TestUIStoragePersistWiring：浏览器存储配额是**浏览器**给的，本页不设上限——
+// 能做的是申请持久化（避免大文件被当 best-effort 清掉）并把"上限由浏览器决定"
+// 说清楚。测试钉住：申请走用户手势（按钮 + 合并前）、文案不写成"可用空间"。
+func TestUIStoragePersistWiring(t *testing.T) {
+	ui := string(uiHTML)
+	for _, want := range []string{
+		`id="muxPersist"`,
+		`function ensurePersist(`,
+		`navigator.storage.persist`, `navigator.storage.persisted`,
+		`await ensurePersist();`, // 合并前申请（点击手势内）
+		`浏览器配额上限`,                // 不把浏览器给的上限说成"可用空间"
+		`未持久化`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Errorf("解析页缺少 %q", want)
+		}
+	}
+	// 不能有任何自造的容量上限：配额完全交给浏览器。
+	for _, bad := range []string{
+		"10 * 1024 * 1024 * 1024", "10*1024*1024*1024", "10737418240",
+		"MAX_STORAGE", "STORAGE_LIMIT",
+	} {
+		if strings.Contains(ui, bad) {
+			t.Errorf("页面里出现了自造的存储上限 %q，配额应由浏览器决定", bad)
+		}
+	}
+	if strings.Contains(ui, "/ 可用 ") {
+		t.Error("不要把浏览器配额写成\"可用\"：那是浏览器给的上限，不是本页抠出来的额度")
 	}
 }
 
