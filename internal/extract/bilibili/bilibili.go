@@ -40,6 +40,8 @@ type Endpoints struct {
 	// 但历史上 B 站收紧过搜索接口，届时自动降级/升级到 WBI 通道即可。
 	Search    string
 	SearchWBI string
+	// PGCSeason 是番剧/影视季信息接口（按 ep_id 或 season_id 查）。
+	PGCSeason string
 }
 
 // DefaultEndpoints 返回官方地址。
@@ -52,6 +54,7 @@ func DefaultEndpoints() Endpoints {
 		Nav:         "https://api.bilibili.com/x/web-interface/nav",
 		Search:      "https://api.bilibili.com/x/web-interface/search/type",
 		SearchWBI:   "https://api.bilibili.com/x/web-interface/wbi/search/type",
+		PGCSeason:   "https://api.bilibili.com/pgc/view/web/season",
 	}
 }
 
@@ -130,15 +133,28 @@ func (e *Extractor) Parse(ctx context.Context, u *core.URL) (*core.Video, error)
 	}
 
 	headers := e.headers()
+	// 番剧/影视（PGC）：每个 ep 都是独立的一集，走自己的入口。
+	if ref.ep != 0 {
+		return e.parsePGC(ctx, ref, headers)
+	}
 	view, err := e.fetchView(ctx, ref, headers)
 	if err != nil {
 		return nil, err
 	}
 
 	// 番剧重定向：普通稿件入口指向番剧时，view 会给出 redirect_url。
-	if redirect := jsonx.String(view, "data.redirect_url"); redirect != "" && ref.bvid == "" {
-		return nil, core.Errf(core.KindUnsupport, core.PlatformBilibili,
-			"parse", "该地址指向番剧，请使用番剧链接: %s", redirect)
+	//
+	// 既然现在支持 ep，就**直接跟着 redirect 解析那一集**，而不是把用户打发走：
+	// share 链接里 "av 号指向番剧" 的情况并不少见，让用户自己去页面上找 ep 号
+	// 是没必要的摩擦。
+	if redirect := jsonx.String(view, "data.redirect_url"); redirect != "" {
+		if ep := epFromURL(redirect); ep != 0 {
+			return e.parsePGC(ctx, reference{ep: ep}, headers)
+		}
+		if ref.bvid == "" {
+			return nil, core.Errf(core.KindUnsupport, core.PlatformBilibili,
+				"parse", "该地址指向番剧，请使用番剧链接: %s", redirect)
+		}
 	}
 
 	cid := e.pickCID(view, ref)
@@ -196,6 +212,24 @@ func (e *Extractor) Parse(ctx context.Context, u *core.URL) (*core.Video, error)
 	return video, nil
 }
 
+// epFromURL 从番剧地址里取 ep 号（如 https://www.bilibili.com/bangumi/play/ep733316 → 733316）。
+// 不用正则：只认 "/ep" 后面的一段连续数字，够用且不引入新依赖。
+func epFromURL(raw string) int64 {
+	_, rest, ok := strings.Cut(raw, "/ep")
+	if !ok {
+		return 0
+	}
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(rest[:end], 10, 64)
+	return n
+}
+
 // maxHeight 返回视频轨里的最大高度；没有视频轨时返回 0。
 func maxHeight(v *core.Video) int {
 	m := 0
@@ -207,14 +241,30 @@ func maxHeight(v *core.Video) int {
 	return m
 }
 
-// ParseID 支持直接传 BV 号 / av 号。
+// ParseID 支持直接传 BV 号 / av 号 / ep 号（番剧单集）。
+//
+// ep 号也能直接解析：番剧的每一集是一份独立稿件，ID 就是 ep 号。
+// ss（季）不行——见 resolveRef 里的说明。
 func (e *Extractor) ParseID(ctx context.Context, id string) (*core.Video, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, core.BadInput(core.PlatformBilibili, "ID 为空")
 	}
-	u := &core.URL{Raw: id, Href: "https://www.bilibili.com/video/" + id, Host: "www.bilibili.com", Path: "/video/" + id}
+	href := "https://www.bilibili.com/video/" + id
+	if strings.HasPrefix(strings.ToLower(id), "ep") {
+		href = "https://www.bilibili.com/bangumi/play/" + strings.ToLower(id)
+	}
+	u := &core.URL{Raw: id, Href: href, Host: "www.bilibili.com", Path: u_pathOf(href)}
 	return e.Parse(ctx, u)
+}
+
+// u_pathOf 取 URL 的路径部分（这里只用来填 core.URL，失败就返回空）。
+func u_pathOf(href string) string {
+	u, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	return u.Path
 }
 
 // --- 内部实现 ---
@@ -242,12 +292,19 @@ func (e *Extractor) resolveRef(href string) (reference, error) {
 				ref.aid, _ = strconv.ParseInt(v[2:], 10, 64)
 			}
 		case s == "bangumi" && i+1 < len(segs) && strings.HasPrefix(segs[i+1], "play"):
-			// /bangumi/play/ep123 或 ss456
+			// /bangumi/play/ep123（单集）或 /bangumi/play/ss456（整季）
 			if i+2 < len(segs) {
 				tok := segs[i+2]
-				switch {
-				case strings.HasPrefix(tok, "ep"):
-					ref.ep, _ = strconv.ParseInt(tok[2:], 10, 64)
+				// 链接里的大小写不固定（EP733316 也见过），统一按小写判断。
+				switch low := strings.ToLower(tok); {
+				case strings.HasPrefix(low, "ep"):
+					ref.ep, _ = strconv.ParseInt(low[2:], 10, 64)
+				case strings.HasPrefix(low, "ss"):
+					// 季链接必须落到某一集：一部番几百集，猜"第 1 集"是错的
+					return reference{}, core.Unsupported(core.PlatformBilibili,
+						"这是番剧季链接（%s）：请用具体一集的地址（形如 "+
+							"https://www.bilibili.com/bangumi/play/ep1234567），"+
+							"或在番剧页里点开一集后复制地址", tok)
 				}
 			}
 		}
